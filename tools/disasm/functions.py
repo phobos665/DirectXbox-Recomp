@@ -294,6 +294,15 @@ class FunctionDetector:
             if (addr in self._candidates or addr in self.functions
                     or table_or_its_padding(addr) or not in_a_gap(addr)):
                 continue
+            # Opcodes 0x00-0x0E are `add`, `or` and segment pushes. No function
+            # starts with one, but an index table does, because its bytes are
+            # small arm numbers: one the walk above stopped in early (an index
+            # at or above the entry count, as a switch whose lowest case is not
+            # 0 can have) leaves its tail here, and it decodes as `add` far
+            # enough to pass for a body.
+            first = self.image.read_bytes_at_va(addr, 1)
+            if not first or first[0] < 0x0F:
+                continue
             if not self.engine.probes_as_function_body(addr):
                 continue
             # The sweep resumed at the dword table's end and decoded the index

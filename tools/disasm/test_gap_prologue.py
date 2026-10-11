@@ -181,6 +181,21 @@ class SwitchTableTest(unittest.TestCase):
         det = self._det(bodies=set())
         self.assertFalse(det._pass_gap_prologues([]))
 
+    def test_bytes_no_function_starts_with_are_refused(self):
+        # After the table, bytes that are no index table (0x0D >= 6 entries)
+        # but are `or eax, imm32` and `add` opcodes all the same: data of some
+        # other kind, or the tail of an index table, not a function -- even
+        # though they decode far enough to probe as a body.
+        junk_at = self.TABLE[1]
+        memory = {self.RET + 1: bytes.fromhex("8bff") + self.BYTES[2:26]
+                  + bytes.fromhex("0d0d0d0d0d05c3")}
+        det = _detector([_Insn(self.RET, 1, is_ret=True)],
+                        [_Func(0x001C4CE0, self.RET + 1)], prologues=set(),
+                        jump_tables=dict([self.TABLE]), memory=memory,
+                        bodies={junk_at})
+        self.assertFalse(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [])
+
     def test_a_second_switchs_table_is_not_a_function(self):
         # Future Perfect 0x001C53FE: the index bytes run straight into the
         # next table's 8B FF alignment.
