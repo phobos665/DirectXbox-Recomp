@@ -3221,11 +3221,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                           - base_addr;
         uint64_t demand = 0;
 
-        for (DWORD si = 0; si < count && si < 64; si++) {
-            const uint8_t *sh = xbe + hdrs + si * SECTHDR_SIZE;
+        /* Every section, as the loader below now loads every section: a
+         * cap of 64 here would undercount a title that has more. Bounded by
+         * the image, in 64 bits for the same reason as the loader's. */
+        for (DWORD si = 0; si < count; si++) {
+            const uint8_t *sh;
 
-            if (hdrs + (si + 1) * SECTHDR_SIZE > xbe_size)
+            if ((uint64_t)hdrs + ((uint64_t)si + 1) * SECTHDR_SIZE > xbe_size)
                 break;
+            sh = xbe + hdrs + si * SECTHDR_SIZE;
             if (!(*(const DWORD *)(sh + SECTHDR_FLAGS) & 0x00000002u))  /* PRELOAD */
                 demand += *(const DWORD *)(sh + SECTHDR_VSIZE);
         }
@@ -3461,13 +3465,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         int sections_loaded = 0;
         size_t total_bytes = 0;
 
-        if (num_sections > 64) num_sections = 64;  /* sanity cap */
-
+        /* No cap on the count. There used to be one at 64, and a title with
+         * more sections silently lost the rest (upstream #189). The loop is
+         * bounded by the image instead: it stops at the first header that
+         * does not fit in the file, worked in 64 bits so a header table
+         * placed below the base address cannot wrap the test. Nothing here
+         * is sized by the section count. */
         fprintf(stderr, "  XBE sections: %u (headers at file offset 0x%08X)\n",
                 num_sections, sect_headers_off);
 
         for (DWORD si = 0; si < num_sections; si++) {
-            if (sect_headers_off + (si + 1) * SECTHDR_SIZE > xbe_size) break;
+            if ((uint64_t)sect_headers_off + ((uint64_t)si + 1) * SECTHDR_SIZE > xbe_size)
+                break;
 
             const uint8_t *sh = xbe + sect_headers_off + si * SECTHDR_SIZE;
             DWORD sec_va       = *(const DWORD *)(sh + SECTHDR_VA);
