@@ -15,12 +15,21 @@ other's System Link game, join, and play a Deathmatch, also with 100 ms
 added each way, and with 50 ms and 5% loss. Next is playing against xemu
 (which needs the player's own `XboxLANKey`, below) and XLink Kai.
 
+**Status (11 Oct 2026):** hosted sessions for up to 16 consoles, chosen in the
+launcher's System Link tab ("Hosting a session", below). The switch is
+checked by `tests/syslink_hub` on 127.0.0.1 with no game; **no game has been
+played through it yet**, on one PC or several, and the router forward has not
+been tried against a real router.
+
 ## What exists
 
 | Piece | Where | Switch |
 | --- | --- | --- |
-| The network card | `src/kernel/xbox_nic.c`, a fault range it registers itself (`recomp_fault_add_range`, routed by `xbox_fault_route.c`); interrupt from the kernel's timer thread | `RECOMP_SYSLINK=udp` |
-| A UDP tunnel in xemu's format | `src/kernel/xbox_net_udp.c` | `RECOMP_SYSLINK_REMOTE=host:port`, `RECOMP_SYSLINK_LOCAL=port`, `RECOMP_SYSLINK_DELAY_MS`, `RECOMP_SYSLINK_LOSS` |
+| The network card | `src/kernel/xbox_nic.c`, a fault range it registers itself (`recomp_fault_add_range`, routed by `xbox_fault_route.c`); interrupt from the kernel's timer thread | `RECOMP_SYSLINK=host`, `join` or `udp` (`syslink` in the settings file) |
+| A hosted session: the host is a learning switch for up to 16 consoles | `src/kernel/xbox_net_udp.c`; checked by `tests/syslink_hub` | `syslink_host`, `syslink_port`, `syslink_code` (`RECOMP_SYSLINK_HOST`, `_PORT`, `_CODE`) |
+| The router asked to forward the host's port (UPnP), and the addresses to give out | `src/net/net_upnp.c`, over `third_party/miniupnp` (miniupnpc 2.3.3) | `syslink_upnp` (`RECOMP_SYSLINK_UPNP`), on by default |
+| The launcher's System Link tab | `src/launcher/launcher.c` | writes the five `syslink*` settings |
+| A UDP tunnel in xemu's format | `src/kernel/xbox_net_udp.c` | `RECOMP_SYSLINK=udp`, `RECOMP_SYSLINK_REMOTE=host:port`, `RECOMP_SYSLINK_LOCAL=port`, `RECOMP_SYSLINK_DELAY_MS`, `RECOMP_SYSLINK_LOSS` |
 | Real Diffie-Hellman and triple DES in the kernel | `src/kernel/xbox_crypto_soft.c`, behind `XcModExp`, `XcKeyTable`, `XcBlockCrypt(CBC)`, `XcDESKeyParity`; checked by `tests/crypto_soft` | |
 | `XboxLANKey` from the player | `xbox_NetLanKey` in `xbox_nic.c` | `%APPDATA%\xboxrecomp\keys.ini` `lan_key = ...`, or `RECOMP_XBOX_LAN_KEY` |
 | A unique Ethernet address per save folder | `src/kernel/xbox_nic.c`, answered through `ExQueryNonVolatileSetting(XC_FACTORY_ETHERNET_ADDR)` in `kernel_xbox.c` | `RECOMP_SYSLINK_MAC=00:50:F2:12:34:56` overrides it |
@@ -31,6 +40,77 @@ Everything is off by default: without `RECOMP_SYSLINK` or `RECOMP_NIC_TRACE`
 the register page is the plain memory it always was, and a title on no
 network shows what it should: TimeSplitters 2 searches, then says "No System
 Link Games Found".
+
+### Hosting a session
+
+One player hosts, everyone else joins; the host's copy is the network switch
+the session runs through. In the launcher's System Link tab:
+
+- **Host a session.** The tab shows the address to give out: this PC's on its
+  own network, and the router's internet address once the router answers
+  (Ctrl+C or a click copies it). With **Open the router** on (the default),
+  the game asks the router over UPnP to forward the UDP port to this PC while
+  it hosts, with a one-hour lease renewed every half hour.
+- **Join a session.** Type or paste the host's address (`:port` on the end if
+  theirs is not 27610). Nothing to open on a joining PC's router: the host
+  answers to the address the join came from, and a ping every two seconds
+  keeps that way back open.
+- **Join code**, optional on both sides: a host with one lets in only consoles
+  that say the same word (not case-sensitive).
+
+Then everyone starts the game and uses its own System Link menu as on a
+console: any console in the session can host the game there, not only the
+one hosting the session. If the session's host quits, the session ends.
+
+The same from the environment, which wins over the settings file:
+
+```
+host: RECOMP_SYSLINK=host [RECOMP_SYSLINK_PORT=27610] [RECOMP_SYSLINK_CODE=word] [RECOMP_SYSLINK_UPNP=0]
+join: RECOMP_SYSLINK=join RECOMP_SYSLINK_HOST=81.2.3.4[:port] [RECOMP_SYSLINK_CODE=word]
+```
+
+What the log says, in order, on the host:
+
+```
+[NET] hosting System Link on UDP port 27610, up to 16 consoles; on this network friends join 192.168.1.20:27610
+[NET] the router forwards UDP port 27610 here: friends on the internet join 81.2.3.4:27610
+[NET] a console joined from 86.5.6.7:51234: 2 in the session
+```
+
+and on a joining copy `[NET] joined the session at ...`, then every 30 s its
+round trip to the host. A refusal names its reason (wrong code, full, a
+different version, or the same console identity as one already in -- two
+copies sharing a save folder). When the router does not answer, or answers
+with an internet address that is itself private (a second router, or the
+ISP's shared address), the log and the launcher say friends outside need the
+port forwarded by hand or a virtual network (ZeroTier, Tailscale).
+
+The session's own messages are four bytes ('X' 'L', version, type) ahead of
+a hello (join code, Ethernet address), a welcome (how many are in), a refusal
+(why), a frame, a ping and its echo, or a goodbye. Until a console is
+welcomed, nothing it sends reaches anyone. The switch learns each console's
+Ethernet address from its hello and from what it sends; a broadcast goes to
+everyone but its sender, a frame for one console to that console, and one for
+an address not seen yet to everyone but its sender, as a learning switch
+floods. It forwards on its receive thread, so a frame between two joined
+consoles never waits for the host's game.
+
+Limits: IPv4 only; a full 1514-byte frame plus the 4-byte header is past the
+1472 bytes of a 1500-byte internet packet and will be fragmented (no title
+has been seen to send one, see "Measured" below); the card itself is Windows
+only, so a session is between Windows PCs for now.
+
+Two copies on one PC, hosted: one hosts, the other joins 127.0.0.1, each
+with its own save folder (its own Ethernet address), and the router left
+alone since nobody outside is joining:
+
+```
+copy A: RECOMP_SAVE_DIR=<a> RECOMP_SYSLINK=host RECOMP_SYSLINK_UPNP=0
+copy B: RECOMP_SAVE_DIR=<b> RECOMP_SYSLINK=join RECOMP_SYSLINK_HOST=127.0.0.1
+```
+
+Three or more on one PC is the same with more copies like B, each with its
+own save folder.
 
 ### Two copies on one PC
 
