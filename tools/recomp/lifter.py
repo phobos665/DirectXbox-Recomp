@@ -2957,6 +2957,23 @@ class Lifter:
                     and (self.xbe_data[offset - 5] & 0xC7) == 0x85):
                 floor = offset - 4       # the disp belongs to the jump
 
+            # A backward entry must also point near the dispatch, as a case
+            # label does -- the rule DisasmEngine.resync_jump_tables already
+            # applies. "Is a code address" alone gets weaker as the image gets
+            # bigger. Pro Evolution Soccer 5's memmove dispatches through
+            # `neg ecx; jmp [ecx*4 + 0x349DF8]` over eight arms at
+            # 0x349DDC-0x349DF8, and the word below them, 00 8D 49 00 (the
+            # previous jump's last displacement byte and a `lea ecx,[ecx]`),
+            # reads as 0x00498D00 -- an overlay's code in a 15 MB image. It
+            # became entry 0, _analyze_switch_table stops at the first arm
+            # outside the function, so the whole switch was dropped, and every
+            # overlapping copy left memmove through an unresolved jump with
+            # esi, edi and esp wrong. Within 4 KB of the dispatch, or of the
+            # span the forward entries cover.
+            cluster = targets + [table_va]
+            cluster_lo = min(cluster) - 0x1000
+            cluster_hi = max(cluster) + 0x1000
+
             back = []
             for i in range(1, max_entries + 1):
                 o = offset - i * 4
@@ -2964,6 +2981,8 @@ class Lifter:
                     break
                 val = struct.unpack_from('<I', self.xbe_data, o)[0]
                 if not is_code_address(val):
+                    break
+                if not (cluster_lo <= val <= cluster_hi):
                     break
                 # The value backstop is for the jump's own displacement, so it
                 # only fires when the word IS one: preceded by FF 24 <SIB>.
