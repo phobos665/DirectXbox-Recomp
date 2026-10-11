@@ -24,6 +24,8 @@ CASES = (
     "fxch_st", "fcom_m32_t", "fcomp_st1_t", "seq_fs", "seq_fl", "seq_mov",
     "seq_and", "seq_two", "seq_sahf", "seq_wait",
     "mulps_", "addps_", "shufps_", "paddw_", "psraw_", "pextrw_",
+    # fld/fstp tbyte, as the CRT loads its constants.
+    "fld_m80",
 )
 
 
