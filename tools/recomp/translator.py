@@ -1206,6 +1206,14 @@ class FunctionTranslator:
         """
         if self._func_has_prologue(instructions):
             return True
+        # MSVC's biased frame, `push ebp; lea ebp, [esp - N]`: a frame like
+        # any other, re-published across calls (_lift_lea publishes it).
+        if (len(instructions) >= 2 and
+                instructions[0].mnemonic == "push" and
+                instructions[0].op_str == "ebp" and
+                instructions[1].mnemonic == "lea" and
+                instructions[1].op_str.startswith("ebp, [esp")):
+            return True
         seh_prologs = getattr(self.lifter, "SEH_PROLOGS", frozenset())
         if not seh_prologs:
             return False

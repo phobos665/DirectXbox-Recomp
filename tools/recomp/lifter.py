@@ -2067,7 +2067,21 @@ class Lifter:
         if len(ops) < 2 or ops[1].type != "mem":
             return [f"/* lea: unexpected operands */"]
         addr_expr = _fmt_mem(ops[1])
-        return [_fmt_operand_write(ops[0], addr_expr)]
+        out = [_fmt_operand_write(ops[0], addr_expr)]
+        # `lea ebp, [esp - N]` is a frame too: MSVC's biased frame pointer,
+        # `push ebp; lea ebp, [esp-0x70]; sub esp, 0x274`, which reaches more
+        # locals with 8-bit displacements. Publish it as `mov ebp, esp` does
+        # (see _lift_mov). Unpublished, a guest setjmp called from such a
+        # function saved its caller's frame into the jmp_buf, and the longjmp
+        # back restored that one: Pro Evolution Soccer 5's libjpeg decoder
+        # (sub_004F5929) left through `add ebp,0x70; leave` with esp 0x90 too
+        # high, the next decoder's frame landed on its caller's, and the
+        # caller's pSrcInfo argument was overwritten with a gamma ramp.
+        if (ops[0].type == "reg" and ops[0].reg == "ebp" and
+                ops[1].mem_base == "esp" and not ops[1].mem_index):
+            out.append("g_ebp = ebp; /* publish frame for frameless callees */")
+            out.append("g_seh_ebp = ebp;")
+        return out
 
     def _lift_xchg(self, insn, ops):
         if len(ops) < 2:
