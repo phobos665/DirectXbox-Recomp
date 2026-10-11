@@ -26,6 +26,7 @@
 #include "launcher_bindings.h"
 #include "recomp_config.h"
 #include "recomp_pad.h"
+#include "net_upnp.h"
 
 #ifndef LAUNCHER_GAME_EXE
 #define LAUNCHER_GAME_EXE "game.exe"
@@ -51,8 +52,10 @@ typedef struct Row {
     int         lo, hi;                 /* ROW_INT */
     const char *const *choices;         /* ROW_CHOICE, NULL terminated */
     int        *ival;                   /* ROW_INT / ROW_BOOL / ROW_CHOICE index */
-    char       *text;                   /* ROW_TEXT */
+    char       *text;                   /* ROW_TEXT: typed into, Ctrl+V pastes */
     size_t      text_len;
+    const char *empty;                  /* ROW_TEXT: shown while there is no text */
+    int         digits;                 /* ROW_TEXT: only 0-9 may be typed */
 } Row;
 
 static const char *const k_frame_caps[] = { "adaptive", "60", "30", "0", NULL };
@@ -63,6 +66,25 @@ static int            g_widescreen;        /* the row; settings_save applies it 
 
 static Row  g_video_rows[12];
 static int  g_video_count;
+
+/* ---- System Link ---- */
+
+/* The rows depend on the mode: a host is not asked for an address, and a
+ * joining copy is not asked about its router. */
+static const char *const k_link_modes[] = { "off", "host", "join", NULL };
+#define LINK_OFF   0
+#define LINK_HOST  1
+#define LINK_JOIN  2
+#define LINK_BY_HAND (-1)               /* "udp", set in the file; kept as it is */
+
+static int           g_link_mode;
+static char          g_port_text[8];
+static Row           g_link_rows[6];
+static int           g_link_count;
+static char          g_lan_addr[64];    /* this PC on its network */
+static NetUpnpResult g_probe;           /* what the router said */
+static volatile LONG g_probe_state;     /* 0 not asked, 1 asking, 2 answered */
+static ULONGLONG     g_copied_until;    /* "copied" shown until then */
 
 /* ---- input ---- */
 
@@ -175,6 +197,73 @@ static void build_rows(void)
     g_video_count = (int)(r - g_video_rows);
 }
 
+static const char *link_mode_label(int i)
+{
+    switch (i) {
+    case LINK_HOST: return "Host a session";
+    case LINK_JOIN: return "Join a session";
+    case LINK_BY_HAND: return "udp (set in the settings file)";
+    default: return "Off";
+    }
+}
+
+static void build_link_rows(void)
+{
+    Row *r = g_link_rows;
+
+    memset(g_link_rows, 0, sizeof g_link_rows);
+
+    r->label = "System Link";
+    r->help  = "Play with other copies over a network. Host: this PC is the session"
+               " your friends join. Join: play in a friend's session.";
+    r->kind  = ROW_CHOICE; r->choices = k_link_modes; r->ival = &g_link_mode;
+    r++;
+
+    if (g_link_mode == LINK_JOIN) {
+        r->label = "Host's address";
+        r->help  = "What the host gave you, like 81.2.3.4 or a name, with :port if"
+                   " theirs is not the port below. Type it, or Ctrl+V to paste.";
+        r->kind  = ROW_TEXT; r->text = g_settings.syslink_host;
+        r->text_len = sizeof g_settings.syslink_host; r->empty = "type the host's address";
+        r++;
+    }
+    if (g_link_mode == LINK_HOST || g_link_mode == LINK_JOIN) {
+        r->label = "Port";
+        r->help  = g_link_mode == LINK_HOST
+                   ? "The UDP port friends join on. Change it only if something else"
+                     " on this PC or your router already uses it."
+                   : "The host's port, when their address does not end in one.";
+        r->kind  = ROW_TEXT; r->text = g_port_text; r->text_len = sizeof g_port_text;
+        r->digits = 1; r->empty = "27610";
+        r++;
+
+        r->label = "Join code";
+        r->help  = "Optional. Only consoles with the same code get in; empty lets in"
+                   " anyone who has the address. Not case-sensitive.";
+        r->kind  = ROW_TEXT; r->text = g_settings.syslink_code;
+        r->text_len = sizeof g_settings.syslink_code; r->empty = "none";
+        r++;
+    }
+    if (g_link_mode == LINK_HOST) {
+        r->label = "Open the router";
+        r->help  = "Ask the router to forward the port to this PC (UPnP) while you"
+                   " host, so friends on the internet can join. Friends on your own"
+                   " network can join either way.";
+        r->kind  = ROW_BOOL; r->ival = &g_settings.syslink_upnp;
+        r++;
+    }
+    g_link_count = (int)(r - g_link_rows);
+}
+
+/* The port the host listens on as typed, or the default for anything that
+ * is not a port. */
+static int link_port(void)
+{
+    int p = atoi(g_port_text);
+
+    return (p >= 1 && p <= 65535) ? p : RECOMP_SYSLINK_DEFAULT_PORT;
+}
+
 #ifndef LAUNCHER_NO_WIDESCREEN
 /* Whether the file's own hor_plus, which settings_save keeps while the
  * switch is where it was found, gives this game a different camera from
@@ -234,10 +323,13 @@ static void row_value(const Row *r, char *out, size_t n)
             snprintf(out, n, "%dx", *r->ival);
         break;
     case ROW_CHOICE:
-        snprintf(out, n, "%s", frame_cap_label(*r->ival));
+        if (r->ival == &g_link_mode)
+            snprintf(out, n, "%s", link_mode_label(*r->ival));
+        else
+            snprintf(out, n, "%s", frame_cap_label(*r->ival));
         break;
     default:
-        snprintf(out, n, "%s", r->text && r->text[0] ? r->text : "Beside the game");
+        snprintf(out, n, "%s", r->text ? r->text : "");
         break;
     }
 }
@@ -269,9 +361,48 @@ static int row_can(const Row *r, int delta)
     switch (r->kind) {
     case ROW_INT:
         return delta < 0 ? *r->ival > r->lo : *r->ival < r->hi;
+    case ROW_TEXT:
+        return 0;                       /* typed, not stepped: no arrows */
     default:
         return 1;
     }
+}
+
+/* A key typed on a text row: printable characters go on the end, Backspace
+ * takes one off. */
+static void row_type(Row *r, unsigned ch)
+{
+    size_t len;
+
+    if (r->kind != ROW_TEXT || !r->text)
+        return;
+    len = strlen(r->text);
+    if (ch == 8) {
+        if (len)
+            r->text[len - 1] = '\0';
+    } else if (ch >= 32 && ch < 127 && len + 1 < r->text_len &&
+               (!r->digits || (ch >= '0' && ch <= '9'))) {
+        r->text[len] = (char)ch;
+        r->text[len + 1] = '\0';
+    }
+}
+
+static void row_paste(Row *r, HWND owner)
+{
+    HANDLE h;
+    const char *s;
+
+    if (r->kind != ROW_TEXT || !OpenClipboard(owner))
+        return;
+    h = GetClipboardData(CF_TEXT);
+    s = h ? (const char *)GlobalLock(h) : NULL;
+    if (s) {
+        /* The first line only, and only what could have been typed. */
+        for (; *s && *s != '\r' && *s != '\n'; s++)
+            row_type(r, (unsigned char)*s);
+        GlobalUnlock(h);
+    }
+    CloseClipboard();
 }
 
 /* ------------------------------------------------------------- the title */
@@ -499,6 +630,19 @@ static void settings_load(void)
                 break;
             }
     }
+
+    g_link_mode = LINK_OFF;
+    {
+        int i;
+        for (i = 0; k_link_modes[i]; i++)
+            if (_stricmp(g_settings.syslink, k_link_modes[i]) == 0)
+                g_link_mode = i;
+    }
+    /* A pair set up by hand is left as it is unless the row is moved. */
+    if (_stricmp(g_settings.syslink, "udp") == 0)
+        g_link_mode = LINK_BY_HAND;
+    snprintf(g_port_text, sizeof g_port_text, "%d", g_settings.syslink_port);
+    build_link_rows();
 }
 
 static void bindings_load(void)
@@ -541,6 +685,10 @@ static int settings_save(void)
 #endif
     snprintf(g_settings.frame_cap, sizeof g_settings.frame_cap, "%s",
              k_frame_caps[g_frame_cap_index]);
+    if (g_link_mode != LINK_BY_HAND)
+        snprintf(g_settings.syslink, sizeof g_settings.syslink, "%s",
+                 k_link_modes[g_link_mode]);
+    g_settings.syslink_port = link_port();
 
     if (!recomp_settings_path(g_title_id, path, sizeof path))
         return 0;
@@ -657,8 +805,8 @@ static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
 
 /* ----------------------------------------------------------------- state */
 
-typedef enum { TAB_VIDEO, TAB_INPUT, TAB_ABOUT, TAB_COUNT } Tab;
-static const char *const k_tab_names[TAB_COUNT] = { "VIDEO", "INPUT", "ABOUT" };
+typedef enum { TAB_VIDEO, TAB_INPUT, TAB_LINK, TAB_ABOUT, TAB_COUNT } Tab;
+static const char *const k_tab_names[TAB_COUNT] = { "VIDEO", "INPUT", "SYSTEM LINK", "ABOUT" };
 
 static Tab    g_tab;
 static Tab    g_tab_from;
@@ -667,6 +815,87 @@ static int    g_rows_on_tab;
 static double g_pulse;
 static int    g_pad_seen;
 static HWND   g_hwnd;
+
+/* The list of settings rows on this tab, or NULL for a tab without one. */
+static Row *tab_rows(int *count)
+{
+    if (g_tab == TAB_VIDEO) {
+        *count = g_video_count;
+        return g_video_rows;
+    }
+    if (g_tab == TAB_LINK) {
+        *count = g_link_count;
+        return g_link_rows;
+    }
+    *count = 0;
+    return NULL;
+}
+
+/* ---- the System Link tab's addresses ---- */
+
+static DWORD WINAPI probe_thread(LPVOID unused)
+{
+    (void)unused;
+    net_upnp_probe(&g_probe);
+    InterlockedExchange(&g_probe_state, 2);
+    return 0;
+}
+
+/* While the tab is showing: this PC's address, once, and -- for a host that
+ * lets the router be asked -- the router's internet address, asked once on a
+ * thread of its own, since a router that does not answer takes two seconds
+ * to say so. Nothing is opened from here; the game does that while it hosts. */
+static void link_tab_tick(void)
+{
+    if (!g_lan_addr[0] && !net_local_address(g_lan_addr, sizeof g_lan_addr))
+        snprintf(g_lan_addr, sizeof g_lan_addr, "?");
+    if (g_link_mode == LINK_HOST && g_settings.syslink_upnp &&
+        InterlockedCompareExchange(&g_probe_state, 1, 0) == 0) {
+        HANDLE t = CreateThread(NULL, 0, probe_thread, NULL, 0, NULL);
+        if (t)
+            CloseHandle(t);
+        else
+            InterlockedExchange(&g_probe_state, 0);
+    }
+}
+
+/* What a host tells its friends: the internet address when the router gave
+ * one, else this PC's address on its own network. */
+static void link_share_address(char *out, size_t n)
+{
+    if (g_settings.syslink_upnp && g_probe_state == 2 && g_probe.state == NET_UPNP_FOUND)
+        snprintf(out, n, "%s:%d", g_probe.external, link_port());
+    else
+        snprintf(out, n, "%s:%d", g_lan_addr, link_port());
+}
+
+static void copy_text(const char *s)
+{
+    size_t len = strlen(s) + 1;
+    HGLOBAL h;
+
+    if (!OpenClipboard(g_hwnd))
+        return;
+    EmptyClipboard();
+    h = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (h) {
+        memcpy(GlobalLock(h), s, len);
+        GlobalUnlock(h);
+        if (!SetClipboardData(CF_TEXT, h))
+            GlobalFree(h);
+        else
+            g_copied_until = GetTickCount64() + 1500;
+    }
+    CloseClipboard();
+}
+
+/* After the mode row moved: the list is a different length now. */
+static void link_rows_changed(void)
+{
+    build_link_rows();
+    if (g_sel >= g_link_count)
+        g_sel = g_link_count - 1;
+}
 
 static ThemeRect tab_rect(int i)
 {
@@ -731,7 +960,8 @@ static void set_tab(Tab t)
 static void rows_for_tab(void)
 {
     g_rows_on_tab = (g_tab == TAB_VIDEO) ? g_video_count
-                  : (g_tab == TAB_INPUT) ? BIND_ROWS_VISIBLE : 0;
+                  : (g_tab == TAB_INPUT) ? BIND_ROWS_VISIBLE
+                  : (g_tab == TAB_LINK)  ? g_link_count : 0;
     if (g_sel >= g_rows_on_tab)
         g_sel = g_rows_on_tab ? g_rows_on_tab - 1 : 0;
 }
@@ -840,8 +1070,16 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
 
     if (dy && g_rows_on_tab)
         g_sel = (g_sel + dy + g_rows_on_tab) % g_rows_on_tab;
-    if (dx && g_tab == TAB_VIDEO && g_rows_on_tab)
-        row_move(&g_video_rows[g_sel], dx);
+    if (dx && g_rows_on_tab) {
+        int count;
+        Row *rows = tab_rows(&count);
+
+        if (rows && g_sel < count) {
+            row_move(&rows[g_sel], dx);
+            if (g_tab == TAB_LINK)
+                link_rows_changed();
+        }
+    }
     if (accept)
         do_play();
     if (cancel)
@@ -850,10 +1088,133 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
 
 /* ------------------------------------------------------------------ draw */
 
+/* A list of settings rows and the selected one's explanation under it, as
+ * the Video and System Link tabs both show them: on one line, or wrapped
+ * for the System Link tab's longer ones. Returns the y below. */
+static int draw_rows(const Row *rows, int count, int wrap_help)
+{
+    ThemeRect r;
+    char value[160];
+    int i;
+
+    for (i = 0; i < count; i++) {
+        const Row *row = &rows[i];
+        ThemeRect rr = row_rect(i), lr, vr, ar;
+        double lit = (i == g_sel) ? 1.0 : 0.0;
+        int dim_value = 0;
+
+        theme_panel(rr, lit);
+
+        lr = rr; lr.x += 22; lr.w = 260;
+        theme_text(lr, row->label, 13, 600,
+                   lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+
+        row_value(row, value, sizeof value);
+        if (row->kind == ROW_TEXT) {
+            /* A cursor on the row being typed into; the hint on an empty
+             * one that is not. */
+            if (lit > 0.5) {
+                if ((int)(g_pulse * 6.0) % 2 == 0)
+                    strncat(value, "_", sizeof value - strlen(value) - 1);
+            } else if (!value[0] && row->empty) {
+                snprintf(value, sizeof value, "%s", row->empty);
+                dim_value = 1;
+            }
+        }
+        vr = rr; vr.x += 300; vr.w = rr.w - 360;
+        theme_text(vr, value, 13, 400,
+                   (lit > 0.5 && !dim_value) ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+
+        ar = arrows_rect(rr);
+        if (row_can(row, -1) || row_can(row, 1))
+            theme_arrows(ar, row_can(row, -1), row_can(row, 1), lit);
+    }
+
+    r.x = 62; r.y = 168 + count * 62 + 10;
+    r.w = g_cw - 124; r.h = 46;
+    if (g_sel < count) {
+        if (wrap_help)
+            theme_text_wrapped(r, row_help(&rows[g_sel]), 11, THEME_TEXT_DIM);
+        else
+            theme_text(r, row_help(&rows[g_sel]), 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    }
+    return r.y + r.h;
+}
+
+static ThemeRect g_link_panel;          /* where the addresses are: a click copies */
+
+static void draw_link(void)
+{
+    ThemeRect p, line;
+    char text[320], share[96];
+    int y = draw_rows(g_link_rows, g_link_count, 1) + 8;
+
+    p.x = 60; p.y = y; p.w = g_cw - 120;
+    p.h = (g_ch - 96) - y;
+    if (p.h > 230) p.h = 230;
+    g_link_panel = p;
+    theme_panel(p, 0.25);
+    line = p; line.x += 24; line.w -= 48; line.y += 16; line.h = 22;
+
+    if (g_link_mode == LINK_HOST) {
+        int asked = g_settings.syslink_upnp;
+
+        theme_text(line, "TELL YOUR FRIENDS", 10, 700, THEME_GREEN, THEME_LEFT);
+        line.y += 30;
+        snprintf(text, sizeof text, "On your network      %s:%d", g_lan_addr, link_port());
+        theme_text(line, text, 12, 400, THEME_TEXT, THEME_LEFT);
+        line.y += 26;
+
+        if (!asked) {
+            snprintf(text, sizeof text, "On the internet      only with UDP port %d forwarded"
+                     " to this PC by hand, or over a virtual network", link_port());
+        } else if (g_probe_state != 2) {
+            snprintf(text, sizeof text, "On the internet      asking the router...");
+        } else if (g_probe.state == NET_UPNP_FOUND) {
+            snprintf(text, sizeof text, "On the internet      %s:%d   (the router is asked"
+                     " to open it when the game starts)", g_probe.external, link_port());
+        } else {
+            snprintf(text, sizeof text, "On the internet      %s", g_probe.detail);
+        }
+        line.h = 40;
+        theme_text_wrapped(line, text, 12,
+                           (asked && g_probe_state == 2 && g_probe.state == NET_UPNP_FOUND)
+                               ? THEME_TEXT : THEME_TEXT_DIM);
+        line.y += 46;
+        line.h = 60;
+        link_share_address(share, sizeof share);
+        snprintf(text, sizeof text,
+                 "%s  Windows may ask to let the game through its firewall the first"
+                 " time: allow it. Then host or join a game in the game's own System"
+                 " Link menu.",
+                 GetTickCount64() < g_copied_until ? "Copied." : "Ctrl+C or a click here copies it.");
+        theme_text_wrapped(line, text, 11, THEME_TEXT_DIM);
+    } else if (g_link_mode == LINK_JOIN) {
+        theme_text(line, "JOINING", 10, 700, THEME_GREEN, THEME_LEFT);
+        line.y += 30; line.h = 120;
+        theme_text_wrapped(line,
+            "Ask the host for their address, and the join code if they set one."
+            " Nothing needs opening on your router. Start the game and open its"
+            " System Link menu: games anyone in the session hosts appear there."
+            " If none does, the log beside the game says whether the host answered.",
+            12, THEME_TEXT_DIM);
+    } else {
+        theme_text(line, "SYSTEM LINK", 10, 700, THEME_GREEN, THEME_LEFT);
+        line.y += 30; line.h = 120;
+        theme_text_wrapped(line, g_link_mode == LINK_BY_HAND
+            ? "The settings file sets up a pair by hand (syslink = udp, with"
+              " syslink_remote). Choose Host or Join here to replace it."
+            : "Consoles linked together play in one game, as they did with a cable"
+              " or a network switch. One player hosts the session, up to 15 more"
+              " join it, from the same network or over the internet. Each needs"
+              " their own copy of the game.",
+            12, THEME_TEXT_DIM);
+    }
+}
+
 static void draw(void)
 {
     ThemeRect r;
-    char value[128];
     int i;
 
     theme_background(g_pulse);
@@ -876,32 +1237,9 @@ static void draw(void)
     }
 
     if (g_tab == TAB_VIDEO) {
-        for (i = 0; i < g_video_count; i++) {
-            Row *row = &g_video_rows[i];
-            ThemeRect rr = row_rect(i), lr, vr, ar;
-            double lit = (i == g_sel) ? 1.0 : 0.0;
-
-            theme_panel(rr, lit);
-
-            lr = rr; lr.x += 22; lr.w = 260;
-            theme_text(lr, row->label, 13, 600,
-                       lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
-
-            row_value(row, value, sizeof value);
-            vr = rr; vr.x += 300; vr.w = rr.w - 360;
-            theme_text(vr, value, 13, 400,
-                       lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
-
-            ar = arrows_rect(rr);
-            theme_arrows(ar, row_can(row, -1), row_can(row, 1), lit);
-        }
-
-        /* The selected row's explanation, under the list. */
-        r.x = 62; r.y = 168 + g_video_count * 62 + 10;
-        r.w = g_cw - 124; r.h = 46;
-        if (g_sel < g_video_count)
-            theme_text(r, row_help(&g_video_rows[g_sel]), 11, 400, THEME_TEXT_DIM,
-                       THEME_LEFT);
+        draw_rows(g_video_rows, g_video_count, 0);
+    } else if (g_tab == TAB_LINK) {
+        draw_link();
     } else if (g_tab == TAB_INPUT) {
         BindPort *bp = &g_bind.port[g_bind_port];
         char line[160];
@@ -1095,11 +1433,11 @@ static void draw(void)
 
 static int hit_row(int mx, int my)
 {
-    int i;
+    int i, count;
 
-    if (g_tab != TAB_VIDEO)
+    if (!tab_rows(&count))
         return -1;
-    for (i = 0; i < g_video_count; i++) {
+    for (i = 0; i < count; i++) {
         ThemeRect r = row_rect(i);
 
         if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
@@ -1159,6 +1497,25 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         InvalidateRect(h, NULL, FALSE);
         return 0;
+    case WM_CHAR:
+        /* Typing goes to the System Link tab's text rows; Ctrl+C there
+         * copies the address a host gives out, Ctrl+V pastes into a row. */
+        if (g_tab == TAB_LINK && g_sel < g_link_count && !g_capturing) {
+            Row *row = &g_link_rows[g_sel];
+
+            if (wp == 3 && g_link_mode == LINK_HOST) {
+                char share[96];
+
+                link_share_address(share, sizeof share);
+                copy_text(share);
+            } else if (wp == 22) {
+                row_paste(row, h);
+            } else {
+                row_type(row, (unsigned)wp);
+            }
+            InvalidateRect(h, NULL, FALSE);
+        }
+        return 0;
     case WM_LBUTTONDOWN: {
         int mx = LOWORD(lp), my = HIWORD(lp), i;
 
@@ -1202,12 +1559,23 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         i = hit_row(mx, my);
         if (i >= 0) {
-            int dir = hit_arrow(row_rect(i), mx);
+            int dir = hit_arrow(row_rect(i), mx), count;
+            Row *rows = tab_rows(&count);
 
             g_sel = i;
             /* Back or forward on the arrows; anywhere else on the row steps
-             * it forward, which is how a toggle is clicked. */
-            row_move(&g_video_rows[i], dir ? dir : 1);
+             * it forward, which is how a toggle is clicked. A text row only
+             * takes the selection, to be typed into. */
+            row_move(&rows[i], dir ? dir : 1);
+            if (g_tab == TAB_LINK)
+                link_rows_changed();
+        } else if (g_tab == TAB_LINK && g_link_mode == LINK_HOST &&
+                   mx >= g_link_panel.x && mx < g_link_panel.x + g_link_panel.w &&
+                   my >= g_link_panel.y && my < g_link_panel.y + g_link_panel.h) {
+            char share[96];
+
+            link_share_address(share, sizeof share);
+            copy_text(share);
         }
         if (hit_play(mx, my))
             do_play();
@@ -1236,6 +1604,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             g_tab_t += 0.12;
             if (g_tab_t > 1.0) g_tab_t = 1.0;
         }
+        if (g_tab == TAB_LINK)
+            link_tab_tick();
         g_pad_seen = pad_poll(&dx, &dy, &a, &b, &t);
         if (g_capturing)
             capture_tick();             /* the press is the answer, not a move */

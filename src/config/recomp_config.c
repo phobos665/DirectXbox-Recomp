@@ -302,6 +302,9 @@ void recomp_settings_defaults(RecompSettings *s)
     s->vrr               = 1;
     s->frame_interp      = 1;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
+    snprintf(s->syslink, sizeof s->syslink, "off");
+    s->syslink_port      = RECOMP_SYSLINK_DEFAULT_PORT;
+    s->syslink_upnp      = 1;
 }
 
 static int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -370,6 +373,16 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->frame_interp = clamp_int(atoi(v), 1, 4);
         if ((v = from_table("game_dir")) != NULL)
             snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
+        if ((v = from_table("syslink")) != NULL)
+            snprintf(s->syslink, sizeof s->syslink, "%s", v);
+        if ((v = from_table("syslink_host")) != NULL)
+            snprintf(s->syslink_host, sizeof s->syslink_host, "%s", v);
+        if ((v = from_table("syslink_port")) != NULL)
+            s->syslink_port = clamp_int(atoi(v), 1, 65535);
+        if ((v = from_table("syslink_code")) != NULL)
+            snprintf(s->syslink_code, sizeof s->syslink_code, "%s", v);
+        if ((v = from_table("syslink_upnp")) != NULL)
+            s->syslink_upnp = !off_word(v);
     }
 
     memcpy(g_entries, saved, sizeof saved);
@@ -513,6 +526,40 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         fprintf(f, "game_dir = %s\n", s->game_dir);
     else
         fprintf(f, "# game_dir =\n");
+
+    fprintf(f,
+        "\n"
+        "# System Link: play with other copies over a network. off; host, where\n"
+        "# this copy is the session friends join; or join, to play in someone\n"
+        "# else's. Only games with System Link use it.         [RECOMP_SYSLINK]\n"
+        "syslink = %s\n"
+        "#\n"
+        "# join: the host's address or name, with :port if it is not the port\n"
+        "# below.                                         [RECOMP_SYSLINK_HOST]\n",
+        s->syslink[0] ? s->syslink : "off");
+    if (s->syslink_host[0])
+        fprintf(f, "syslink_host = %s\n", s->syslink_host);
+    else
+        fprintf(f, "# syslink_host =\n");
+    fprintf(f,
+        "#\n"
+        "# The UDP port a host listens on, and joins use when the address names\n"
+        "# none.                                          [RECOMP_SYSLINK_PORT]\n"
+        "syslink_port = %d\n"
+        "#\n"
+        "# A word everyone in the session types the same, so nobody else gets\n"
+        "# in. Empty for none.                            [RECOMP_SYSLINK_CODE]\n",
+        s->syslink_port > 0 ? s->syslink_port : RECOMP_SYSLINK_DEFAULT_PORT);
+    if (s->syslink_code[0])
+        fprintf(f, "syslink_code = %s\n", s->syslink_code);
+    else
+        fprintf(f, "# syslink_code =\n");
+    fprintf(f,
+        "#\n"
+        "# host: ask the router to forward the port to this PC (UPnP), so friends\n"
+        "# on the internet can join. 0 leaves the router alone. [RECOMP_SYSLINK_UPNP]\n"
+        "syslink_upnp = %d\n",
+        s->syslink_upnp ? 1 : 0);
 
     fclose(f);
     return 1;

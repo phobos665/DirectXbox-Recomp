@@ -346,6 +346,36 @@ int main(void)
         check_str(back.frame_cap, "60", "round trip: frame cap");
         check_str(back.game_dir, "D:\\games\\ts2", "round trip: game dir");
 
+        /* System Link, as the launcher's tab writes it for a joining copy. */
+        snprintf(out.syslink, sizeof out.syslink, "join");
+        snprintf(out.syslink_host, sizeof out.syslink_host, "friend.example.net:30000");
+        out.syslink_port = 30000;
+        snprintf(out.syslink_code, sizeof out.syslink_code, "Siberia");
+        out.syslink_upnp = 0;
+        check(recomp_settings_write(rt, &out) != 0, "System Link settings written");
+        check(recomp_settings_read(rt, &back) != 0, "System Link settings read back");
+        check_str(back.syslink, "join", "round trip: System Link mode");
+        check_str(back.syslink_host, "friend.example.net:30000", "round trip: host");
+        check_int(back.syslink_port, 30000, "round trip: port");
+        check_str(back.syslink_code, "Siberia", "round trip: join code");
+        check_int(back.syslink_upnp, 0, "round trip: router left alone");
+
+        /* Empty host and code are written as comments and come back empty;
+         * an unset port comes back as the default, and the router is asked. */
+        recomp_settings_defaults(&out);
+        check(recomp_settings_write(rt, &out) != 0, "default System Link written");
+        check(file_has_line(rt, "syslink = off"), "System Link is off by default");
+        check(file_has_line(rt, "# syslink_host ="), "no host is a comment");
+        check(file_has_line(rt, "# syslink_code ="), "no code is a comment");
+        check(recomp_settings_read(rt, &back) != 0, "default System Link read back");
+        check_str(back.syslink_host, "", "default: no host");
+        check_str(back.syslink_code, "", "default: no code");
+        check_int(back.syslink_port, RECOMP_SYSLINK_DEFAULT_PORT, "default: port");
+        check_int(back.syslink_upnp, 1, "default: the router is asked");
+        write_file(rt, "syslink_port = 99999\n");
+        check(recomp_settings_read(rt, &back) != 0, "out-of-range port read");
+        check_int(back.syslink_port, 65535, "clamp: port to 65535");
+
         /* A file written by an older build, missing newer keys, must keep
          * the defaults for them rather than zeroing them. */
         write_file(rt, "resolution_scale = 4\n");

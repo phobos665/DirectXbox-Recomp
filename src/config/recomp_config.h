@@ -194,7 +194,18 @@ typedef struct RecompSettings {
     int  vrr;                   /* 0 or 1: present for variable refresh when fullscreen */
     int  frame_interp;          /* 1 (off) to 4: frames shown for each the game draws */
     char game_dir[512];         /* empty means beside the executable */
+
+    /* System Link (src/kernel/xbox_net_udp.c). */
+    char syslink[8];            /* "off", "host", "join"; "udp" by hand only */
+    char syslink_host[128];     /* join: the host's address or name, [:port] */
+    int  syslink_port;          /* the port a host listens on, and joins use */
+    char syslink_code[64];      /* the session's join code; empty for none */
+    int  syslink_upnp;          /* host: ask the router to forward the port */
 } RecompSettings;
+
+/* The port a System Link host listens on when nobody chooses one. The same
+ * number as XBOX_NET_DEFAULT_PORT, which the runtime falls back to. */
+#define RECOMP_SYSLINK_DEFAULT_PORT 27610
 
 void recomp_settings_defaults(RecompSettings *s);
 
