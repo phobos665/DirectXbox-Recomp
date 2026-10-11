@@ -172,6 +172,23 @@ class FpuLifterTest(unittest.TestCase):
         self.assertTrue(lifted[0].startswith("g_fp_cmp ="))
         self.assertNotIn("_fpu_cmp", lifted[0])
 
+    def test_ficom_compares_with_the_signed_integer_and_ficomp_pops(self):
+        """ficom/ficomp fell through to the `/* FPU: ... */` catch-all: the
+        status word kept the previous compare and ficomp never popped."""
+        for mnemonic, size, accessor, pops in (("ficom", 4, "SMEM32", 0),
+                                               ("ficomp", 2, "SMEM16", 1)):
+            with self.subTest(mnemonic=mnemonic):
+                width = "dword" if size == 4 else "word"
+                insn = Instruction(0, 3, mnemonic, f"{width} ptr [eax + 0x1c]", "")
+                insn.operands = [Operand(type="mem", mem_base="eax",
+                                         mem_disp=0x1C, mem_size=size)]
+                lifted = "\n".join(Lifter().lift_instruction(insn))
+                self.assertIn(f"RECOMP_FCMP(fp_top(), (double){accessor}(eax + 0x1C))",
+                              lifted)
+                self.assertIn("g_fp_cc = RECOMP_FCMP_CC(g_fp_cmp);", lifted)
+                self.assertEqual(lifted.count("fp_pop();"), pops, lifted)
+                self.assertNotIn("/* FPU:", lifted)
+
     def test_fxch_swaps_with_the_explicit_register(self):
         """Capstone reports fxch with both operands -- (st(0), st(i)) -- and it
         is the only x87 form that does. Reading operand 0 picked up the

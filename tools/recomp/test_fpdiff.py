@@ -26,6 +26,8 @@ CASES = (
     "mulps_", "addps_", "shufps_", "paddw_", "psraw_", "pextrw_",
     # fld/fstp tbyte, as the CRT loads its constants.
     "fld_m80",
+    # ficom/ficomp compare st0 with an integer and ficomp pops.
+    "ficom",
 )
 
 
