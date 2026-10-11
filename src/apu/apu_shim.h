@@ -48,7 +48,12 @@ static inline int64_t qemu_clock_get_us(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000LL / freq.QuadPart);
+    /* Whole seconds and the remainder, not count * 1e6 / freq: on POSIX the
+     * QPC shim counts CLOCK_MONOTONIC nanoseconds (freq 1e9), and that
+     * product overflows int64 after ~2.5 hours of host uptime (Windows' 10 MHz
+     * counter: ~10 days). Same split as qemu_clock_get_ns in qemu_shim.h. */
+    return (int64_t)(count.QuadPart / freq.QuadPart) * 1000000LL +
+           (int64_t)(count.QuadPart % freq.QuadPart) * 1000000LL / freq.QuadPart;
 }
 #endif
 

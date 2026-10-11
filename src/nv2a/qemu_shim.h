@@ -86,11 +86,13 @@ static inline int ctz32(uint32_t val) {
 static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c) {
     uint64_t hi, lo;
     lo = _umul128(a, (uint64_t)b, &hi);
-    /* Simple fallback: if hi is 0, just do lo/c */
     if (hi == 0) return lo / c;
-    /* Otherwise use 128-bit division via shifts */
-    /* For our use case (timer math), overflow is unlikely */
-    return (uint64_t)(((double)a * b) / c);
+    /* The product passed 64 bits. That is the normal case, not a rare one:
+     * PTIMER feeds host nanoseconds times the 233 MHz core clock, which
+     * passes 2^64 after ~80 s of host uptime. Split a by c instead of going
+     * through a double: (a % c) * b < 2^32 * 2^32, so nothing overflows and
+     * the result is exact, as the __int128 path below is. */
+    return (a / c) * b + ((a % c) * b) / c;
 }
 #else
 static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c) {
@@ -375,7 +377,13 @@ static inline int64_t qemu_clock_get_ns(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000000LL / freq.QuadPart);
+    /* Whole seconds and the remainder, not count * 1e9 / freq: the product
+     * overflows int64 after ~15 minutes of host uptime at Windows' 10 MHz
+     * counter, and after ~9 s on POSIX, where the QPC shim counts in
+     * nanoseconds (freq 1e9). The remainder is below freq, so its product
+     * stays in range for any counter up to ~9 GHz. */
+    return (int64_t)(count.QuadPart / freq.QuadPart) * 1000000000LL +
+           (int64_t)(count.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart;
 }
 #define QEMU_CLOCK_VIRTUAL 0
 
