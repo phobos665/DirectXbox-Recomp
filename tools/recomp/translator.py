@@ -1620,8 +1620,12 @@ class FunctionTranslator:
         # sub_000EEA10 in Wreckless is exactly `bsf eax, ecx; ret`.
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
+        # sahf and the fcomi family leave an EFLAGS image in _fa, and sahf
+        # reads the OF before it from _fb.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg", "inc", "dec")
+                                 "lock cmpxchg", "inc", "dec", "sahf",
+                                 "fcomi", "fcomip", "fcompi", "fucomi",
+                                 "fucomip", "fucompi")
                or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")

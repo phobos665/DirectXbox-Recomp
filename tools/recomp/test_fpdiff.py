@@ -28,6 +28,10 @@ CASES = (
     "fld_m80",
     # ficom/ficomp compare st0 with an integer and ficomp pops.
     "ficom",
+    # EFLAGS from sahf, fcomi and comiss, read by every jcc/setcc/cmovcc,
+    # and the C2 tests the CRT makes through `fnstsw ax; sahf; jp`.
+    "fcomp_m32_t", "fcomi", "fucomi", "comiss", "ucomiss", "fcom_st1_sahf",
+    "fcomp_m32_sahf", "fcompp_sahf", "fucompp_sahf", "ftst_sahf", "seq_c2",
 )
 
 

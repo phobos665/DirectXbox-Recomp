@@ -114,15 +114,104 @@ def test_ucomiss_ah_semantics_evaluated():
 
 
 def test_fpu_unordered_reads_below_equal_and_parity():
-    # fcomi/fucomi/sahf set ZF, PF and CF on an unordered compare; g_fp_cmp
-    # is 2 then, which must not read as "greater".
+    # fcomi/fucomi/sahf set ZF, PF and CF on an unordered compare. The
+    # conditions read those bits from the _fa snapshot, so a later x87 compare
+    # or an AH edit before sahf cannot change them.
     from tools.recomp.lifter import _make_condition
     ja = _make_condition("ja", "fucomip", [])[0]
     jb = _make_condition("jb", "fucomip", [])[0]
     jp = _make_condition("jp", "sahf", [])[0]
-    assert "g_fp_cmp == 1" in ja and ">" not in ja, ja
-    assert "g_fp_cmp == 2" in jb, jb
-    assert "g_fp_cmp == 2" in jp, jp
+    assert "(!(_fa & 1u) && !(_fa & 0x40u))" in ja, ja
+    assert "(_fa & 1u)" in jb, jb
+    assert "(_fa & 4u)" in jp, jp
+    assert "g_fp_cmp" not in ja + jb + jp
+
+
+def _ax():
+    return _Op("ax", size=2)
+
+
+def test_sahf_snapshots_ah_and_keeps_the_previous_of():
+    # fnstsw ax; sahf: the snapshot is AH's SF/ZF/AF/PF/CF; OF comes from
+    # the setter before sahf (none here, so 0), put in _fb first.
+    block = _Block([_Insn("fnstsw", [_ax()], "ax"), _Insn("sahf", [], "")])
+    out = "\n".join(lift_basic_block(Lifter(), block)[0])
+    assert "_fb = (0) != 0; /* sahf keeps OF */" in out, out
+    assert "_fa = ((eax >> 8) & 0xD5u) | ((_fb & 1u) << 11); /* sahf */" in out, out
+    assert out.index("sahf keeps OF") < out.index("0xD5u"), out
+    assert "/* sahf - store AH" not in out, out
+
+
+def test_sahf_writes_cf_only_when_the_function_tracks_it():
+    lifter = Lifter()
+    assert not any("_cf" in s for s in lifter.lift_instruction(_Insn("sahf", [], "")))
+    lifter.needs_cf = True
+    assert "_cf = _fa & 1u;" in lifter.lift_instruction(_Insn("sahf", [], ""))
+
+
+def test_fcomi_snapshots_eflags_and_leaves_the_status_word():
+    out = "\n".join(Lifter().lift_instruction(
+        _Insn("fcomi", [_Op("st(1)")], "st(1)")))
+    assert "_fa = RECOMP_FCMP_CC(RECOMP_FCMP(fp_top(), fp_st1())) >> 8;" in out, out
+    assert "g_fp_cmp" not in out and "g_fp_cc" not in out, out
+
+
+def test_signed_conditions_after_sahf_and_fcomi():
+    from tools.recomp.lifter import _make_condition
+    for setter in ("sahf", "fcomi"):
+        for jcc in ("js", "jns", "jo", "jno", "jl", "jge", "jle", "jg"):
+            r = _make_condition(jcc, setter, [])
+            assert r is not None and "_fa" in r[0], (setter, jcc, r)
+
+
+def test_comiss_signed_conditions_are_constants_or_zf():
+    # comiss clears SF and OF: js/jo/jl never, jns/jno/jge always, and jle/jg
+    # reduce to ZF. These fell back to the never-assigned _flags.
+    from tools.recomp.lifter import _make_condition
+    import math
+    ops = [_Op("xmm0"), _Op("xmm1")]
+    assert _make_condition("js", "comiss", ops)[0] == "0"
+    assert _make_condition("jge", "ucomiss", ops)[0] == "1"
+
+    def ev(jcc, a, b):
+        e = _make_condition(jcc, "ucomiss", ops)[0]
+        e = e.replace("||", " or ").replace("&&", " and ").replace("!(", "not (")
+        return bool(eval(e, {"_fca": a, "_fcb": b}))
+    # jle = ZF = equal or unordered; jg = !ZF.
+    assert ev("jle", 1.0, 1.0) and ev("jle", math.nan, 1.0) and not ev("jle", 2.0, 1.0)
+    assert ev("jg", 2.0, 1.0) and ev("jg", 1.0, 2.0) and not ev("jg", math.nan, 1.0)
+
+
+def test_overflow_setcc_and_cmovcc_after_fcomi_are_lifted():
+    for insn in (_Insn("seto", [_Op("al", size=1)], "al"),
+                 _Insn("cmovno", [_Op("eax"), _Op("ecx")], "eax, ecx")):
+        block = _Block([_Insn("fcomi", [_Op("st(1)")], "st(1)"),
+                        insn])
+        out = "\n".join(lift_basic_block(Lifter(), block)[0])
+        assert "((_fa >> 11) & 1u)" in out, out
+
+
+def test_sahf_only_function_declares_the_snapshot():
+    # fnstsw ax; sahf; ret -- no cmp/test anywhere, yet the sahf lift writes
+    # _fa and reads _fb, so the translator must declare them.
+    from tools.recomp import config
+    from tools.recomp.translator import FunctionTranslator
+    from tools.conformance.corpus_run import _CONFIG_GLOBALS
+    base = 0x00011000
+    image = bytes.fromhex("DFE09EC3")
+    saved = {k: getattr(config, k) for k in _CONFIG_GLOBALS if hasattr(config, k)}
+    try:
+        config._install(
+            [config.Section(".text", base, len(image), 0, len(image), True)],
+            entry_point=base, kernel_thunk_addr=base, origin="sahf-test")
+        db = {base: {"start": f"0x{base:08X}", "end": base + len(image),
+                     "_addr": base, "size": len(image)}}
+        c = FunctionTranslator(image, db).translate_function(base, db[base])
+    finally:
+        for k, v in saved.items():
+            setattr(config, k, v)
+    assert "0xD5u" in c, c
+    assert "uint32_t _fa = 0, _fb = 0;" in c, c
 
 
 def test_comiss_unordered_sets_zf_pf_cf():

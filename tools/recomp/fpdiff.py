@@ -208,6 +208,17 @@ def cases():
                                      "done: mov ecx, eax"])
     add("seq_wait_sahf_jne", three + ["fcompp", "fwait", "fnstsw ax", "sahf"] + _jump("ne"))
     add("seq_fptan_sahf_jp", two + ["fptan", "fwait", "fnstsw ax", "sahf"] + _jump("p"))
+    # The CRT's C2 tests (_CIsin's `fsin; fnstsw ax; sahf; jp reduce`, fmod's
+    # `fprem; fnstsw ax; sahf; jp again`) behind an unordered compare, so a jp
+    # that reads the last compare instead of C2 is taken on every NaN input.
+    after_nan = three + ["fucompp", "fstp st(0)"]
+    add("seq_c2_fsin_sahf_jp", after_nan + ["fld1", "fsin", "fnstsw ax", "sahf"]
+        + _jump("p"), tol=1e-9)
+    add("seq_c2_fprem_sahf_jp", after_nan + ["fld1", "fld1", "faddp st(1), st", "fld1",
+                                             "fprem", "fnstsw ax", "sahf"] + _jump("p"))
+    # An AH edited between fnstsw and sahf is what sahf loads.
+    add("seq_c2_ah_edit_sahf_je", three + ["fcompp", "fnstsw ax", "and ah, 5", "sahf"]
+        + _jump("e"))
 
     for cmp in ("fcomi", "fcomip", "fucomi", "fucomip"):
         pre = two + [f"{cmp} st, st(1)"]

@@ -59,7 +59,9 @@ def test_fcomi_family_joins():
     # fld st0; fcomip st1 on one edge, fucomip st1 on the other, then ja.
     # test cl,cl; jle alt; fcomip st(1); jmp join; alt: fucomip st(1); join: ja skip; nop; skip: ret
     code = translate(bytes.fromhex('84c97e04dff1eb02dfe97701' + '90c3'))
-    assert 'if ((g_fp_cmp == 1)' in code, code
+    # fcomi leaves EFLAGS in _fa, so the merged join reads CF and ZF there.
+    assert 'if ((!(_fa & 1u) && !(_fa & 0x40u))' in code, code
+    assert 'g_fp_cmp' not in code, code
     assert 'if (_flags' not in code, code
 
 

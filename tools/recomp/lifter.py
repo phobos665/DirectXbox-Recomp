@@ -638,26 +638,31 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
                         "fucomip", "fcomi", "sahf"):
-        # g_fp_cmp is -1 less, 0 equal, 1 greater, 2 unordered. An
-        # unordered compare sets ZF, PF and CF all three, so it reads as
-        # below AND equal AND parity. Comparing g_fp_cmp against 0 made 2 look
-        # "greater": ja/jae went the wrong way on every NaN, and jp/jnp were
-        # constants.
+        # Both leave an EFLAGS image in _fa where they run: CF bit 0, PF bit
+        # 2, ZF bit 6, SF bit 7, and OF at bit 11. fcomi writes ZF/PF/CF from
+        # the compare and clears SF and OF; sahf loads SF/ZF/PF/CF from AH and
+        # keeps the OF it found. An unordered compare sets ZF, PF and CF all
+        # three, so it reads as below AND equal AND parity.
+        #
+        # Both used to read g_fp_cmp. After `fnstsw ax; sahf` that is the last
+        # x87 compare, not AH: the CRT's `fsin; fnstsw ax; sahf; jp` and
+        # `fprem; fnstsw ax; sahf; jp` test C2, which no compare wrote, and an
+        # edit of AH between fnstsw and sahf was lost. An fcomi's answer was
+        # overwritten by the next fcom/ftst before its jcc ran.
+        cf, zf, pf = "(_fa & 1u)", "(_fa & 0x40u)", "(_fa & 4u)"
+        sf, of = "((_fa >> 7) & 1u)", "((_fa >> 11) & 1u)"
         fpu_cmp_map = {
-            "ja": "(g_fp_cmp == 1)", "jnbe": "(g_fp_cmp == 1)",
-            "jae": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
-            "jnb": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
-            "jnc": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
-            "jb": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
-            "jnae": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
-            "jc": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
-            "jbe": "(g_fp_cmp != 1)", "jna": "(g_fp_cmp != 1)",
-            "je": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
-            "jz": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
-            "jne": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
-            "jnz": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
-            "jp": "(g_fp_cmp == 2)", "jpe": "(g_fp_cmp == 2)",
-            "jnp": "(g_fp_cmp != 2)", "jpo": "(g_fp_cmp != 2)",
+            "ja": f"(!{cf} && !{zf})", "jnbe": f"(!{cf} && !{zf})",
+            "jae": f"!{cf}", "jnb": f"!{cf}", "jnc": f"!{cf}",
+            "jb": cf, "jnae": cf, "jc": cf,
+            "jbe": f"({cf} || {zf})", "jna": f"({cf} || {zf})",
+            "je": zf, "jz": zf, "jne": f"!{zf}", "jnz": f"!{zf}",
+            "jp": pf, "jpe": pf, "jnp": f"!{pf}", "jpo": f"!{pf}",
+            "js": sf, "jns": f"!{sf}", "jo": of, "jno": f"!{of}",
+            "jl": f"({sf} != {of})", "jnge": f"({sf} != {of})",
+            "jge": f"({sf} == {of})", "jnl": f"({sf} == {of})",
+            "jle": f"({zf} || {sf} != {of})", "jng": f"({zf} || {sf} != {of})",
+            "jg": f"(!{zf} && {sf} == {of})", "jnle": f"(!{zf} && {sf} == {of})",
         }
         expr = fpu_cmp_map.get(jcc)
         if expr:
@@ -710,6 +715,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return u, desc
         if jcc in ("jnp", "jpo"):
             return f"!{u}", desc
+        # comiss clears SF and OF, so the sign and signed conditions are
+        # constants or reduce to ZF. These fell back to the never-assigned
+        # _flags.
+        if jcc in ("js", "jo", "jl", "jnge"):
+            return "0", desc
+        if jcc in ("jns", "jno", "jge", "jnl"):
+            return "1", desc
+        if jcc in ("jle", "jng"):
+            return f"({a} == {b} || {u})", desc
+        if jcc in ("jg", "jnle"):
+            return f"({a} != {b} && !{u})", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
@@ -1767,7 +1783,14 @@ class Lifter:
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
-            return ["/* sahf - store AH to flags */"]
+            # SF/ZF/AF/PF/CF from AH (AF is not modelled), with the OF
+            # lift_basic_block put in _fb from the setter before. The jcc
+            # reads this snapshot, so C2 after fsin/fprem/fxam reaches a jp
+            # and an AH edited between fnstsw and sahf is what is tested.
+            out = ["_fa = ((eax >> 8) & 0xD5u) | ((_fb & 1u) << 11); /* sahf */"]
+            if self.needs_cf:
+                out.append("_cf = _fa & 1u;")
+            return out
         if m == "shld":
             return self._lift_shld(insn, ops)
         if m == "shrd":
@@ -4235,19 +4258,26 @@ class Lifter:
         # These are exact-enough mappings onto libm. The 80-bit intermediates of
         # real x87 are not reproduced -- fp_stack is double -- which is the same
         # approximation every other op here already makes.
+        #
+        # The hardware sets C2 when |st0| >= 2^63 and leaves st0 alone; libm
+        # reduces any argument, so here the operation always completes and C2
+        # is cleared, as the hardware clears it in range. Leaving C2 as the
+        # last compare had it sent the CRT's `fsin; fnstsw ax; sahf; jp`
+        # into its reduction path after an unordered compare.
+        _c2 = " g_fp_cc &= (uint16_t)~0x0400u;"
         if m == "fsin":
-            return [f"fp_top() = sin(fp_top()); /* fsin */"]
+            return [f"fp_top() = sin(fp_top());{_c2} /* fsin */"]
         if m == "fcos":
-            return [f"fp_top() = cos(fp_top()); /* fcos */"]
+            return [f"fp_top() = cos(fp_top());{_c2} /* fcos */"]
         if m == "fsincos":
             # Replaces st0 with sin, then pushes cos. Order matters: the push
             # must see the sine already stored.
             return [f"{{ double _a = fp_top(); fp_top() = sin(_a);"
-                    f" fp_push(cos(_a)); }} /* fsincos */"]
+                    f" fp_push(cos(_a)); }}{_c2} /* fsincos */"]
         if m == "fptan":
             # st0 = tan(st0), then push 1.0. The constant push is not decoration:
             # callers use it as the denominator of a subsequent fdiv.
-            return [f"{{ fp_top() = tan(fp_top()); fp_push(1.0); }} /* fptan */"]
+            return [f"{{ fp_top() = tan(fp_top()); fp_push(1.0); }}{_c2} /* fptan */"]
         if m == "fpatan":
             # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
             return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"
@@ -4342,8 +4372,15 @@ class Lifter:
             pops = m.endswith("pi") or m.endswith("ip")
             pop_code = " fp_pop();" if pops else ""
             rhs = self._fcom_rhs(ops)
-            return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});"
-                    f"{pop_code} /* {m} */"]
+            # ZF/PF/CF as RECOMP_FCMP_CC places C3/C2/C0 (bits 14/10/8, so 6/2/0
+            # after the shift); SF and OF clear. The x87 status word is not
+            # touched, as on the hardware, and g_fp_cmp is left to the fcom
+            # family, so a later ftst cannot change this answer.
+            out = [f"_fa = RECOMP_FCMP_CC(RECOMP_FCMP(fp_top(), {rhs})) >> 8;"
+                   f"{pop_code} /* {m} */"]
+            if self.needs_cf:
+                out.append("_cf = _fa & 1u;")
+            return out
         if m == "fnstsw":
             # `fnstsw ax` after an FPU compare is half of the pre-SSE float
             # branch idiom `fcomp; fnstsw ax; test ah, mask; j(p/np/z/nz)`.
@@ -4495,7 +4532,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
                               "seta", "setl", "setge", "setle", "setg",
-                              "sets", "setns", "setp", "setnp", "setpe", "setpo")
+                              "sets", "setns", "setp", "setnp", "setpe", "setpo",
+                              "seto", "setno")
                 and last_flag_setter and len(curr.operands) >= 1):
             cond = _make_setcc_value(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -4521,7 +4559,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         if (curr.mnemonic in ("cmove", "cmovne", "cmovb", "cmovae",
                               "cmovbe", "cmova", "cmovl", "cmovge",
-                              "cmovle", "cmovg", "cmovs", "cmovns", "cmovp", "cmovnp", "cmovpe", "cmovpo")
+                              "cmovle", "cmovg", "cmovs", "cmovns", "cmovp", "cmovnp", "cmovpe", "cmovpo",
+                              "cmovo", "cmovno")
                 and last_flag_setter and len(curr.operands) >= 2):
             cond = _make_cmovcc_cond(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -4533,6 +4572,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
                     + f" /* {curr.mnemonic} */")
                 i += 1
                 continue
+
+        # sahf leaves OF alone, so the OF of the setter before it goes into
+        # _fb for the sahf lift to fold into its snapshot. Unknown is 0.
+        if curr.mnemonic == "sahf":
+            overflow = (_make_condition("jo", last_flag_setter, last_flag_ops)
+                        if last_flag_setter else None)
+            of = overflow[0] if overflow else "0"
+            if "_cf" in of and not lifter.needs_cf:
+                of = "0"
+            stmts.append(f"_fb = ({of}) != 0; /* sahf keeps OF */")
 
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
