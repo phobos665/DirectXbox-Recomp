@@ -167,10 +167,13 @@ volatile uint64_t g_icall_count;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
 void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
+/* RECOMP_BACKEDGE() at every loop header: no guest lock here, so never taken. */
+volatile int32_t g_guest_lock_waiters;
+void recomp_guest_backedge_yield(void) { }
 
 """
 
-_PREAMBLE_TAIL = """/* The corpus image is mapped at the address it was linked for, so a guest
+_PREAMBLE_TAIL ="""/* The corpus image is mapped at the address it was linked for, so a guest
    address is a host address and g_xbox_mem_offset stays 0. That is what lets
    the lifted code read a float constant out of .rdata, or index a jump table,
    without any relocation handling anywhere in the pipeline. */
