@@ -48,16 +48,25 @@ struct OutputVoice {
     uint32_t starved;
     bool fed;
     uint32_t mix_applied;           /* SlotMix::generation last applied */
+    uint32_t route_applied;         /* the submix key its sends point at, 0 = speakers */
 };
 
-/* recomp_audio_output_set_mix: kept per slot, not per voice, so a voice the
-   slot gets later (a format change, a reset) starts with it too. */
+/* recomp_audio_output_set_mix / _route: kept per slot, not per voice, so a
+   voice the slot gets later (a format change, a reset) starts with them. */
 struct SlotMix {
     bool set;
-    float levels[2][RECOMP_SPEAKERS];
-    float ratio;
+    RecompAudioMix mix;
     uint32_t generation;            /* bumped on every change; 0 = never set */
+    uint32_t route;                 /* submix key, 0 = speakers */
 };
+
+/* A mix-in buffer's submix (recomp_audio_output_set_submix). */
+struct Submix {
+    uint32_t key;
+    IXAudio2SubmixVoice *voice;
+    uint32_t channels;
+};
+constexpr uint32_t kSubmixCount = 32;
 
 /* Voices may play up to this much faster than they are submitted. */
 constexpr float kMaxFrequencyRatio = 8.0f;
@@ -91,6 +100,12 @@ bool meter_on;
    before the master's volume, and a muted run (RECOMP_MUTE) can still be
    measured. */
 IXAudio2SubmixVoice *meter_mix;
+/* The I3DL2 room (recomp_audio_output_set_reverb): one mono-in submix with
+   XAudio2's reverb, which takes I3DL2 parameters as the console's does.
+   Silent (volume 0) until a title describes a room. */
+IXAudio2SubmixVoice *reverb_voice;
+uint32_t reverb_inputs;             /* 1, or 2 where the reverb would not take mono */
+Submix submixes[kSubmixCount];
 unsigned long long meter_last_poll, meter_last_report;
 float meter_peak_max;
 unsigned long meter_readings, meter_over;
@@ -151,6 +166,12 @@ void destroyVoice(OutputVoice &voice)
 void releaseOutput()
 {
     for (auto &voice : voices) destroyVoice(voice);
+    for (auto &sub : submixes) {
+        if (sub.voice) sub.voice->DestroyVoice();
+        sub = {};
+    }
+    if (reverb_voice) reverb_voice->DestroyVoice();
+    reverb_voice = nullptr;
     if (meter_mix) meter_mix->DestroyVoice();
     meter_mix = nullptr;
     meter_on = false;
@@ -234,23 +255,112 @@ void foldSpeaker(float *matrix, uint32_t src_channels, uint32_t c, int speaker, 
     }
 }
 
-/* Put the slot's mix (if it has one) on its voice. */
-void applyMix(uint32_t slot, OutputVoice &voice)
+/* Where the dry mix goes: the meter's submix when there is one. */
+IXAudio2Voice *dryTarget()
 {
-    const SlotMix &mix = mixes[slot];
-    if (!voice.source || !mix.set || voice.mix_applied == mix.generation || !master_channels)
-        return;
+    return meter_mix ? static_cast<IXAudio2Voice *>(meter_mix)
+                     : static_cast<IXAudio2Voice *>(master);
+}
+
+Submix *findSubmix(uint32_t key)
+{
+    for (auto &sub : submixes)
+        if (sub.key == key && sub.voice) return &sub;
+    return nullptr;
+}
+
+/* A voice's sends: the submix it is routed to, or the speakers and the
+   reverb. A new send gets XAudio2's default levels, so the reverb's is set to
+   nothing straight away; the mix, if any, sets it properly. */
+void applySends(IXAudio2Voice *v, uint32_t channels, uint32_t route)
+{
+    XAUDIO2_SEND_DESCRIPTOR d[2] = {};
+    uint32_t n = 0;
+    Submix *sub = route ? findSubmix(route) : nullptr;
+    if (sub) {
+        d[n++] = {0, sub->voice};
+    } else {
+        d[n++] = {0, dryTarget()};
+        if (reverb_voice) d[n++] = {0, reverb_voice};
+    }
+    XAUDIO2_VOICE_SENDS sends{n, d};
+    v->SetOutputVoices(&sends);
+    if (!sub && reverb_voice) {
+        float zero[2 * 2] = {};
+        v->SetOutputMatrix(reverb_voice, channels, reverb_inputs, zero);
+    }
+}
+
+/* The speaker and reverb levels of `mix` on `v`, which has `channels`. */
+void applyLevels(IXAudio2Voice *v, uint32_t channels, const RecompAudioMix &mix)
+{
     float matrix[2 * XAUDIO2_MAX_AUDIO_CHANNELS] = {};
-    for (uint32_t c = 0; c < voice.channels && c < 2; ++c)
+    for (uint32_t c = 0; c < channels && c < 2; ++c)
         for (int s = 0; s < RECOMP_SPEAKERS; ++s)
             if (mix.levels[c][s] != 0.0f)
-                foldSpeaker(matrix, voice.channels, c, s, mix.levels[c][s]);
-    voice.source->SetOutputMatrix(meter_mix, voice.channels, master_channels, matrix);
+                foldSpeaker(matrix, channels, c, s, mix.levels[c][s]);
+    v->SetOutputMatrix(dryTarget(), channels, master_channels, matrix);
+    if (reverb_voice) {
+        float send[2 * 2] = {};
+        for (uint32_t c = 0; c < channels && c < 2; ++c)
+            for (uint32_t i = 0; i < reverb_inputs; ++i)
+                if (reverb_inputs == 1 || i == c || channels == 1)
+                    send[i * channels + c] = mix.reverb[c];
+        v->SetOutputMatrix(reverb_voice, channels, reverb_inputs, send);
+    }
+}
+
+/* Put the slot's mix and route (if it has them) on its voice. */
+void applyMix(uint32_t slot, OutputVoice &voice)
+{
+    SlotMix &sm = mixes[slot];
+    if (!voice.source || !master_channels)
+        return;
+    const uint32_t route = sm.route && findSubmix(sm.route) ? sm.route : 0;
+    if (voice.route_applied != route) {
+        applySends(voice.source, voice.channels, route);
+        voice.route_applied = route;
+        voice.mix_applied = 0;          /* the matrices go with the sends */
+    }
+    if (!sm.set || voice.mix_applied == sm.generation)
+        return;
+    const RecompAudioMix &mix = sm.mix;
+    if (route) {
+        /* Into the mix-in buffer as it is: channel for channel, a mono voice
+         * into every channel of a stereo submix, stereo into mono at half. */
+        Submix *sub = findSubmix(route);
+        float matrix[2 * 2] = {};
+        for (uint32_t c = 0; c < voice.channels && c < 2; ++c)
+            for (uint32_t o = 0; o < sub->channels && o < 2; ++o)
+                if (voice.channels == 1 || sub->channels == 1 || o == c)
+                    matrix[o * voice.channels + c] =
+                        (sub->channels == 1 && voice.channels == 2) ? 0.5f : 1.0f;
+        voice.source->SetOutputMatrix(sub->voice, voice.channels, sub->channels, matrix);
+    } else {
+        applyLevels(voice.source, voice.channels, mix);
+    }
+    XAUDIO2_FILTER_PARAMETERS filter{LowPassFilter, XAUDIO2_MAX_FILTER_FREQUENCY, 1.0f};
+    if (mix.filter.low_pass) {
+        filter.Frequency = mix.filter.frequency;
+        filter.OneOverQ = mix.filter.one_over_q;
+        if (!(filter.Frequency > 0.0f)) filter.Frequency = 0.0f;
+        if (filter.Frequency > XAUDIO2_MAX_FILTER_FREQUENCY) filter.Frequency = XAUDIO2_MAX_FILTER_FREQUENCY;
+        if (!(filter.OneOverQ > 0.0f)) filter.OneOverQ = 0.01f;
+        if (filter.OneOverQ > XAUDIO2_MAX_FILTER_ONEOVERQ) filter.OneOverQ = XAUDIO2_MAX_FILTER_ONEOVERQ;
+    }
+    voice.source->SetFilterParameters(&filter);
     float ratio = mix.ratio;
     if (!(ratio >= 1.0f / kMaxFrequencyRatio)) ratio = 1.0f / kMaxFrequencyRatio;
     if (ratio > kMaxFrequencyRatio) ratio = kMaxFrequencyRatio;
     voice.source->SetFrequencyRatio(ratio);
-    voice.mix_applied = mix.generation;
+    voice.mix_applied = sm.generation;
+}
+
+float gainOf(int32_t hundredth_db)
+{
+    if (hundredth_db <= -10000) return 0.0f;
+    if (hundredth_db > 0) hundredth_db = 0;
+    return std::pow(10.0f, hundredth_db / 2000.0f);
 }
 
 /* RECOMP_AUDIO_METER: read the mastering voice's peak, at most every 2 ms,
@@ -389,12 +499,43 @@ extern "C" void recomp_audio_output_initialize(void)
             master->GetVoiceDetails(&details);
             XAUDIO2_EFFECT_DESCRIPTOR effect{apo, TRUE, master_channels};
             XAUDIO2_EFFECT_CHAIN chain{1, &effect};
+            /* Processing stage 2: after the mix-in submixes (0) and the
+               reverb (1), which both send to it. */
             meter_on = SUCCEEDED(engine->CreateSubmixVoice(
-                &meter_mix, master_channels, details.InputSampleRate, 0, 0, nullptr, &chain));
+                &meter_mix, master_channels, details.InputSampleRate, 0, 2, nullptr, &chain));
             if (!meter_on) meter_mix = nullptr;
             apo->Release();
             std::fprintf(stderr, "[audio-output] RECOMP_AUDIO_METER: %s\n",
                          meter_on ? "metering the mix" : "could not attach the meter");
+        }
+    }
+    /* The I3DL2 room. XAudio2's reverb takes I3DL2 parameters through
+       ReverbConvertI3DL2ToNative, as the console's DSP reverb takes them from
+       IDirectSound_SetI3DL2Listener. RECOMP_AUDIO_REVERB=0 for none. */
+    {
+        const char *rev = std::getenv("RECOMP_AUDIO_REVERB");
+        if (!(rev && std::strcmp(rev, "0") == 0) && master_channels) {
+            XAUDIO2_VOICE_DETAILS details{};
+            master->GetVoiceDetails(&details);
+            const uint32_t outs = master_channels == 6 ? 6u : 2u;
+            for (uint32_t ins = 1; ins <= 2 && !reverb_voice; ++ins) {
+                IUnknown *apo = nullptr;
+                if (FAILED(XAudio2CreateReverb(&apo, 0))) break;
+                XAUDIO2_EFFECT_DESCRIPTOR effect{apo, TRUE, outs};
+                XAUDIO2_EFFECT_CHAIN chain{1, &effect};
+                XAUDIO2_SEND_DESCRIPTOR d{0, dryTarget()};
+                XAUDIO2_VOICE_SENDS sends{1, &d};
+                if (SUCCEEDED(engine->CreateSubmixVoice(&reverb_voice, ins,
+                        details.InputSampleRate, 0, 1, &sends, &chain)))
+                    reverb_inputs = ins;
+                else
+                    reverb_voice = nullptr;
+                apo->Release();
+            }
+            if (reverb_voice) reverb_voice->SetVolume(0.0f);
+            std::fprintf(stderr, "[audio-output] reverb: %s\n",
+                         reverb_voice ? (reverb_inputs == 1 ? "ready (mono send)" : "ready (stereo send)")
+                                      : "could not be made; voices play dry");
         }
     }
     /* RECOMP_MUTE: silent, but everything else as usual. RECOMP_AUDIO_GAIN=0
@@ -436,20 +577,97 @@ extern "C" void recomp_audio_output_reset_voice(uint32_t slot)
     if (slot < kVoiceCount) destroyVoice(voices[slot]);
 }
 
-extern "C" void recomp_audio_output_set_mix(uint32_t slot,
-                                            const float levels[2][RECOMP_SPEAKERS],
-                                            float ratio)
+extern "C" void recomp_audio_output_set_mix(uint32_t slot, const RecompAudioMix *mix)
 {
-    if (slot >= kVoiceCount || !levels) return;
-    SlotMix &mix = mixes[slot];
-    if (mix.set && mix.ratio == ratio &&
-        std::memcmp(mix.levels, levels, sizeof mix.levels) == 0)
+    if (slot >= kVoiceCount || !mix) return;
+    SlotMix &sm = mixes[slot];
+    if (sm.set && std::memcmp(&sm.mix, mix, sizeof sm.mix) == 0)
         return;
-    std::memcpy(mix.levels, levels, sizeof mix.levels);
-    mix.ratio = ratio;
-    mix.set = true;
-    if (++mix.generation == 0) mix.generation = 1;
+    sm.mix = *mix;
+    sm.set = true;
+    if (++sm.generation == 0) sm.generation = 1;
     if (engine) applyMix(slot, voices[slot]);
+}
+
+extern "C" void recomp_audio_output_route(uint32_t slot, uint32_t key)
+{
+    if (slot >= kVoiceCount || mixes[slot].route == key) return;
+    mixes[slot].route = key;
+    if (++mixes[slot].generation == 0) mixes[slot].generation = 1;
+    if (engine) applyMix(slot, voices[slot]);
+}
+
+extern "C" void recomp_audio_output_set_submix(uint32_t key, uint32_t channels,
+                                               const RecompAudioMix *mix,
+                                               int32_t volume_hundredth_db)
+{
+    recomp_audio_output_initialize();
+    if (!engine || !key || !mix || !master_channels) return;
+    if (channels < 1 || channels > 2) channels = 2;
+    Submix *sub = findSubmix(key);
+    if (sub && sub->channels != channels) {
+        /* A different shape: make it again, and point what was routed to it
+           there anew at the next submission. */
+        sub->voice->DestroyVoice();
+        *sub = {};
+        sub = nullptr;
+        for (auto &v : voices) if (v.route_applied == key) v.route_applied = ~0u;
+    }
+    if (!sub) {
+        for (auto &s : submixes) if (!s.voice) { sub = &s; break; }
+        if (!sub) {
+            static bool said;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "[audio-output] more than %u mix-in buffers; "
+                             "the rest play to the speakers\n", kSubmixCount);
+            }
+            return;
+        }
+        XAUDIO2_VOICE_DETAILS details{};
+        master->GetVoiceDetails(&details);
+        XAUDIO2_SEND_DESCRIPTOR d[2] = {{0, dryTarget()}, {0, reverb_voice}};
+        XAUDIO2_VOICE_SENDS sends{reverb_voice ? 2u : 1u, d};
+        if (FAILED(engine->CreateSubmixVoice(&sub->voice, channels, details.InputSampleRate,
+                                             0, 0, &sends, nullptr))) {
+            sub->voice = nullptr;
+            return;
+        }
+        sub->key = key;
+        sub->channels = channels;
+        std::fprintf(stderr, "[audio-output] mix-in buffer %08X: %u-channel submix\n",
+                     key, channels);
+    }
+    applyLevels(sub->voice, channels, *mix);
+    sub->voice->SetVolume(gainOf(volume_hundredth_db));
+}
+
+extern "C" void recomp_audio_output_set_reverb(const RecompI3dl2 *room)
+{
+    recomp_audio_output_initialize();
+    if (!engine || !reverb_voice) return;
+    if (!room || room->room <= -10000) {
+        reverb_voice->SetVolume(0.0f);
+        return;
+    }
+    XAUDIO2FX_REVERB_I3DL2_PARAMETERS i3{};
+    i3.WetDryMix = 100.0f;                 /* a send: all of what reaches it is the room */
+    i3.Room = room->room;
+    i3.RoomHF = room->room_hf;
+    i3.RoomRolloffFactor = room->room_rolloff_factor;
+    i3.DecayTime = room->decay_time;
+    i3.DecayHFRatio = room->decay_hf_ratio;
+    i3.Reflections = room->reflections;
+    i3.ReflectionsDelay = room->reflections_delay;
+    i3.Reverb = room->reverb;
+    i3.ReverbDelay = room->reverb_delay;
+    i3.Diffusion = room->diffusion;
+    i3.Density = room->density;
+    i3.HFReference = room->hf_reference;
+    XAUDIO2FX_REVERB_PARAMETERS native{};
+    ReverbConvertI3DL2ToNative(&i3, &native);
+    reverb_voice->SetEffectParameters(0, &native, sizeof native);
+    reverb_voice->SetVolume(1.0f);
 }
 
 extern "C" void recomp_audio_output_clear_mix(uint32_t slot)
@@ -513,11 +731,10 @@ extern "C" int recomp_audio_output_submit(
         format.wBitsPerSample = static_cast<WORD>(bits_per_sample);
         /* Not XAUDIO2_VOICE_NOPITCH: a slot's mix may set a frequency ratio
            (pitch, Doppler), and changing the rate must not mean a new voice. */
-        XAUDIO2_SEND_DESCRIPTOR send{0, meter_mix};
-        XAUDIO2_VOICE_SENDS sends{1, &send};
+        /* USEFILTER: a slot's mix may carry the voice's DLS2 filter. The sends
+           are set straight after (applySends), before anything plays. */
         HRESULT error = engine->CreateSourceVoice(
-            &voice.source, &format, 0, kMaxFrequencyRatio, nullptr,
-            meter_mix ? &sends : nullptr);
+            &voice.source, &format, XAUDIO2_VOICE_USEFILTER, kMaxFrequencyRatio);
         if (FAILED(error)) {
             dropBuffer(slot, "create-voice");
             disableOutput("CreateSourceVoice", error);
@@ -526,6 +743,8 @@ extern "C" int recomp_audio_output_submit(
         voice.sample_rate = sample_rate;
         voice.channels = channels;
         voice.bits_per_sample = bits_per_sample;
+        voice.route_applied = 0;
+        applySends(voice.source, channels, 0);
         error = voice.source->Start();
         if (FAILED(error)) {
             dropBuffer(slot, "start-voice");

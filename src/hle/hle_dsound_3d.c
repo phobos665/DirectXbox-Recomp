@@ -80,6 +80,7 @@ enum {
     DS3DMODE_DISABLE = 2u,
 
     CAPS_CTRL3D = 0x00000010u,
+    CAPS_MIXIN = 0x00002000u,
     CAPS_MUTE3DATMAXDISTANCE = 0x00020000u,
 
     BIN_XTLK_FRONT_LEFT = 6u, BIN_XTLK_FRONT_RIGHT = 7u,
@@ -128,11 +129,29 @@ typedef struct Voice {
     uint32_t frequency;             /* streams: SetFrequency/SetPitch, 0 = own rate */
     uint64_t used_ms;               /* last mixed: the table drops the stalest */
     uint64_t trace_ms;              /* RECOMP_DS3D_TRACE */
+    /* DSI3DL2BUFFER (SetI3DL2Source): the direct path's level and the send
+     * into the room, hundredths of a dB. */
+    int32_t i3dl2_direct, i3dl2_room;
+    int i3dl2_set;
+    /* SetFilter: DSFILTERDESC's mode and its first two coefficients, which
+     * the XDK writes to the voice's FC0 (cutoff) and FC1 (resonance). */
+    uint32_t filter_mode;
+    int32_t filter_fc;
+    uint32_t filter_q;
+    uint32_t output;                /* SetOutputBuffer: the mix-in buffer, 0 = speakers */
+    int mixin;                      /* created with DSBCAPS_MIXIN */
+    /* SetEG: DSENVELOPEDESC as given, for the amplitude envelope [0] and the
+     * multi (pitch and filter) envelope [1]. */
+    uint32_t eg[2][10];
+    int eg_set[2];
 } Voice;
 
 static Voice g_voices[VOICES];
 static Ds3dListener g_listener, g_listener_pending;
 static int g_listener_pending_set;
+/* DSI3DL2LISTENER (IDirectSound_SetI3DL2Listener), deferred like the rest. */
+static RecompI3dl2 g_room, g_room_pending;
+static int g_room_set, g_room_pending_set, g_room_dirty;
 static CRITICAL_SECTION g_lock;
 static INIT_ONCE g_lock_once = INIT_ONCE_STATIC_INIT;
 
@@ -206,13 +225,21 @@ static void default_buffer(Ds3dBuffer *b)
     b->distance_factor = b->rolloff_factor = b->doppler_factor = 1.0f;
 }
 
+/* Where each key was last found: the pump looks every voice up several
+ * times every 5 ms, and the table is 640 long. A hint, checked before use. */
+static uint16_t g_hint[1024];
+
 static Voice *find(uint32_t key)
 {
-    uint32_t i;
+    uint32_t i, h = (key >> 2) & 1023u;
     if (!key) return NULL;
+    if (g_hint[h] < VOICES && g_voices[g_hint[h]].key == key)
+        return &g_voices[g_hint[h]];
     for (i = 0; i < VOICES; i++)
-        if (g_voices[i].key == key)
+        if (g_voices[i].key == key) {
+            g_hint[h] = (uint16_t)i;
             return &g_voices[i];
+        }
     return NULL;
 }
 
@@ -344,10 +371,13 @@ static int speaker_of(uint32_t bin)
     }
 }
 
-int hle_ds3d_mix(uint32_t key, uint32_t channels, int32_t voice_volume,
-                 float levels[2][RECOMP_SPEAKERS], float *doppler)
+int hle_ds3d_mix(uint32_t key, uint32_t channels, int32_t voice_volume, int force,
+                 RecompAudioMix *mix, uint32_t *route)
 {
+    static Voice none;              /* a voice nothing was said about */
     Voice *v;
+    float (*levels)[RECOMP_SPEAKERS] = mix->levels;
+    int reverb_heard = 0;
     uint8_t bins[MAX_BINS];
     int32_t vols[MAX_BINS];
     uint32_t count, k;
@@ -360,10 +390,19 @@ int hle_ds3d_mix(uint32_t key, uint32_t channels, int32_t voice_volume,
         return 0;
     lock();
     v = find(key);
-    if (!v || (!v->is3d && !v->bins_set)) {
-        unlock();
-        return 0;
+    if (!v || (!v->is3d && !v->bins_set && !v->i3dl2_set && !v->filter_mode && !v->output &&
+               !v->eg_set[1])) {
+        if (!force) {
+            unlock();
+            return 0;
+        }
+        if (!v) {
+            if (!none.now.min_distance) default_buffer(&none.now);
+            v = &none;
+        }
     }
+    memset(mix, 0, sizeof *mix);
+    *route = v->output;
     three_d = v->is3d && v->now.mode != DS3DMODE_DISABLE;
 
     if (three_d) {
@@ -409,15 +448,28 @@ int hle_ds3d_mix(uint32_t key, uint32_t channels, int32_t voice_volume,
         bins[0] = 0u; bins[1] = 1u; vols[0] = vols[1] = 0;
     }
 
-    memset(levels, 0, sizeof(float) * 2u * RECOMP_SPEAKERS);
     for (k = 0; k < count; k++) {
         uint32_t bin = bins[k], c = channels == 2u ? (k & 1u) : 0u;
         int speaker = speaker_of(bin);
         int32_t atten = vols[k] > 0 ? 0 : vols[k];
         float gain;
 
+        if (bin == BIN_I3DL2) {
+            /* The send into the room: the bin's level, the 3D distance and
+             * cone (the XDK adds them to this bin as to the speakers), and
+             * SetI3DL2Source's room level. */
+            if (three_d) atten += dist + cone;
+            if (v->i3dl2_set) atten += v->i3dl2_room > 0 ? 0 : v->i3dl2_room;
+            if (voice_volume + atten > -ATTEN_SILENT) {
+                mix->reverb[c] += powf(10.0f, (float)atten / 2000.0f);
+                reverb_heard = 1;
+            }
+            continue;
+        }
         if (speaker < 0)
             continue;
+        if (v->i3dl2_set)               /* SetI3DL2Source's direct-path level */
+            atten += v->i3dl2_direct > 0 ? 0 : v->i3dl2_direct;
         if (three_d) {
             atten += dist + cone;
             if (bin == BIN_XTLK_FRONT_LEFT || bin == BIN_XTLK_FRONT_RIGHT) atten += front;
@@ -433,13 +485,13 @@ int hle_ds3d_mix(uint32_t key, uint32_t channels, int32_t voice_volume,
         levels[c][speaker] += gain;
         audible = 1;
     }
-    if (!audible) {
+    if (!audible && !reverb_heard) {
         /* Heard only through effects this runtime does not run: play it dry on
          * the front speakers rather than not at all. */
         static int said;
         float gain = three_d ? powf(10.0f, (float)(dist + cone) / 2000.0f) : 1.0f;
         if (!said++)
-            fprintf(stderr, "[DS3D] voice %08X is routed only to reverb or effect sends, "
+            fprintf(stderr, "[DS3D] voice %08X is routed only to effect sends, "
                     "which are not run; playing it on the front speakers\n", key);
         for (k = 0; k < channels; k++) {
             levels[k][RECOMP_SPEAKER_FRONT_LEFT] = channels == 2u ? (k == 0 ? gain : 0.0f) : gain;
@@ -460,10 +512,79 @@ int hle_ds3d_mix(uint32_t key, uint32_t channels, int32_t voice_volume,
         fflush(stderr);
         v->trace_ms = now;
     }
-    v->used_ms = now;
+    /* The voice's filter: DLS2 is the voice processor's resonant low-pass,
+     * read as xemu reads FC0 and FC1 -- 2^(fc/4096) for the state-variable
+     * coefficient, q/0x8000 for its damping -- which is XAudio2's filter's
+     * own parameterisation. Which modes run it depends on the voice, as in
+     * xemu's voice_process: a 3D voice's modes are 1 DLS2+I3DL2, 2
+     * ParaEQ+I3DL2 and 3 I3DL2 alone; a 2D voice's 1 DLS2, 2 ParaEQ, and 3
+     * DLS2+ParaEQ when mono, bypass when stereo. MK Shaolin Monks gives its
+     * 3D voices mode 3 with FC0 0x8000 -- no low-pass; read as one, the
+     * coefficient is the floor and the voice would be muffled to nothing.
+     * ParaEQ is not run (xemu does not run it either). */
+    if (v->filter_mode == 1u || (v->filter_mode == 3u && !v->is3d && channels == 1u)) {
+        float f = powf(2.0f, (float)v->filter_fc / 4096.0f);
+        float q = (float)v->filter_q / 32768.0f;
+        if (f < 0.003906f) f = 0.003906f;
+        if (f > 1.0f) f = 1.0f;
+        if (q < 0.079407f) q = 0.079407f;
+        if (q > 1.0f) q = 1.0f;
+        mix->filter.low_pass = 1;
+        mix->filter.frequency = f;
+        mix->filter.one_over_q = q;
+    }
+    if (v != &none)
+        v->used_ms = now;
     unlock();
-    *doppler = three_d ? ratio : 1.0f;
+    mix->ratio = three_d ? ratio : 1.0f;
     return 1;
+}
+
+uint32_t hle_ds3d_mixins(uint32_t *keys, uint32_t max)
+{
+    uint32_t i, n = 0u;
+    lock();
+    for (i = 0; i < VOICES && n < max; i++)
+        if (g_voices[i].key && g_voices[i].mixin)
+            keys[n++] = g_voices[i].key;
+    unlock();
+    return n;
+}
+
+int hle_ds3d_envelope(uint32_t voice, uint32_t which, uint32_t out[10])
+{
+    Voice *v;
+    int set = 0;
+    if (which > 1u) return 0;
+    lock();
+    v = find(voice);
+    if (v && v->eg_set[which]) {
+        memcpy(out, v->eg[which], sizeof v->eg[which]);
+        set = 1;
+    }
+    unlock();
+    return set;
+}
+
+void hle_ds3d_service(void)
+{
+    RecompI3dl2 room;
+    int dirty;
+    lock();
+    dirty = g_room_dirty;
+    room = g_room;
+    g_room_dirty = 0;
+    unlock();
+    if (dirty) {
+        if (tracing())
+            fprintf(stderr, "[DS3D] I3DL2 room %d (HF %d), decay %.2f s (HF x%.2f), "
+                    "reflections %d after %.3f s, reverb %d after %.3f s, diffusion %.0f, "
+                    "density %.0f\n", room.room, room.room_hf, (double)room.decay_time,
+                    (double)room.decay_hf_ratio, room.reflections,
+                    (double)room.reflections_delay, room.reverb, (double)room.reverb_delay,
+                    (double)room.diffusion, (double)room.density);
+        recomp_audio_output_set_reverb(&room);
+    }
 }
 
 uint32_t hle_ds3d_stream_frequency(uint32_t stream)
@@ -524,6 +645,14 @@ void hle_ds3d_created(uint32_t key, uint32_t flags, uint32_t mixbins)
     v = get(key);
     v->is3d = (flags & CAPS_CTRL3D) != 0u;
     v->mute_at_max = (flags & CAPS_MUTE3DATMAXDISTANCE) != 0u;
+    v->mixin = (flags & CAPS_MIXIN) != 0u;
+    if (v->mixin) {
+        static int said;
+        if (said < 4) {
+            said++;
+            fprintf(stderr, "[DS3D] buffer %08X is a mix-in buffer\n", key);
+        }
+    }
     read_mixbins(v, mixbins, 1);
     unlock();
 }
@@ -1039,6 +1168,185 @@ HLE_EXPORT(IDirectSound_SetAllParameters)
     PASS(IDirectSound_SetAllParameters);
 }
 
+/* The room (DSI3DL2LISTENER, the same fields in the same order as
+ * RecompI3dl2): IDirectSound_SetI3DL2Listener(this, pds3dl, dwApply). The
+ * host's reverb takes it from the service thread (hle_ds3d_service). */
+static void read_room(RecompI3dl2 *r, uint32_t p)
+{
+    r->room = (int32_t)HLE_MEM32(p);
+    r->room_hf = (int32_t)HLE_MEM32(p + 4u);
+    r->room_rolloff_factor = as_float(HLE_MEM32(p + 8u));
+    r->decay_time = as_float(HLE_MEM32(p + 0xCu));
+    r->decay_hf_ratio = as_float(HLE_MEM32(p + 0x10u));
+    r->reflections = (int32_t)HLE_MEM32(p + 0x14u);
+    r->reflections_delay = as_float(HLE_MEM32(p + 0x18u));
+    r->reverb = (int32_t)HLE_MEM32(p + 0x1Cu);
+    r->reverb_delay = as_float(HLE_MEM32(p + 0x20u));
+    r->diffusion = as_float(HLE_MEM32(p + 0x24u));
+    r->density = as_float(HLE_MEM32(p + 0x28u));
+    r->hf_reference = as_float(HLE_MEM32(p + 0x2Cu));
+}
+
+HLE_ORIGINAL(IDirectSound_SetI3DL2Listener);
+HLE_EXPORT(IDirectSound_SetI3DL2Listener)
+{
+    uint32_t p = HLE_ARG(1), apply = HLE_ARG(2);
+    if (p && guest_readable(p, 0x30u)) {
+        lock();
+        if (apply & DS3D_DEFERRED) {
+            read_room(&g_room_pending, p);
+            g_room_pending_set = 1;
+        } else {
+            read_room(&g_room, p);
+            g_room_set = g_room_dirty = 1;
+        }
+        unlock();
+        {
+            static int said;
+            if (said < 4) {
+                said++;
+                fprintf(stderr, "[DS3D] I3DL2 listener: room %d, decay %.2f s%s\n",
+                        (int32_t)HLE_MEM32(p), (double)as_float(HLE_MEM32(p + 0xCu)),
+                        (apply & DS3D_DEFERRED) ? " (deferred)" : "");
+            }
+        }
+    }
+    PASS(IDirectSound_SetI3DL2Listener);
+}
+
+/* DSI3DL2BUFFER { lDirect, lDirectHF, lRoom, lRoomHF, flRoomRolloffFactor,
+ * Obstruction, Occlusion }: the source's direct level and its send into the
+ * room, which hle_ds3d_mix adds to the speaker bins and to the I3DL2 bin.
+ * Taken at once whatever dwApply says. The high-frequency levels, the
+ * obstruction and the occlusion shape the console's I3DL2 send and direct
+ * path filters, which this runtime does not run. */
+static void i3dl2_source(uint32_t key, uint32_t p)
+{
+    Voice *v;
+    if (!p || !guest_readable(p, 0x10u))
+        return;
+    lock();
+    v = get(key);
+    if (v) {
+        v->i3dl2_direct = (int32_t)HLE_MEM32(p);
+        v->i3dl2_room = (int32_t)HLE_MEM32(p + 8u);
+        v->i3dl2_set = 1;
+    }
+    unlock();
+}
+
+HLE_ORIGINAL(IDirectSoundBuffer_SetI3DL2Source);
+HLE_EXPORT(IDirectSoundBuffer_SetI3DL2Source)
+{
+    i3dl2_source(HLE_ARG(0), HLE_ARG(1));
+    PASS(IDirectSoundBuffer_SetI3DL2Source);
+}
+
+HLE_ORIGINAL(IDirectSoundStream_SetI3DL2Source);
+HLE_EXPORT(IDirectSoundStream_SetI3DL2Source)
+{
+    i3dl2_source(HLE_ARG(0), HLE_ARG(1));
+    PASS(IDirectSoundStream_SetI3DL2Source);
+}
+
+/* DSFILTERDESC { dwMode, dwQCoefficient, adwCoefficients[4] }: the XDK writes
+ * the first two coefficients to the voice's FC0 and FC1. Mode 0 is bypass. */
+static void filter(uint32_t key, uint32_t p)
+{
+    Voice *v;
+    if (!p || !guest_readable(p, 0x18u))
+        return;
+    lock();
+    v = get(key);
+    if (v) {
+        v->filter_mode = HLE_MEM32(p);
+        v->filter_fc = (int16_t)(HLE_MEM32(p + 8u) & 0xFFFFu);
+        v->filter_q = HLE_MEM32(p + 0xCu) & 0xFFFFu;
+        if (tracing())
+            fprintf(stderr, "[DS3D] voice %08X filter mode %u, FC0 %d, FC1 %u\n",
+                    key, v->filter_mode, v->filter_fc, v->filter_q);
+    }
+    unlock();
+}
+
+HLE_ORIGINAL(IDirectSoundBuffer_SetFilter);
+HLE_EXPORT(IDirectSoundBuffer_SetFilter)
+{
+    filter(HLE_ARG(0), HLE_ARG(1));
+    PASS(IDirectSoundBuffer_SetFilter);
+}
+
+HLE_ORIGINAL(IDirectSoundStream_SetFilter);
+HLE_EXPORT(IDirectSoundStream_SetFilter)
+{
+    filter(HLE_ARG(0), HLE_ARG(1));
+    PASS(IDirectSoundStream_SetFilter);
+}
+
+/* SetOutputBuffer(this, pOutputBuffer): play into a mix-in buffer (NULL: back
+ * to the mix bins). */
+static void output_buffer(uint32_t key, uint32_t out)
+{
+    Voice *v;
+    lock();
+    v = get(key);
+    if (v) v->output = out;
+    unlock();
+}
+
+HLE_ORIGINAL(IDirectSoundBuffer_SetOutputBuffer);
+HLE_EXPORT(IDirectSoundBuffer_SetOutputBuffer)
+{
+    output_buffer(HLE_ARG(0), HLE_ARG(1));
+    PASS(IDirectSoundBuffer_SetOutputBuffer);
+}
+
+HLE_ORIGINAL(IDirectSoundStream_SetOutputBuffer);
+HLE_EXPORT(IDirectSoundStream_SetOutputBuffer)
+{
+    output_buffer(HLE_ARG(0), HLE_ARG(1));
+    PASS(IDirectSoundStream_SetOutputBuffer);
+}
+
+/* SetEG(this, pEnvelopeDesc): DSENVELOPEDESC's ten DWORDs, the first saying
+ * which envelope (0 amplitude, 1 multi). hle_dsound.c runs them. */
+static void envelope(uint32_t key, uint32_t p)
+{
+    Voice *v;
+    uint32_t k, which;
+    if (!p || !guest_readable(p, 40u))
+        return;
+    which = HLE_MEM32(p) & 1u;
+    lock();
+    v = get(key);
+    if (v) {
+        for (k = 0; k < 10u; k++)
+            v->eg[which][k] = HLE_MEM32(p + k * 4u);
+        v->eg_set[which] = 1;
+        if (tracing())
+            fprintf(stderr, "[DS3D] voice %08X %s envelope: mode %u, delay %u attack %u "
+                    "hold %u decay %u release %u sustain %u, pitch %d filter %d\n", key,
+                    which ? "multi" : "amplitude", v->eg[which][1], v->eg[which][2],
+                    v->eg[which][3], v->eg[which][4], v->eg[which][5], v->eg[which][6],
+                    v->eg[which][7], (int8_t)v->eg[which][8], (int8_t)v->eg[which][9]);
+    }
+    unlock();
+}
+
+HLE_ORIGINAL(IDirectSoundBuffer_SetEG);
+HLE_EXPORT(IDirectSoundBuffer_SetEG)
+{
+    envelope(HLE_ARG(0), HLE_ARG(1));
+    PASS(IDirectSoundBuffer_SetEG);
+}
+
+HLE_ORIGINAL(IDirectSoundStream_SetEG);
+HLE_EXPORT(IDirectSoundStream_SetEG)
+{
+    envelope(HLE_ARG(0), HLE_ARG(1));
+    PASS(IDirectSoundStream_SetEG);
+}
+
 /* Everything deferred becomes what is heard. */
 HLE_ORIGINAL(IDirectSound_CommitDeferredSettings);
 HLE_EXPORT(IDirectSound_CommitDeferredSettings)
@@ -1048,6 +1356,11 @@ HLE_EXPORT(IDirectSound_CommitDeferredSettings)
     if (g_listener_pending_set) {
         g_listener = g_listener_pending;
         g_listener_pending_set = 0;
+    }
+    if (g_room_pending_set) {
+        g_room = g_room_pending;
+        g_room_set = g_room_dirty = 1;
+        g_room_pending_set = 0;
     }
     for (i = 0; i < VOICES; i++)
         if (g_voices[i].key && g_voices[i].pending_set) {

@@ -481,15 +481,17 @@ static void pump(Stream *s, uint64_t now)
             /* Where it is heard, and how fast: hle_dsound_3d.c. The stream's
              * clock is the host's play position, which counts what was
              * submitted however fast it plays. */
-            float levels[2][RECOMP_SPEAKERS], doppler = 1.0f;
-            if (hle_ds3d_mix(s->iface, s->channels, s->volume, levels, &doppler)) {
+            RecompAudioMix mix;
+            uint32_t route = 0u;
+            if (hle_ds3d_mix(s->iface, s->channels, s->volume, 0, &mix, &route)) {
                 uint32_t asked = hle_ds3d_stream_frequency(s->iface);
-                float ratio = (asked ? (float)asked / (float)s->rate : 1.0f) * doppler;
-                recomp_audio_output_set_mix(slot_of(s), (const float (*)[RECOMP_SPEAKERS])levels,
-                                            ratio);
+                mix.ratio *= asked ? (float)asked / (float)s->rate : 1.0f;
+                recomp_audio_output_set_mix(slot_of(s), &mix);
+                recomp_audio_output_route(slot_of(s), route);
                 s->mixed = 1;
             } else if (s->mixed) {
                 recomp_audio_output_clear_mix(slot_of(s));
+                recomp_audio_output_route(slot_of(s), 0u);
                 s->mixed = 0;
             }
         }
@@ -585,6 +587,7 @@ static void forget_stream(Stream *s)
 {
     recomp_audio_output_reset_voice(slot_of(s));
     recomp_audio_output_clear_mix(slot_of(s));
+    recomp_audio_output_route(slot_of(s), 0u);
     memset(s, 0, sizeof *s);
 }
 

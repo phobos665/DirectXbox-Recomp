@@ -137,6 +137,20 @@ per slot and `RECOMP_AUDIO_CAPTURE=<dir>` writes what each slot was given as raw
 muted run (`RECOMP_MUTE=1`) still produces all of it. A stream's `ran dry` is also the
 silence between two lines of dialogue, so compare runs rather than reading one.
 
+**Where a sound is heard, and how (Oct 2026, `src/hle/hle_dsound_3d.c`).** Mix bins, 3D
+position (the XDK's own distance, cone and Doppler arithmetic), pitch, the I3DL2 room
+(XAudio2's reverb, fed by each voice's I3DL2 bin and `SetI3DL2Source`), the DLS2 filter,
+mix-in buffers (`SetOutputBuffer` into host submixes), envelopes (`SetEG`, xemu's shapes
+stepped 1500 times a second, `StopEx` with `DSBSTOPEX_ENVELOPE` stopping after the release)
+and position notifications are all replaced through the public API. Two things to know: a
+filter mode means different things on a 3D and a 2D voice (MK Shaolin Monks gives its 3D
+voices mode 3, which is reverb-only, with a cutoff that read as DLS2 is the floor), and the
+mix sums past full scale in fights, so the master has a limiter. `RECOMP_DS3D_TRACE=1` shows
+each voice's bins, levels, filter and envelope; `RECOMP_AUDIO_METER=1` the mix's peak. Not
+run: the DSP effects image beyond its reverb (32 of 37 titles in `games/` download one),
+mix-bin headroom (31), HRTF (24, panned instead), LFO (10), ParaEQ, and reverb on the SDL
+backend.
+
 **Widescreen and internal resolution** are investigated in
 `docs/technical/widescreen-and-resolution.md`, with every work item classified toolkit or
 game-specific. Two things to know before touching either: `XGetVideoFlags` returns 0 today

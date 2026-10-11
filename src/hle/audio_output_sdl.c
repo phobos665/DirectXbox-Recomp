@@ -53,13 +53,25 @@ typedef struct {
     uint32_t mix_applied;
 } voice;
 
-/* recomp_audio_output_set_mix, per slot (see the XAudio2 file). */
+/* recomp_audio_output_set_mix / _route, per slot (see the XAudio2 file),
+ * and the slot's filter state. */
 typedef struct {
     int      set;
-    float    levels[2][RECOMP_SPEAKERS];
-    float    ratio;
+    RecompAudioMix mix;
     uint32_t generation;
+    uint32_t route;                  /* mix-in submix key, 0 = speakers */
+    float    svf_low[2], svf_band[2];
 } slot_mix;
+
+/* A mix-in buffer's submix. Mixing is linear, so a voice routed into one is
+ * the voice's channels taken through the submix's levels and gain: composed
+ * per voice here, with no second mixing stage. */
+typedef struct {
+    uint32_t key, channels;
+    RecompAudioMix mix;
+    float gain;
+} submix;
+#define SUBMIXES 32u
 
 #define MIX_FRAME_BYTES (RECOMP_SPEAKERS * 4u)
 #define MAX_RATIO       8.0f
@@ -68,6 +80,7 @@ static pthread_mutex_t   g_lock = PTHREAD_MUTEX_INITIALIZER;
 static SDL_AudioDeviceID g_device;
 static voice             g_voices[VOICE_COUNT];
 static slot_mix          g_mixes[VOICE_COUNT];
+static submix            g_submixes[SUBMIXES];
 static int               g_reported_nonzero[VOICE_COUNT];
 static int               g_attempted, g_summary_printed;
 static unsigned long long g_submitted_buffers, g_submitted_bytes, g_nonzero_buffers;
@@ -110,9 +123,52 @@ static uint64_t voice_played(voice *v)
     return waiting >= v->submitted ? 0 : v->submitted - waiting;
 }
 
-/* The caller's PCM as 5.1 float frames with the slot's mix applied. */
-static float *mix_pcm(const slot_mix *m, const uint8_t *pcm, uint32_t bytes,
-                      uint32_t channels, uint32_t bits, uint32_t *out_bytes)
+static const submix *find_submix(uint32_t key)
+{
+    uint32_t i;
+    for (i = 0; key && i < SUBMIXES; i++)
+        if (g_submixes[i].key == key)
+            return &g_submixes[i];
+    return NULL;
+}
+
+/* Whether the slot plays through a mix, and which: its own, or its own pitch
+ * and filter with the levels of the submix it is routed to. */
+static int effective_mix(uint32_t slot, uint32_t channels, RecompAudioMix *out)
+{
+    const slot_mix *m = &g_mixes[slot];
+    const submix *sub = find_submix(m->route);
+    uint32_t c, o, s;
+
+    if (!m->set && !sub)
+        return 0;
+    if (m->set) {
+        *out = m->mix;
+    } else {
+        memset(out, 0, sizeof *out);
+        out->ratio = 1.0f;
+    }
+    if (sub) {
+        memset(out->levels, 0, sizeof out->levels);
+        memset(out->reverb, 0, sizeof out->reverb);
+        for (c = 0; c < channels && c < 2u; c++)
+            for (o = 0; o < sub->channels && o < 2u; o++) {
+                float into;
+                if (!(channels == 1u || sub->channels == 1u || o == c))
+                    continue;
+                into = (sub->channels == 1u && channels == 2u) ? 0.5f : 1.0f;
+                for (s = 0; s < RECOMP_SPEAKERS; s++)
+                    out->levels[c][s] += into * sub->mix.levels[o][s] * sub->gain;
+            }
+    }
+    return 1;
+}
+
+/* The caller's PCM as 5.1 float frames with the slot's mix applied: the
+ * voice's low-pass (a state-variable filter, as the console's and XAudio2's
+ * are) on each channel, then its speaker levels. */
+static float *mix_pcm(slot_mix *m, const RecompAudioMix *mix, const uint8_t *pcm,
+                      uint32_t bytes, uint32_t channels, uint32_t bits, uint32_t *out_bytes)
 {
     static float *buf;
     static uint32_t cap;
@@ -134,8 +190,14 @@ static float *mix_pcm(const slot_mix *m, const uint8_t *pcm, uint32_t bytes,
             float x = bits == 8u ? ((float)pcm[f * frame + c] - 128.0f) / 128.0f
                                  : (float)(int16_t)(pcm[f * frame + c * 2u] |
                                                     pcm[f * frame + c * 2u + 1u] << 8) / 32768.0f;
+            if (mix->filter.low_pass) {
+                float high = x - m->svf_low[c] - mix->filter.one_over_q * m->svf_band[c];
+                m->svf_band[c] += mix->filter.frequency * high;
+                m->svf_low[c] += mix->filter.frequency * m->svf_band[c];
+                x = m->svf_low[c];
+            }
             for (s = 0; s < RECOMP_SPEAKERS; s++)
-                o[s] += x * m->levels[c][s];
+                o[s] += x * mix->levels[c][s];
         }
     }
     *out_bytes = need;
@@ -298,23 +360,72 @@ void recomp_audio_output_reset_voice(uint32_t slot)
     pthread_mutex_unlock(&g_lock);
 }
 
-void recomp_audio_output_set_mix(uint32_t slot, const float levels[2][RECOMP_SPEAKERS],
-                                 float ratio)
+void recomp_audio_output_set_mix(uint32_t slot, const RecompAudioMix *mix)
 {
     slot_mix *m;
 
-    if (slot >= VOICE_COUNT || !levels)
+    if (slot >= VOICE_COUNT || !mix)
         return;
     pthread_mutex_lock(&g_lock);
     m = &g_mixes[slot];
-    if (!m->set || m->ratio != ratio || memcmp(m->levels, levels, sizeof m->levels) != 0) {
-        memcpy(m->levels, levels, sizeof m->levels);
-        m->ratio = ratio;
+    if (!m->set || memcmp(&m->mix, mix, sizeof m->mix) != 0) {
+        m->mix = *mix;
         m->set = 1;
         if (++m->generation == 0)
             m->generation = 1;
     }
     pthread_mutex_unlock(&g_lock);
+}
+
+void recomp_audio_output_route(uint32_t slot, uint32_t key)
+{
+    if (slot >= VOICE_COUNT)
+        return;
+    pthread_mutex_lock(&g_lock);
+    if (g_mixes[slot].route != key) {
+        g_mixes[slot].route = key;
+        if (++g_mixes[slot].generation == 0)
+            g_mixes[slot].generation = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+void recomp_audio_output_set_submix(uint32_t key, uint32_t channels, const RecompAudioMix *mix,
+                                    int32_t volume_hundredth_db)
+{
+    submix *sub = NULL;
+    uint32_t i;
+
+    if (!key || !mix)
+        return;
+    pthread_mutex_lock(&g_lock);
+    for (i = 0; i < SUBMIXES && !sub; i++)
+        if (g_submixes[i].key == key) sub = &g_submixes[i];
+    for (i = 0; i < SUBMIXES && !sub; i++)
+        if (!g_submixes[i].key) sub = &g_submixes[i];
+    if (sub) {
+        sub->key = key;
+        sub->channels = channels == 1u ? 1u : 2u;
+        sub->mix = *mix;
+        sub->gain = volume_hundredth_db <= -10000 ? 0.0f
+                  : powf(10.0f, (float)(volume_hundredth_db > 0 ? 0 : volume_hundredth_db) / 2000.0f);
+        /* What is routed here mixes anew. */
+        for (i = 0; i < VOICE_COUNT; i++)
+            if (g_mixes[i].route == key && ++g_mixes[i].generation == 0)
+                g_mixes[i].generation = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* No reverb on this backend yet: voices play dry. */
+void recomp_audio_output_set_reverb(const RecompI3dl2 *room)
+{
+    static int said;
+    if (room && room->room > -10000 && !said) {
+        said = 1;
+        fprintf(stderr, "[audio-output] the title describes an I3DL2 room; this backend "
+                "has no reverb yet, so it plays dry\n");
+    }
 }
 
 void recomp_audio_output_clear_mix(uint32_t slot)
@@ -355,6 +466,8 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     uint32_t block_align, i;
     voice *v;
     float gain;
+    int mixed_now = 0;
+    RecompAudioMix eff;
     int nonzero = 0;
     const uint8_t silence = bits_per_sample == 8 ? 0x80 : 0;
 
@@ -379,9 +492,15 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         return 0;
     }
     v = &g_voices[slot];
+    {
+        RecompAudioMix probe;
+        mixed_now = effective_mix(slot, channels, &probe);
+        if (mixed_now)
+            eff = probe;
+    }
     if (v->stream && (v->sample_rate != sample_rate || v->channels != channels ||
                       v->bits_per_sample != bits_per_sample ||
-                      v->mixed != g_mixes[slot].set))
+                      v->mixed != mixed_now))
         destroy_voice(v);
     if (!v->stream) {
         SDL_AudioSpec src;
@@ -389,7 +508,7 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         src.format = bits_per_sample == 8 ? SDL_AUDIO_U8 : SDL_AUDIO_S16LE;
         src.channels = (int)channels;
         src.freq = (int)sample_rate;
-        if (g_mixes[slot].set) {
+        if (mixed_now) {
             src.format = SDL_AUDIO_F32;
             src.channels = RECOMP_SPEAKERS;   /* SDL's 5.1 order is the Xbox's */
         }
@@ -404,10 +523,10 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         v->sample_rate = sample_rate;
         v->channels = channels;
         v->bits_per_sample = bits_per_sample;
-        v->mixed = g_mixes[slot].set;
+        v->mixed = mixed_now;
     }
     if (v->mixed && v->mix_applied != g_mixes[slot].generation) {
-        float ratio = g_mixes[slot].ratio;
+        float ratio = eff.ratio;
         if (!(ratio >= 1.0f / MAX_RATIO)) ratio = 1.0f / MAX_RATIO;
         if (ratio > MAX_RATIO) ratio = MAX_RATIO;
         SDL_SetAudioStreamFrequencyRatio(v->stream, ratio);
@@ -429,7 +548,7 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     }
     if (v->mixed) {
         uint32_t out_bytes = 0;
-        const float *frames = mix_pcm(&g_mixes[slot], pcm, bytes, channels,
+        const float *frames = mix_pcm(&g_mixes[slot], &eff, pcm, bytes, channels,
                                       bits_per_sample, &out_bytes);
         if (!frames || !SDL_PutAudioStreamData(v->stream, frames, (int)out_bytes)) {
             drop_buffer(slot, "submit");
