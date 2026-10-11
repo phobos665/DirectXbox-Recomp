@@ -148,6 +148,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_subdirectory(tests/d3d8_capture)        # portable: the capture container
     add_subdirectory(tests/host_timer)          # portable: the sub-millisecond timer
     add_subdirectory(tests/mmio_decode)         # x86-64 decoder; skips on other CPUs
+    add_subdirectory(tests/kernel_file_rename)  # FileRenameInformation, either file backend
     if(NOT WIN32)
         add_subdirectory(tests/host_window)     # needs a display; run by hand
         add_subdirectory(tests/audio_output)    # muted; skips with no device

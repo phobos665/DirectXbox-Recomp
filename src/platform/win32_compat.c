@@ -395,6 +395,18 @@ const char *w32_handle_path(HANDLE h)
     return (!w32_handle_is_value(h) && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
+void w32_handle_set_path(HANDLE h, const char *host_path)
+{
+    w32_object *o = (w32_object *)h;
+    char *old;
+
+    if (w32_handle_is_value(h) || o->kind != K_FILE)
+        return;
+    old = o->file_path;
+    o->file_path = host_path ? strdup(host_path) : NULL;
+    free(old);
+}
+
 BOOL CloseHandle(HANDLE h)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||

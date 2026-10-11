@@ -18,6 +18,7 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -734,6 +735,116 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     }
 }
 
+/* What a failed host rename means to the guest. */
+static NTSTATUS rename_error_to_status(DWORD e)
+{
+    switch (e) {
+        case ERROR_ALREADY_EXISTS:
+        case ERROR_FILE_EXISTS:      return STATUS_OBJECT_NAME_COLLISION;
+        case ERROR_ACCESS_DENIED:    return STATUS_ACCESS_DENIED;
+        case ERROR_SHARING_VIOLATION: return STATUS_SHARING_VIOLATION;
+        case ERROR_FILE_NOT_FOUND:   return STATUS_OBJECT_NAME_NOT_FOUND;
+        case ERROR_PATH_NOT_FOUND:   return STATUS_OBJECT_PATH_NOT_FOUND;
+        case ERROR_NOT_SAME_DEVICE:  return STATUS_NOT_SAME_DEVICE;
+        case ERROR_INVALID_NAME:     return STATUS_OBJECT_NAME_INVALID;
+        default:                     return STATUS_UNSUCCESSFUL;
+    }
+}
+
+/* Rename an open file (NtSetInformationFile, FileRenameInformation).
+ *
+ * A title can write a file under a temporary name and rename it into place
+ * -- a utility-drive cache file built as name.tmp and renamed to name.dat,
+ * or a save written beside the old one. Unhandled, the rename failed, the
+ * final name never appeared, and the title rebuilt the file on every visit
+ * (upstream #190).
+ *
+ * The target resolves through translate_obj_path, the same rules
+ * NtCreateFile uses (relative to RootDirectory, else the guest path table),
+ * except that a bare name with no root renames within the file's own
+ * directory, as on NT. The handle does the rename (FileRenameInfo), so it
+ * keeps working afterwards and needs no share mode; that takes DELETE access,
+ * which an XAPI MoveFile open asks for. FileRenameInfo is passed to the NT
+ * call as it is, so the name has to be an NT path (\??\C:\...), not a DOS
+ * one. If the handle cannot do it, MoveFileExW on its path is the fallback,
+ * which works only when the open shared delete. */
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
+{
+    WCHAR src[MAX_PATH], dst[MAX_PATH], full[MAX_PATH], nt[MAX_PATH + 8];
+    const char *name = get_xbox_path(NewName);
+    DWORD n;
+    BOOL ok = FALSE;
+    DWORD err = 0;
+
+    if (!FileHandle || FileHandle == INVALID_HANDLE_VALUE)
+        return STATUS_INVALID_HANDLE;
+    if (!name || !*name)
+        return STATUS_OBJECT_NAME_INVALID;
+    n = GetFinalPathNameByHandleW(FileHandle, src, MAX_PATH,
+                                  FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!n || n >= MAX_PATH)
+        return STATUS_INVALID_HANDLE;
+
+    if (!NewName->RootDirectory && !strchr(name, '\\') && !strchr(name, ':')) {
+        WCHAR *slash = wcsrchr(src, L'\\');
+        size_t dir = slash ? (size_t)(slash - src) + 1 : 0;
+        memcpy(dst, src, dir * sizeof(WCHAR));
+        if (!MultiByteToWideChar(CP_ACP, 0, name, -1, dst + dir,
+                                 (int)(MAX_PATH - dir)))
+            return STATUS_OBJECT_NAME_INVALID;
+    } else if (!translate_obj_path(NewName, dst, MAX_PATH)) {
+        fprintf(stderr, "  [FILE] rename to %s: path translation failed\n", name);
+        fflush(stderr);
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    /* Absolute (the game directory may be configured relative), then NT. */
+    n = GetFullPathNameW(dst, MAX_PATH, full, NULL);
+    if (!n || n >= MAX_PATH)
+        return STATUS_OBJECT_NAME_INVALID;
+    if (wcsncmp(full, L"\\\\?\\", 4) == 0)
+        swprintf_s(nt, MAX_PATH + 8, L"\\??\\%s", full + 4);
+    else if (wcsncmp(full, L"\\\\", 2) == 0)
+        swprintf_s(nt, MAX_PATH + 8, L"\\??\\UNC\\%s", full + 2);
+    else
+        swprintf_s(nt, MAX_PATH + 8, L"\\??\\%s", full);
+
+    {
+        size_t len = wcslen(nt);
+        size_t bytes = sizeof(FILE_RENAME_INFO) + len * sizeof(WCHAR);
+        FILE_RENAME_INFO *fri = (FILE_RENAME_INFO *)calloc(1, bytes);
+        if (fri) {
+            fri->ReplaceIfExists = ReplaceIfExists ? TRUE : FALSE;
+            fri->RootDirectory = NULL;
+            fri->FileNameLength = (DWORD)(len * sizeof(WCHAR));
+            memcpy(fri->FileName, nt, (len + 1) * sizeof(WCHAR));
+            ok = SetFileInformationByHandle(FileHandle, FileRenameInfo, fri,
+                                            (DWORD)bytes);
+            if (!ok)
+                err = GetLastError();
+            free(fri);
+        }
+    }
+    /* A collision is the answer, not a reason to try another way. */
+    if (!ok && err != ERROR_ALREADY_EXISTS && err != ERROR_FILE_EXISTS) {
+        const WCHAR *from = wcsncmp(src, L"\\\\?\\", 4) == 0 ? src + 4 : src;
+        ok = MoveFileExW(from, full, ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0);
+        if (!ok && !err)
+            err = GetLastError();
+    }
+    if (!ok) {
+        NTSTATUS st = rename_error_to_status(err);
+        fprintf(stderr, "  [FILE] rename %ls -> %ls FAILED (win32 err=%u) -> 0x%08X\n",
+                src, full, (unsigned)err, (unsigned)st);
+        fflush(stderr);
+        return st;
+    }
+    fprintf(stderr, "  [FILE] rename %ls -> %ls\n", src, full);
+    fflush(stderr);
+    return STATUS_SUCCESS;
+}
+
 /* The sectors per cluster recorded in a FATX superblock at the start of the
  * file behind `h`, or 0 when it does not hold one (a host directory, an
  * ordinary file, a partition image nobody has formatted). The superblock is
@@ -1136,6 +1247,35 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
+/* An OBJECT_ATTRIBUTES path to a host path: relative to an open directory
+ * when RootDirectory is set and the name is not absolute (XDeleteSaveGame
+ * opens each child of its save directory this way), else through the guest
+ * path table. The POSIX twin of the Win32 translate_obj_path; NtCreateFile
+ * and the rename share it so a renamed file lands where a later open of the
+ * same name looks. `who` names the caller in the log. */
+static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+                               char *host_path, size_t buf_size, const char *who)
+{
+    const char *xbox_path = get_xbox_path(ObjectAttributes);
+    if (xbox_path && ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
+        !(xbox_path[0] && xbox_path[1] == ':')) {
+        const char *root = w32_handle_path(ObjectAttributes->RootDirectory);
+        if (!root || snprintf(host_path, buf_size, "%s/%s", root, xbox_path)
+                         >= (int)buf_size) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "%s: relative open with no root path", who);
+            return FALSE;
+        }
+        for (char *p = host_path; *p; p++)
+            if (*p == '\\') *p = '/';
+        return TRUE;
+    }
+    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, (DWORD)buf_size)) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "%s: path translation failed", who);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -1152,22 +1292,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     /* The same rules as the Win32 half, which says why each one is there;
      * this half had none of them. */
     const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (xbox_path && ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
-        !(xbox_path[0] && xbox_path[1] == ':')) {
-        /* Relative to an open directory (XDeleteSaveGame opens each child
-         * of its save directory this way). */
-        const char *root = w32_handle_path(ObjectAttributes->RootDirectory);
-        if (!root || snprintf(host_path, sizeof host_path, "%s/%s", root, xbox_path)
-                         >= (int)sizeof host_path) {
-            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: relative open with no root path");
-            return STATUS_OBJECT_PATH_NOT_FOUND;
-        }
-        for (char *p = host_path; *p; p++)
-            if (*p == '\\') *p = '/';
-    } else if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
+    if (!translate_obj_path(ObjectAttributes, host_path, sizeof host_path,
+                            "NtCreateFile"))
         return STATUS_OBJECT_PATH_NOT_FOUND;
-    }
     ensure_e_root_folder(xbox_path, CreateDisposition);
 
     /* A partition device opened as a directory (a free-space query): the
@@ -1469,6 +1596,64 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
+}
+
+/* Rename an open file (NtSetInformationFile, FileRenameInformation). See
+ * the Win32 half for why a title needs it. The target resolves through
+ * translate_obj_path, as NtCreateFile's does, except that a bare name with no
+ * root renames within the file's own directory, as on NT.
+ *
+ * rename() replaces an existing target, so ReplaceIfExists = FALSE is checked
+ * first. The handle keeps working (the fd follows the inode), and its
+ * recorded path is updated, so a later delete-on-close (which unlinks by
+ * path here) removes the new name and not whatever takes the old one. */
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
+{
+    char dst[MAX_PATH];
+    const char *src = w32_handle_path(FileHandle);
+    const char *name = get_xbox_path(NewName);
+    struct stat st;
+
+    if (!src)
+        return STATUS_INVALID_HANDLE;
+    if (!name || !*name)
+        return STATUS_OBJECT_NAME_INVALID;
+
+    if (!NewName->RootDirectory && !strchr(name, '\\') && !strchr(name, ':')) {
+        const char *slash = strrchr(src, '/');
+        size_t dir = slash ? (size_t)(slash - src) + 1 : 0;
+        if (dir + strlen(name) >= sizeof dst)
+            return STATUS_OBJECT_NAME_INVALID;
+        memcpy(dst, src, dir);
+        strcpy(dst + dir, name);
+    } else if (!translate_obj_path(NewName, dst, sizeof dst, "rename")) {
+        fprintf(stderr, "  [FILE] rename to %s: path translation failed\n", name);
+        fflush(stderr);
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    if (strcmp(src, dst) != 0) {
+        NTSTATUS status = STATUS_SUCCESS;
+        if (!ReplaceIfExists && lstat(dst, &st) == 0) {
+            status = STATUS_OBJECT_NAME_COLLISION;
+        } else if (rename(src, dst) != 0) {
+            int e = errno;
+            status = e == EXDEV ? STATUS_NOT_SAME_DEVICE
+                   : e == ENAMETOOLONG ? STATUS_OBJECT_NAME_INVALID
+                   : errno_to_status(e);
+        }
+        if (status != STATUS_SUCCESS) {
+            fprintf(stderr, "  [FILE] rename %s -> %s FAILED -> 0x%08X\n",
+                    src, dst, (unsigned)status);
+            fflush(stderr);
+            return status;
+        }
+    }
+    fprintf(stderr, "  [FILE] rename %s -> %s\n", src, dst);
+    fflush(stderr);
+    w32_handle_set_path(FileHandle, dst);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
