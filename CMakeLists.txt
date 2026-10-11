@@ -85,6 +85,20 @@ else()
     find_package(SDL3 CONFIG REQUIRED)
 endif()
 
+# ── miniupnpc ─────────────────────────────────────────────────
+# So a System Link host can ask its router to forward the port friends join
+# on (src/net). Static, from third_party/miniupnp (miniupnpc 2.3.3, BSD-3,
+# `git submodule update --init third_party/miniupnp`). Without it the build
+# still works and the host says it cannot open the router.
+if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/third_party/miniupnp/miniupnpc/CMakeLists.txt)
+    set(UPNPC_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    set(UPNPC_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(UPNPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(UPNPC_BUILD_SAMPLE OFF CACHE BOOL "" FORCE)
+    set(UPNPC_NO_INSTALL ON CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/miniupnp/miniupnpc EXCLUDE_FROM_ALL)
+endif()
+
 # ── Runtime Libraries ─────────────────────────────────────────
 
 # Platform: Win32/NT type vocabulary + POSIX implementation of generic
@@ -95,6 +109,9 @@ add_subdirectory(src/platform)
 # Player settings, read by the d3d backend, the kernel and the HLE, so it
 # comes before all three and depends on none of them.
 add_subdirectory(src/config)
+
+# System Link's router and address helpers, for the kernel and the launcher.
+add_subdirectory(src/net)
 
 # The launcher a title ships beside its game. Defines recomp_add_launcher
 # for a title's CMakeLists to call; builds nothing on its own.
@@ -147,6 +164,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_subdirectory(tests/nv2a_vsh)
     add_subdirectory(tests/d3d8_capture)        # portable: the capture container
     add_subdirectory(tests/host_timer)          # portable: the sub-millisecond timer
+    add_subdirectory(tests/syslink_hub)         # portable: the System Link switch, on 127.0.0.1
     add_subdirectory(tests/mmio_decode)         # x86-64 decoder; skips on other CPUs
     add_subdirectory(tests/kernel_file_rename)  # FileRenameInformation, either file backend
     if(NOT WIN32)

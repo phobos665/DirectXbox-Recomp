@@ -39,9 +39,10 @@
  * The register names are Linux forcedeth's for the same nForce MAC, there as
  * a reading aid. Offsets nobody named print bare.
  *
- * The card. Under RECOMP_SYSLINK=udp the registers have the behaviour XNet
- * relies on -- the idle bit after a reset, write-1-to-clear status, a kick
- * that sends -- and the card moves frames between the guest's descriptor
+ * The card. Under RECOMP_SYSLINK (host, join or udp; `syslink` in the
+ * settings file) the registers have the behaviour XNet relies on -- the idle
+ * bit after a reset, write-1-to-clear status, a kick that sends -- and the
+ * card moves frames between the guest's descriptor
  * rings and the tunnel in xbox_net_udp.c, raising its interrupt on bus level
  * 4 from the kernel's timer thread. Sending happens on the kick itself;
  * received frames go in on the next timer tick.
@@ -840,14 +841,16 @@ void xbox_NicInit(void *host)
 {
     const char *trace = getenv("RECOMP_NIC_TRACE");
     const char *budget = getenv("RECOMP_NIC_TRACE_BUDGET");
-    const char *link = getenv("RECOMP_SYSLINK");
+    /* The launcher's System Link tab writes `syslink`; the variable wins. */
+    const char *link = recomp_config_lookup("RECOMP_SYSLINK", "syslink");
     DWORD old;
 
     s_nic.trace = trace && *trace && strcmp(trace, "0") != 0;
     s_nic.model = link && *link && strcmp(link, "0") != 0 &&
                   _stricmp(link, "off") != 0;
-    if (s_nic.model && _stricmp(link, "udp") != 0) {
-        fprintf(stderr, "[NIC] RECOMP_SYSLINK=%s: only \"udp\" exists so far; "
+    if (s_nic.model && _stricmp(link, "udp") != 0 && _stricmp(link, "host") != 0 &&
+        _stricmp(link, "join") != 0) {
+        fprintf(stderr, "[NIC] syslink = %s: not host, join or udp; "
                         "the card stays off\n", link);
         s_nic.model = 0;
     }

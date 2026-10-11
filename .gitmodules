@@ -27,3 +27,6 @@
 	path = third_party/SDL
 	url = https://github.com/libsdl-org/SDL.git
 	ignore = untracked
+[submodule "third_party/miniupnp"]
+	path = third_party/miniupnp
+	url = https://github.com/miniupnp/miniupnp.git

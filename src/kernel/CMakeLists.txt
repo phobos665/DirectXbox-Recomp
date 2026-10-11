@@ -46,6 +46,8 @@ target_include_directories(xbox_kernel PUBLIC
     ${XBOXRECOMP_SRC_DIR}
 )
 target_link_libraries(xbox_kernel PUBLIC xbox_config)
+# The System Link host's router forward and addresses (xbox_net_udp.c).
+target_link_libraries(xbox_kernel PRIVATE xbox_net)
 
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
