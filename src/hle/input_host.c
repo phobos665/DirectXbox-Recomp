@@ -37,6 +37,8 @@ enum {
     XBOX_DPAD_RIGHT = 0x0008u,
     XBOX_START = 0x0010u,
     XBOX_BACK = 0x0020u,
+    XBOX_LTHUMB = 0x0040u,
+    XBOX_RTHUMB = 0x0080u,
 };
 
 /* RECOMP_FAKE_INPUT=start,a  presses each listed button in turn, one per
@@ -63,6 +65,7 @@ static const struct { const char *name; int kind; unsigned value; int sign; } FA
     { "x",     FAKE_ANALOG, HOST_ANALOG_X, 0 },   { "y",     FAKE_ANALOG, HOST_ANALOG_Y, 0 },
     { "white", FAKE_ANALOG, HOST_ANALOG_WHITE, 0 }, { "black", FAKE_ANALOG, HOST_ANALOG_BLACK, 0 },
     { "lt",    FAKE_ANALOG, HOST_ANALOG_LTRIG, 0 }, { "rt",    FAKE_ANALOG, HOST_ANALOG_RTRIG, 0 },
+    { "lthumb", FAKE_BUTTON, XBOX_LTHUMB, 0 },    { "rthumb", FAKE_BUTTON, XBOX_RTHUMB, 0 },
     { "lstick_up",    FAKE_STICK, STICK_LY,  1 }, { "lstick_down",  FAKE_STICK, STICK_LY, -1 },
     { "lstick_left",  FAKE_STICK, STICK_LX, -1 }, { "lstick_right", FAKE_STICK, STICK_LX,  1 },
     { "rstick_up",    FAKE_STICK, STICK_RY,  1 }, { "rstick_down",  FAKE_STICK, STICK_RY, -1 },
