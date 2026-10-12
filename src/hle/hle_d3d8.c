@@ -2588,6 +2588,17 @@ static int cpu_frame_upload(uint32_t surface, const char *how)
     return 1;
 }
 
+/* For a title project that paces its own movie copy (Rainbow Six 3's
+ * recomp_manual.c): this frame the title skipped writing the back buffer, and
+ * what it wrote last time is still there in guest memory -- the host never
+ * writes guest memory -- so it is shown again exactly as if the title had
+ * locked the back buffer and copied the same picture in. */
+void hle_d3d8_cpu_frame_repeat(void)
+{
+    if (g_shadow)
+        g_cpu_bb_locked = 1;
+}
+
 /* Before a host draw into the screen: a back buffer the title locked since
  * the last draw goes down first, under what is drawn next. */
 static void cpu_frame_underlay(void)

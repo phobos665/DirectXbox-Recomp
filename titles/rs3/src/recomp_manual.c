@@ -163,6 +163,99 @@ __attribute__((constructor)) static void rs3_defaults(void)
 }
 #endif
 
+/* ── Rainbow Six 3: Bink movies paced by the clock ─────────── */
+
+/*
+ * sub_002BC000 is the title's "show the next movie frame": BinkDoFrame,
+ * BinkNextFrame, then BinkCopyToBuffer into the locked back buffer. It never
+ * calls BinkWait. On the console that is right only because the title runs
+ * at 30 (it asks D3D for INTERVAL_TWO) and every movie is 30 fps, so one call
+ * a frame is one movie frame. At 60 the intro, the menu backgrounds and the
+ * mission intros played at twice their speed.
+ *
+ * This wrapper is what makes 60 possible without touching the movies: it
+ * calls the title's own function only when the movie's next frame is due by
+ * the clock, at the rate in the Bink header (HBINK +0x14 / +0x18), and on the
+ * frames in between leaves the back buffer as the last call wrote it and has
+ * the renderer show it again (hle_d3d8_cpu_frame_repeat). Half a frame of
+ * slack keeps every call due at 30; a movie that has fallen more than two
+ * frames behind (the title stopped calling, or a new movie reused the handle)
+ * is re-based rather than raced to catch up. RECOMP_RS3_MOVIE_PACE=0 turns
+ * it off.
+ */
+extern void sub_002BC000_gen(void);
+uint64_t xbox_ReadTimeStampCounter(void);     /* 733,333,333 Hz, the console's */
+void hle_d3d8_cpu_frame_repeat(void);
+int xbox_EnvSwitch(const char *name, int default_on);
+
+#define RS3_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
+#define RS3_TSC_HZ 733333333ull
+
+void sub_002BC000(void)
+{
+    static int pace = -1;
+    static uint32_t movie;
+    static uint64_t t0, shown;
+    uint32_t bink = RS3_MEM32(g_esp + 4), rate, div;
+    uint64_t now, half_frames;
+
+    if (pace < 0)
+        pace = xbox_EnvSwitch("RECOMP_RS3_MOVIE_PACE", 1);
+    if (!pace || !bink) {
+        sub_002BC000_gen();
+        return;
+    }
+    rate = RS3_MEM32(bink + 0x14);
+    div = RS3_MEM32(bink + 0x18);
+    if (!rate || !div || rate / div > 120u) {
+        rate = 30u;
+        div = 1u;
+    }
+    now = xbox_ReadTimeStampCounter();
+    if (bink != movie) {
+        movie = bink;
+        t0 = now;
+        shown = 0;
+    }
+    /* Movie frames since the first, in halves, so "due" can allow half a
+     * frame of slack. */
+    half_frames = (now - t0) * 2u * rate / ((uint64_t)div * RS3_TSC_HZ);
+    if (half_frames > (shown + 2u) * 2u) {
+        /* Fallen behind: re-base so it does not race. */
+        t0 = now;
+        shown = 0;
+        half_frames = 0;
+    }
+    if (shown * 2u > half_frames + 1u) {
+        /* Not due: the last frame is shown again. `ret 0x10`. */
+        hle_d3d8_cpu_frame_repeat();
+        g_eax = 0;
+        g_esp += 4u + 0x10u;
+        return;
+    }
+    shown++;
+    sub_002BC000_gen();
+    {
+        /* RECOMP_RS3_MOVIE_LOG=1: movie frames shown against the clock. */
+        static int log = -1;
+        static uint64_t log_t0, log_frames;
+        if (log < 0)
+            log = xbox_EnvSwitch("RECOMP_RS3_MOVIE_LOG", 0);
+        if (log) {
+            if (!log_t0)
+                log_t0 = now;
+            log_frames++;
+            if (now - log_t0 >= 5u * RS3_TSC_HZ) {
+                fprintf(stderr, "[RS3] movie: %llu frames in %.2f s (%.2f fps; the file says %u/%u)\n",
+                        (unsigned long long)log_frames, (double)(now - log_t0) / RS3_TSC_HZ,
+                        log_frames * (double)RS3_TSC_HZ / (double)(now - log_t0), rate, div);
+                log_t0 = now;
+                log_frames = 0;
+            }
+        }
+    }
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*
