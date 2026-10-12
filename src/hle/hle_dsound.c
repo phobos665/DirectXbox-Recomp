@@ -128,6 +128,7 @@ typedef struct Buffer {
      * voice ran dry. */
     uint32_t gap_max_ms, discarded_ms, discards, dry;
     uint64_t report_ms;
+    uint64_t used_ms;            /* last looked up; for reclaim_slot() */
     uint64_t cursor_trace_ms;    /* RECOMP_DSOUND_CURSOR_TRACE */
     /* Where it is heard (hle_dsound_3d.c): the rate the title asked for
      * (SetFrequency/SetPitch; 0 = its own), and whether the slot has a mix,
@@ -266,6 +267,7 @@ static uint32_t setting(uint32_t iface, uint32_t offset)
 }
 
 static uint32_t slot_of(const Buffer *b) { return (uint32_t)(b - g_buffers); }
+static int play_log(void);       /* RECOMP_DSOUND_PLAY_LOG, with stop() */
 
 /* Drop what the host has queued for this buffer; the next submission starts
  * a new voice, behind a fresh pre-roll. */
@@ -275,9 +277,21 @@ static void reset_output(Buffer *b)
     b->primed = 0;
 }
 
+/* A stopped buffer's host voice plays out what it was already given -- the
+ * sound due before the stop, which it plays a pre-roll late -- instead of
+ * being cut mid-waveform (recomp_audio_output_release_voice). Cutting it made
+ * a click at every stop, and a short sound lost the length of the pre-roll:
+ * Rainbow Six 3's gun is a 0.54 s loop played while the trigger is held, and
+ * a 130 ms tap was heard for 80 ms. */
+static void release_output(Buffer *b)
+{
+    recomp_audio_output_release_voice(slot_of(b));
+    b->primed = 0;
+}
+
 static void retire(Buffer *b)
 {
-    recomp_audio_output_reset_voice(slot_of(b));
+    recomp_audio_output_release_voice(slot_of(b));
     recomp_audio_output_clear_mix(slot_of(b));
     recomp_audio_output_route(slot_of(b), 0u);
     memset(b, 0, sizeof *b);
@@ -700,6 +714,47 @@ static Buffer *find(uint32_t iface)
     return NULL;
 }
 
+/* No free slot: give one back. A buffer the title released holds its slot
+ * until something notices (IDirectSoundBuffer_Release below catches the usual
+ * way, but a buffer can also be freed under the interface), so first any slot
+ * whose buffer is gone -- its settings no longer what was modelled -- and
+ * failing that the one least recently used that is not playing, paused or
+ * stopping through a release; it is modelled afresh if the title uses it
+ * again. Rainbow Six 3 creates and frees a buffer per sound, filled all 256
+ * slots during its first level, and every sound after that was silent: the
+ * main gun among them. Returns 1 if a slot is free now. */
+static int reclaim_slot(uint64_t now)
+{
+    static unsigned long gone, lru;
+    Buffer *oldest = NULL;
+    uint32_t i;
+    (void)now;
+
+    for (i = 0; i < SLOTS; i++) {
+        Buffer *b = &g_buffers[i];
+        if (b->iface == 0u)
+            return 1;
+        if (b->data != setting(b->iface, SET_DATA) ||
+            b->format != setting(b->iface, SET_FORMAT)) {
+            retire(b);
+            if (!gone++)
+                fprintf(stderr, "[DSOUND] buffer table full: reclaiming slots of buffers "
+                        "that are gone\n");
+            return 1;
+        }
+        if (!b->model.playing && !b->paused && !b->releasing &&
+            (!oldest || b->used_ms < oldest->used_ms))
+            oldest = b;
+    }
+    if (!oldest)
+        return 0;
+    retire(oldest);
+    if (!lru++)
+        fprintf(stderr, "[DSOUND] buffer table full: reclaiming the least recently used "
+                "idle buffer\n");
+    return 1;
+}
+
 /* The buffer's model, created or refreshed from the settings object. NULL when
  * nothing about it can be clocked (no rate or alignment worth trusting).
  *
@@ -777,6 +832,7 @@ static Buffer *model_for_known(Buffer *known, uint32_t iface, uint64_t now)
     }
 
     if (b) {
+        b->used_ms = now;
         if (b->model.loop_start_bytes != decoded_loop) {
             pump(b, now);
             recomp_dsound_buffer_cursor(&b->model, now);
@@ -786,9 +842,15 @@ static Buffer *model_for_known(Buffer *known, uint32_t iface, uint64_t now)
         }
         return b;
     }
-    for (i = 0; i < SLOTS; i++) {
-        if (g_buffers[i].iface == 0u) {
+    for (i = 0; i < SLOTS && g_buffers[i].iface != 0u; i++)
+        ;
+    if (i == SLOTS && reclaim_slot(now))
+        for (i = 0; i < SLOTS && g_buffers[i].iface != 0u; i++)
+            ;
+    if (i < SLOTS) {
+        {
             b = &g_buffers[i];
+            b->used_ms = now;
             if (recomp_dsound_buffer_configure(&b->model, decoded_size, rate,
                                                block_align, now) != 0u)
                 return NULL;
@@ -821,11 +883,13 @@ static Buffer *model_for(uint32_t iface, uint64_t now)
 static uint64_t now_ms(void) { return GetTickCount64(); }
 
 /* After a control change, restart the output from the model unless this is a
- * Play that simply continues a sound already playing. */
+ * Play that simply continues a sound already playing. The old voice plays out
+ * what was already due (release_output): the host plays a pre-roll behind the
+ * console, so resetting it here threw away sound from before the change. */
 static void resync_output(Buffer *b, int continuing)
 {
     if (!continuing)
-        reset_output(b);
+        release_output(b);
     if (continuing)
         b->output_model.play_flags = b->model.play_flags;
     else
@@ -1053,8 +1117,11 @@ HLE_EXPORT(IDirectSoundBuffer_Play)
     hle_dsound_service_start();
     lock();
     b = model_for(iface, now);
-    if (said < 16) {
+    if (said < 16 || play_log()) {
         said++;
+        if (play_log())
+            fprintf(stderr, "[DSOUND] %llu ms slot %d ", (unsigned long long)now,
+                    b ? (int)slot_of(b) : -1);
         fprintf(stderr, "[DSOUND] Play buffer=%08X format=%08X bytes=%u rate=%u "
                         "flags=%u %s\n", iface,
                 iface && HLE_MEM32(iface) ? setting(iface, SET_FORMAT) : 0u,
@@ -1127,6 +1194,18 @@ HLE_EXPORT(IDirectSoundBuffer_Play)
     HLE_RETURN(result);
 }
 
+/* RECOMP_DSOUND_PLAY_LOG=1: every buffer Play and Stop, with the time, the
+ * slot and what is played -- how a title drives a sound, e.g. a gun that
+ * restarts one buffer per shot against one that loops while the trigger is
+ * held. The first 16 Plays are logged regardless. */
+static int play_log(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_DSOUND_PLAY_LOG", 0);
+    return on;
+}
+
 static void stop(uint32_t iface)
 {
     uint64_t now = now_ms();
@@ -1134,13 +1213,18 @@ static void stop(uint32_t iface)
 
     lock();
     b = find(iface);
+    if (play_log())
+        fprintf(stderr, "[DSOUND] %llu ms Stop buffer=%08X slot %d%s\n",
+                (unsigned long long)now, iface, b ? (int)slot_of(b) : -1,
+                b && b->model.playing ? " (was playing)" : "");
     if (b) {
         pump(b, now);
         notify_stop(b, now, 1);
         recomp_dsound_buffer_stop(&b->model, now);
         b->paused = 0;
         b->releasing = 0;
-        resync_output(b, 0);
+        release_output(b);
+        b->output_model = b->model;
     }
     unlock();
 }
@@ -1194,6 +1278,34 @@ HLE_EXPORT(IDirectSoundBuffer_Stop)
     g_ds_calls[DS_CALL_BUF_STOP]++;
     stop(HLE_ARG(0));
     HLE_RETURN(HLE_ARG(0) ? RECOMP_DSOUND_OK : RECOMP_DSOUND_POINTER_ERROR);
+}
+
+/* ULONG IDirectSoundBuffer_Release(this)
+ * The title's own Release runs; when it was the last reference the buffer is
+ * gone, and so is its slot here, with its host voice. Before this a released
+ * buffer kept its slot until a change was noticed, which for one that was not
+ * playing was never (reclaim_slot, above). */
+HLE_ORIGINAL(IDirectSoundBuffer_Release);
+HLE_EXPORT(IDirectSoundBuffer_Release)
+{
+    static unsigned long released;
+    uint32_t iface = HLE_ARG(0);
+
+    if (!hle_original_IDirectSoundBuffer_Release)
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(IDirectSoundBuffer_Release);
+    if (g_eax == 0u && iface) {
+        Buffer *b;
+        lock();
+        b = find(iface);
+        if (b) {
+            retire(b);
+            if (!released++)
+                fprintf(stderr, "[DSOUND] IDirectSoundBuffer_Release: a released buffer "
+                        "gives its slot back\n");
+        }
+        unlock();
+    }
 }
 
 /* HRESULT IDirectSoundBuffer_StopEx(this, REFERENCE_TIME rtTimeStamp, flags).
