@@ -1539,8 +1539,21 @@ HLE_EXPORT(IDirectSoundBuffer_GetCurrentPosition)
     lock();
     b = model_for(iface, now);
     if (b) {
+        static int read_cursor = -1;
         pump(b, now);
         cursor = recomp_dsound_buffer_cursor(&b->model, now);
+        /* For a buffer whose sound is played, the position as far as it has
+         * been read, not as far as the clock says. pump() reads at most every
+         * 10 ms, and a title refilling a ring takes the cursor as "played up
+         * to here" and writes the next lap behind it: Rainbow Six 3's Bink
+         * movies wrote over sound not read yet, and the movie sound crackled
+         * (consecutive submissions on its ring stopped joining: 18 bad joins
+         * in 5 s). The read position is at most one pump behind the clock.
+         * RECOMP_DSOUND_READ_CURSOR=0 reports the clock's, as before. */
+        if (read_cursor < 0)
+            read_cursor = xbox_EnvSwitch("RECOMP_DSOUND_READ_CURSOR", 1);
+        if (read_cursor && b->output && b->model.playing && b->output_model.playing)
+            cursor = b->output_model.cursor_bytes;
         /* ADPCM is clocked in decoded bytes; the game asks in source bytes. */
         if ((b->format & 0xFFFFu) == TAG_ADPCM && b->output)
             cursor = cursor / (XBOX_ADPCM_BLOCK_SAMPLES * b->model.block_align) *
