@@ -284,6 +284,86 @@ static void fake_input(RecompInputGamepad *g)
     }
 }
 
+/* RECOMP_INPUT_RECORD=<file> -- the other half of RECOMP_INPUT_SEQ: what a
+ * person presses on controller 1, written as a script that replays it.
+ *
+ * A menu path or a walk to a place in a level is quicker to play once than to
+ * write by trial, and a script played by hand is one that is known to work.
+ * The clock starts at the title's first pad read, as the replay's does, so the
+ * same file played back presses at the same moments. Each press is written
+ * when it is released, as <ms>:<control>:<hold ms>, comma-separated on one
+ * line, so the file is the value RECOMP_INPUT_SEQ wants as it stands. Sticks
+ * are recorded as pushed fully one way past half travel, which is all the
+ * script can replay; a press shorter than 120 ms is kept at 120 ms so a title
+ * polling at 30 Hz still sees it on replay. Recording ignores a script that is
+ * also running, so a recorded run can start from a scripted menu path. */
+#define RECORD_MIN_HOLD 120u
+static FILE *s_rec;
+static int s_rec_checked;
+static unsigned long long s_rec_t0, s_rec_down[sizeof FAKE / sizeof FAKE[0]];
+static unsigned char s_rec_on[sizeof FAKE / sizeof FAKE[0]];
+static unsigned long s_rec_steps;
+
+static int record_pressed(const RecompInputGamepad *g, int i)
+{
+    int v;
+
+    switch (FAKE[i].kind) {
+    case FAKE_ANALOG:
+        return g->analog_buttons[FAKE[i].value] > 32u;
+    case FAKE_STICK:
+        switch (FAKE[i].value) {
+        case STICK_LX: v = g->thumb_lx; break;
+        case STICK_LY: v = g->thumb_ly; break;
+        case STICK_RX: v = g->thumb_rx; break;
+        default:       v = g->thumb_ry; break;
+        }
+        return FAKE[i].sign > 0 ? v > 16384 : v < -16384;
+    default:
+        return (g->buttons & FAKE[i].value) != 0;
+    }
+}
+
+static void record_input(const RecompInputGamepad *g)
+{
+    unsigned long long t;
+    int i;
+
+    if (!s_rec_checked) {
+        const char *path = getenv("RECOMP_INPUT_RECORD");
+        s_rec_checked = 1;
+        if (path && *path) {
+            s_rec = fopen(path, "w");
+            fprintf(stderr, "  [PAD] recording controller 1 to %s%s\n", path,
+                    s_rec ? "" : " -- could not open it");
+            fflush(stderr);
+        }
+    }
+    if (!s_rec)
+        return;
+    if (!s_rec_t0)
+        s_rec_t0 = GetTickCount64();
+    t = GetTickCount64() - s_rec_t0;
+    for (i = 0; i < (int)(sizeof FAKE / sizeof FAKE[0]); i++) {
+        int on;
+
+        if (strncmp(FAKE[i].name, "dpad_", 5) == 0)
+            continue;                       /* aliases of up/down/left/right */
+        on = record_pressed(g, i);
+        if (on && !s_rec_on[i]) {
+            s_rec_down[i] = t;
+        } else if (!on && s_rec_on[i]) {
+            unsigned long long hold = t - s_rec_down[i];
+            if (hold < RECORD_MIN_HOLD)
+                hold = RECORD_MIN_HOLD;
+            fprintf(s_rec, "%s%llu:%s:%llu", s_rec_steps++ ? "," : "",
+                    s_rec_down[i], FAKE[i].name, hold);
+            fflush(s_rec);
+        }
+        s_rec_on[i] = (unsigned char)on;
+    }
+}
+
 /* One port, through its bindings. The bound sample arrives as the layout
  * src/input already speaks (XBOX_GAMEPAD); the two structures are the same
  * eight analog bytes and four axes in the same order, so this is a copy. */
@@ -305,6 +385,7 @@ bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad)
         gamepad->thumb_ry = (int16_t)pad.sThumbRY;
     }
     if (port == 0) {
+        record_input(gamepad);      /* the person, before any script adds to it */
         fake_input(gamepad);
         seq_input(gamepad);
     }
