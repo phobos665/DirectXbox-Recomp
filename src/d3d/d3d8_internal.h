@@ -26,6 +26,13 @@ HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 /* The guest's presentation size (d3d8_device.c); the back buffer's when unset. */
 UINT                 d3d8_GetGuestWidth(void);
+RhiView             *d3d8_GetDepthSampledView(void);
+RhiImage            *d3d8_GetDepthImage(void);
+/* Before each draw (d3d8_states_apply): a W-buffered draw into the device's
+ * depth keeps its projection, which d3d8_GetWBufferProjection hands back as
+ * _33, _34, _43, _44 -- 0 when the depth holds Z (d3d8_device.c). */
+void                 d3d8_NoteDepthWrite(const DWORD *rs);
+int                  d3d8_GetWBufferProjection(float out[4]);
 void                 d3d8_GetTargetGuestSize(UINT *w, UINT *h);
 /* The finished frame as a shader input: the offscreen scene target when
  * the host renders larger than the guest, the swap chain's back buffer

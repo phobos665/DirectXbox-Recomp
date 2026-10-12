@@ -415,6 +415,7 @@ void d3d8_states_apply(void)
     if (!rs || !rhi_device_ready()) return;
 
     scissor_on = d3d8_GetScissor(&scissor);
+    d3d8_NoteDepthWrite(rs);
     update_blend_state(rs);
     update_depth_stencil_state(rs);
     update_rasterizer_state(rs, scissor_on);

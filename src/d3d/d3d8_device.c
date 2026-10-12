@@ -219,6 +219,72 @@ RhiImage *d3d8_GetSceneImage(void)      { return g_device_state.rhi_scene_image;
 RhiView  *d3d8_GetSceneView(void)       { return g_device_state.rhi_scene_srv; }
 RhiView  *d3d8_GetDefaultTargetView(void) { return g_device_state.rhi_default_rtv; }
 
+/* The device's depth as a shader input (d3d8_depthcopy.c), NULL where the
+ * backend could not make it sampleable. Remade if the image is. */
+RhiView *d3d8_GetDepthSampledView(void)
+{
+    static RhiView  *view;
+    static RhiImage *of;
+    RhiViewDesc vd;
+
+    if (!g_device_state.depth_image)
+        return NULL;
+    if (view && of == g_device_state.depth_image)
+        return view;
+    if (view)
+        rhi_view_destroy(view);
+    of = g_device_state.depth_image;
+    memset(&vd, 0, sizeof vd);
+    vd.format = RHI_FORMAT_D24_UNORM_S8_UINT;
+    vd.dim = RHI_VIEW_DIM_2D;
+    vd.mip_count = 1;
+    vd.layer_count = 1;
+    view = rhi_view_create(of, RHI_VIEW_SAMPLED, &vd);
+    return view;
+}
+
+RhiImage *d3d8_GetDepthImage(void) { return g_device_state.depth_image; }
+
+/* What the device's depth holds, for d3d8_depthcopy.c. The host always keeps
+ * Z, but a draw made with D3DZB_USEW writes W on the Xbox -- eye distance as
+ * a fraction of the projection's far W, linear where Z is hyperbolic -- and a
+ * title that reads its depth as colour reads that. Rainbow Six 3 draws its
+ * world W-buffered and weights a distance haze by the result: read as Z,
+ * everything a few metres off was at the far plane and the haze covered the
+ * picture. The projection of the last W-buffered draw that wrote the device's
+ * depth is kept, so the copy can turn Z back into W, until a full clear of
+ * that depth forgets it. */
+static struct { int valid; float m33, m34, m43, m44; } g_wbuffer;
+
+static D3D8Surface *g_auto_ds;
+static D3D8Surface *g_cur_ds;
+
+void d3d8_NoteDepthWrite(const DWORD *rs)
+{
+    const D3DMATRIX *p;
+
+    if (!rs || rs[D3DRS_ZENABLE] != 2u /* D3DZB_USEW */ || !rs[D3DRS_ZWRITEENABLE] ||
+        !g_cur_ds || g_cur_ds != g_auto_ds)
+        return;
+    p = &g_device_state.transforms[D3DTS_PROJECTION];
+    g_wbuffer.valid = 1;
+    g_wbuffer.m33 = p->_33;
+    g_wbuffer.m34 = p->_34;
+    g_wbuffer.m43 = p->_43;
+    g_wbuffer.m44 = p->_44;
+}
+
+int d3d8_GetWBufferProjection(float out[4])
+{
+    if (!g_wbuffer.valid)
+        return 0;
+    out[0] = g_wbuffer.m33;
+    out[1] = g_wbuffer.m34;
+    out[2] = g_wbuffer.m43;
+    out[3] = g_wbuffer.m44;
+    return 1;
+}
+
 /* Guest render-target pixels to host pixels, for the viewport and the
  * scissor rectangle -- the two pieces of state a title hands us measured
  * in pixels rather than normalised.
@@ -661,9 +727,16 @@ static HRESULT create_render_targets(D3D8DeviceState *state)
     depth_desc.format = RHI_FORMAT_D24_UNORM_S8_UINT;
     depth_desc.samples = 1;
     depth_desc.usage = RHI_USAGE_DEFAULT;
-    depth_desc.bind = RHI_BIND_DEPTH;
+    /* Sampled as well where the backend can, as a shadow map is: a title
+     * that reads its depth back as colour gets it through
+     * xbox_D3D8CopyDepthToTexture (d3d8_depthcopy.c). Depth-only if not. */
+    depth_desc.bind = RHI_BIND_DEPTH | RHI_BIND_SAMPLED;
 
     state->depth_image = rhi_image_create(&depth_desc, NULL);
+    if (!state->depth_image) {
+        depth_desc.bind = RHI_BIND_DEPTH;
+        state->depth_image = rhi_image_create(&depth_desc, NULL);
+    }
     if (!state->depth_image) return E_FAIL;
 
     state->depth_view = rhi_view_create(state->depth_image, RHI_VIEW_DEPTH, NULL);
@@ -772,6 +845,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         d3d8_clear_shutdown();
         d3d8_movie_shutdown();
         xbox_D3D8ScreenCopyShutdown();
+        xbox_D3D8DepthCopyShutdown();
         d3d8_display_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
@@ -1015,6 +1089,8 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
         if (Flags & D3DCLEAR_STENCIL) clear_flags |= RHI_CLEAR_STENCIL;
 
         rhi_clear_depth(dsv, clear_flags, Z, (uint8_t)Stencil);
+        if ((Flags & D3DCLEAR_ZBUFFER) && g_cur_ds == g_auto_ds)
+            g_wbuffer.valid = 0;
     }
 
     return S_OK;

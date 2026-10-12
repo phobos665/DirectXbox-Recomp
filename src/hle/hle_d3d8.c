@@ -676,6 +676,17 @@ static void note_framebuffer_phys(uint32_t data)
     }
 }
 
+/* Whether this physical memory, with these dimensions (a pixel container's
+ * Size word; only the width and height are compared), is the device's own
+ * depth buffer, whole. Rainbow Six 3 also renders a 640x240 blur level into
+ * that memory once the depth has been read: that is a picture of its own. */
+int hle_d3d8_is_device_depth(uint32_t phys, uint32_t size)
+{
+    return g_autodepth_va && phys &&
+           (HLE_MEM32(g_autodepth_va + 4) & 0x0FFFFFFFu) == (phys & 0x0FFFFFFFu) &&
+           (HLE_MEM32(g_autodepth_va + 16) & 0x00FFFFFFu) == (size & 0x00FFFFFFu);
+}
+
 int hle_d3d8_is_framebuffer(uint32_t phys)
 {
     int i;

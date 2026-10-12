@@ -1328,6 +1328,14 @@ HRESULT       xbox_D3D8CopyBackBufferRectToTexture(IDirect3DTexture8 *dst,
                                                    const RECT *src, const POINT *at);
 unsigned long xbox_D3D8ScreenCopyCount(void);
 void          xbox_D3D8ScreenCopyShutdown(void);
+/* The device's depth written into a render-target texture as the bytes an
+   NV2A Z24S8 word reads through a B8G8R8A8 view (A = depth bits 23-16,
+   R = 15-8, G = 7-0, B = stencil, written as 0): what a title sees when it
+   binds a colour texture over its depth buffer's memory. Scales if the
+   texture is not the depth's size. Written as W where the depth was last
+   drawn W-buffered (D3DZB_USEW), as the Xbox would hold it. */
+HRESULT       xbox_D3D8CopyDepthToTexture(IDirect3DTexture8 *dst);
+void          xbox_D3D8DepthCopyShutdown(void);
 
 /* Frame interpolation (src/hle/hle_d3d8_interp.c). Begin points "the back
    buffer" at a second image so a frame can be drawn while the title's own

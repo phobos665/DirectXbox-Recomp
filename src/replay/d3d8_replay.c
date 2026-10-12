@@ -952,6 +952,27 @@ static void do_screen_copy(Replay *r, const D3D8CapChunk *c)
         r->failed++;
 }
 
+static void do_depth_copy(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapScreenCopy *p = c->data;
+    ReplayTexture *slot;
+
+    if (c->bytes < sizeof *p || !p->texture_id) {
+        r->malformed++;
+        return;
+    }
+    slot = texture_slot(r, p->texture_id, 0);
+    if (!slot || !slot->tex || slot->is_cube) {
+        r->unmapped++;
+        return;
+    }
+    if (g_list_draws)
+        fprintf(stderr, "[depth copy after %ld draws] into texture %u\n", g_draw_index,
+                p->texture_id);
+    if (FAILED(xbox_D3D8CopyDepthToTexture((IDirect3DTexture8 *)slot->tex)))
+        r->failed++;
+}
+
 static void do_set_render_target(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapSetRenderTarget *t = c->data;
@@ -1548,6 +1569,9 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         break;
     case D3D8CAP_SCENE:
         do_scene(r, c);
+        break;
+    case D3D8CAP_DEPTH_COPY:
+        do_depth_copy(r, c);
         break;
     case D3D8CAP_DEPTH_SURFACE:
         do_depth_surface(r, c);

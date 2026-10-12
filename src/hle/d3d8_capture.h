@@ -107,8 +107,9 @@ extern "C" {
  * fixed-function lights and the material, version 7 the texels of cubes
  * filled from memory and the stage palettes P8 textures are expanded with,
  * version 8 the screen copies (a title reading its own frame back into a
- * texture), version 9 the scene's pixels as the frame begins. */
-#define D3D8CAP_VERSION      9u
+ * texture), version 9 the scene's pixels as the frame begins, version 10
+ * the depth copies (a title reading its depth buffer as a colour texture). */
+#define D3D8CAP_VERSION      10u
 /* The oldest version the reader still accepts. A bump that only adds chunk
  * kinds leaves an older file a valid newer one that happens not to contain
  * them (version 6 added three; version 5 one), so it leaves this alone. A
@@ -157,7 +158,8 @@ enum {
     D3D8CAP_PALETTE             = 30, /* D3D8CapPalette (version 7) */
     D3D8CAP_SCREEN_COPY         = 31, /* D3D8CapScreenCopy (version 8) */
     D3D8CAP_SCENE               = 32, /* D3D8CapScene + rows (version 9) */
-    D3D8CAP_CHUNK_KINDS         = 33  /* one past the last, for per-kind counters */
+    D3D8CAP_DEPTH_COPY          = 33, /* D3D8CapScreenCopy, has_rect 0 (version 10) */
+    D3D8CAP_CHUNK_KINDS         = 34  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -302,6 +304,8 @@ typedef struct {
     int32_t  src_left, src_top, src_right, src_bottom;
     int32_t  at_x, at_y;
 } D3D8CapScreenCopy;
+/* D3D8CAP_DEPTH_COPY carries the same struct, has_rect 0: the device's depth
+ * as it stands, written into `texture_id` by xbox_D3D8CopyDepthToTexture. */
 
 /* The scene -- what the device calls the back buffer, at the size the host
  * renders it -- as the frame begins: `height` rows of `pitch` bytes, each

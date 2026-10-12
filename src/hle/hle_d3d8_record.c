@@ -1944,6 +1944,28 @@ HRESULT host_CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src
     return xbox_D3D8CopyBackBufferRectToTexture(dst, src, at);
 }
 
+/* ------------------------------------------------------------ depth copies */
+
+static void op_depth_copy(const void *arg)
+{
+    host_CopyDepthToTexture(*(IDirect3DTexture8 *const *)arg);
+}
+
+HRESULT host_CopyDepthToTexture(IDirect3DTexture8 *dst)
+{
+    if (g_cap && dst) {
+        D3D8CapScreenCopy c;
+
+        memset(&c, 0, sizeof c);
+        c.texture_id = texture_id((IDirect3DBaseTexture8 *)dst);
+        if (c.texture_id)
+            chunk(D3D8CAP_DEPTH_COPY, &c, sizeof c, NULL, 0, NULL, 0);
+    }
+    if (hle_d3d8_interp_rec)
+        hle_d3d8_interp_op(op_depth_copy, &dst, sizeof dst);
+    return xbox_D3D8CopyDepthToTexture(dst);
+}
+
 /* --------------------------------------------- the frame-start state, kept
  *
  * capture_snapshot's list, as ops, in the same order and for the same

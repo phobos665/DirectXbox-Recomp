@@ -181,6 +181,42 @@ Also: YUY2 and UYVY are linear (texel-addressed) though they carry no `LIN_`
 name, and `--list-draws` now prints every active stage's ops and, for small
 UP draws, every vertex.
 
+## A ghost over every view (Rainbow Six 3, 12 Oct 2026)
+
+Rainbow Six 3 (XDK 5659) showed a faint second copy of the scene over its
+levels, and its glow stopped in a straight line a third of the way down the
+screen. Its post-process reads its **depth buffer as colour**: the bright
+pass binds a `LIN_B8G8R8A8` texture whose texels are the device depth's
+memory and puts the depth's top byte in alpha, and the blur chain and the
+additive composite are weighted by it. Under shadow mode the depth is the
+host's and never reaches guest memory, so that texture read whatever the
+memory last held -- old frames, and a blur level the title renders into the
+same memory afterwards.
+
+1. **A colour texture over the whole device depth is the depth.** It is now
+   a host render target filled by `xbox_D3D8CopyDepthToTexture`
+   (`d3d8_depthcopy.c`) whenever the screen has changed since it was last
+   filled, in the bytes an NV2A Z24S8 word reads through a B8G8R8A8 view
+   (A = depth bits 23-16, R = 15-8, G = 7-0, B = stencil, written as 0). The
+   device depth is created sampleable for this. Only a texture the size of
+   the depth and not drawn into by the title is taken: RS3's 640x240 blur
+   level in the same memory is its own picture. Recorded in captures as
+   `D3D8CAP_DEPTH_COPY` (version 10). `RECOMP_HLE_D3D8_DEPTH_COLOUR=guest`
+   goes back to the memory.
+2. **A W-buffered draw stores W, not Z.** RS3 draws its world with
+   `D3DZB_USEW`. The Xbox then keeps eye distance over the projection's far W,
+   linear, where the host keeps hyperbolic Z. Read as Z, everything a few
+   metres away was at the far plane and the haze washed out the picture. The
+   projection of the last W-buffered draw into the device depth is kept
+   (`d3d8_NoteDepthWrite`, forgotten on a full depth clear) and the copy turns
+   Z back into W through it, using the D3D far-W formula. Depth testing is
+   still done in Z, which orders pixels the same way. The first-person weapon
+   is Z-buffered with a projection that pins it near 0, and comes out 0
+   either way.
+
+Found by capturing a frame and replaying it with the composite skipped
+(`--skip-draw`), which isolates what the glow adds.
+
 ## What is per-title here
 
 Very little. The replacement boundary is per XDK build, and below it everything
