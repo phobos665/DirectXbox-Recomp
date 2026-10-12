@@ -88,6 +88,7 @@ typedef struct {
      * host's frame, refreshed when it is bound after the screen changed. */
     int                framebuffer;
     unsigned long      screen_copied;   /* hle_d3d8_screen_changes() at the copy */
+    unsigned long      drawn_swap;      /* a rendered surface: last made the target */
     /* P8: the host texture holds the texels expanded through a palette, and
      * this is the checksum of that palette (0: not known, bake again). */
     int                p8;
@@ -776,6 +777,10 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
 
 static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, uint32_t size,
                                                unsigned long now);
+static int rendered_surface_recent(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now);
+static void rendered_surface_drawn(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now);
 
 /* Whether a texture over frame-buffer memory can be the title reading its
  * screen. A frame buffer is linear and uncompressed, so a swizzled or DXT
@@ -805,7 +810,14 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
      * the downsample. A match needs this exact memory, format and size drawn
      * into as an offscreen surface, which a title reading its real frame
      * (Future Perfect, XGRA) never does. */
-    {
+    /* Unless that was long ago and the memory is a frame buffer: then it is
+     * the screen again. Rainbow Six 3's loading thread draws into its front
+     * buffer as a bare surface; in the level the same memory is the frame on
+     * screen, sampled by the night and thermal vision for their trail, and
+     * the stale loading screen the surface still held was laid over the
+     * view. */
+    if (!(hle_d3d8_is_framebuffer(data & 0x0FFFFFFFu) &&
+          !rendered_surface_recent(data, format, size, now))) {
         IDirect3DTexture8 *rs = rendered_surface_for(data, format, size, now);
         if (rs)
             return rs;
@@ -1553,8 +1565,10 @@ IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surfa
     uint32_t size = HLE_MEM32(surface + 16);
     IDirect3DTexture8 *have = rendered_surface_for(data, format, size, now);
 
-    if (have)
+    if (have) {
+        rendered_surface_drawn(data, format, size, now);
         return have;
+    }
     if (!read_layout(surface, &t))
         return NULL;
     e = cache_slot(dev, now);
@@ -1572,11 +1586,41 @@ IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surfa
     e->format = format;
     e->size = size;
     e->rendered = 1;
-    e->checked_swap = e->used_swap = now;
+    e->checked_swap = e->used_swap = e->drawn_swap = now;
     fprintf(stderr, "[HLE-D3D8] shadow render target surface 0x%08X: format 0x%02X %ux%u "
             "at 0x%08X, sampled by any texture over that memory\n",
             surface, t.fmt, t.width, t.height, data);
     return e->host;
+}
+
+/* hle_d3d8_render_surface made that surface the target again. */
+static void rendered_surface_drawn(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+            same_pixels(c->format, c->size, format, size))
+            c->drawn_swap = now;
+    }
+}
+
+/* Whether the rendered surface over this memory has been drawn into lately:
+ * within the last two Swaps. */
+static int rendered_surface_recent(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+            same_pixels(c->format, c->size, format, size))
+            return now - c->drawn_swap <= 2u;
+    }
+    return 0;
 }
 
 /* The host render target a texture's memory was drawn into as a bare
