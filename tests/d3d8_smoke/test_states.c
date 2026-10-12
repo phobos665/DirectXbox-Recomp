@@ -15,6 +15,8 @@ const DWORD *d3d8_GetRenderStates(void) { return rs; }
 const DWORD *d3d8_GetTSS(DWORD stage) { (void)stage; return NULL; }
 /* No scissor: these tests set render states, not the Xbox's SetScissors. */
 BOOL d3d8_GetScissor(RhiRect *out) { (void)out; return FALSE; }
+/* No device depth: nothing here copies it, so a W-buffered draw is not kept. */
+void d3d8_NoteDepthWrite(const DWORD *rs) { (void)rs; }
 
 #define CHECK(name, cond) \
     do { if (!(cond)) { printf("FAIL: %s\n", name); failures++; } } while (0)
