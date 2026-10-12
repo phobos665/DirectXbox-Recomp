@@ -295,7 +295,9 @@ void xbox_Nv2aFlipGateRelease(void);
  * (D3DPRESENT_PARAMETERS.FullScreen_PresentationInterval). With the gate at
  * its default (adaptive, no RECOMP_FPS_CAP), INTERVAL_TWO and
  * TWO_OR_IMMEDIATE hold Swaps to one every two vblanks, THREE every three,
- * FOUR every four, as the console's flip does; a cap the player set wins. */
+ * FOUR every four, as the console's flip does; a cap the player set wins.
+ * Only with RECOMP_TITLE_INTERVAL=1, which a title's project sets for a game
+ * that steps once a frame; otherwise the request is logged and not applied. */
 void xbox_Nv2aFlipGateSetTitleInterval(uint32_t interval);
 
 /* Lend the gate's wait to fn (frame interpolation draws its in-between

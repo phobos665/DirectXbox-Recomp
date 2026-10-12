@@ -121,8 +121,15 @@ extern uint32_t g_xbox_code_hi;
  * RECOMP_ETHERNET_LINK=0 too: with no network card the honest answer is "no
  * cable". With the link reported up, XNet ran DHCP against nobody and the
  * start-up loop on XNetGetTitleXnAddr (0x001D0710) waited 25 to 100 s for it
- * to give up. Both are set before main, and only if the variable is not
- * already set, so =0 or =1 on the command line still wins.
+ * to give up.
+ *
+ * RECOMP_TITLE_INTERVAL=1: the title asks D3D for 30 fps
+ * (D3DPRESENT_INTERVAL_TWO_OR_IMMEDIATE) and steps its Bink movies and
+ * cutscenes once a frame, so at 60 they played at about twice their speed.
+ * The flip gate holds it to the interval it asked for.
+ *
+ * All three are set before main, and only if the variable is not already
+ * set, so =0 or =1 on the command line still wins.
  */
 #if defined(_MSC_VER)
 static void __cdecl rs3_defaults(void)
@@ -131,6 +138,8 @@ static void __cdecl rs3_defaults(void)
         _putenv("RECOMP_VA_64K=1");
     if (!getenv("RECOMP_ETHERNET_LINK"))
         _putenv("RECOMP_ETHERNET_LINK=0");
+    if (!getenv("RECOMP_TITLE_INTERVAL"))
+        _putenv("RECOMP_TITLE_INTERVAL=1");
 }
 #pragma section(".CRT$XCU", read)
 __declspec(allocate(".CRT$XCU")) void (__cdecl *rs3_defaults_init)(void) = rs3_defaults;
@@ -144,9 +153,12 @@ __attribute__((constructor)) static void rs3_defaults(void)
         _putenv("RECOMP_VA_64K=1");
     if (!getenv("RECOMP_ETHERNET_LINK"))
         _putenv("RECOMP_ETHERNET_LINK=0");
+    if (!getenv("RECOMP_TITLE_INTERVAL"))
+        _putenv("RECOMP_TITLE_INTERVAL=1");
 #else
     setenv("RECOMP_VA_64K", "1", 0);       /* 0: an existing value wins */
     setenv("RECOMP_ETHERNET_LINK", "0", 0);
+    setenv("RECOMP_TITLE_INTERVAL", "1", 0); /* 30 fps, as it asks: see above */
 #endif
 }
 #endif

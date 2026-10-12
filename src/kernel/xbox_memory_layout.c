@@ -2081,7 +2081,8 @@ static int flip_gate_divisor(void)
  * GPU here is replaced, so nothing waited, and a title that asked for
  * INTERVAL_TWO ran at 60 instead of 30. Rainbow Six 3 does (0x80000002,
  * TWO_OR_IMMEDIATE) and steps its movies and cutscenes once a frame, so they
- * played at about twice their speed. Adaptive stays adaptive: a Swap that is
+ * played at about twice their speed. Off unless the title's project turns
+ * it on (below). Adaptive stays adaptive: a Swap that is
  * late goes at once, which is what the _OR_IMMEDIATE intervals ask for and
  * harmless for the plain ones. */
 void xbox_Nv2aFlipGateSetTitleInterval(uint32_t interval)
@@ -2096,6 +2097,23 @@ void xbox_Nv2aFlipGateSetTitleInterval(uint32_t interval)
     }
     if (n == g_flip_gate_title)
         return;
+    /* Opt-in, per title. Many titles that ask for 30 are timed by the clock,
+     * not by the frame, and run correctly -- and better -- at 60, which the
+     * gate's default gives them. Only a title whose project says its game
+     * steps once a frame (RECOMP_TITLE_INTERVAL=1, set in its
+     * recomp_manual.c, as Rainbow Six 3's is) is held to what it asked. */
+    {
+        static int honour = -1;
+        if (honour < 0)
+            honour = xbox_EnvSwitch("RECOMP_TITLE_INTERVAL", 0);
+        if (!honour) {
+            fprintf(stderr, "  [NV2A] flip gate: the title asks for one Swap per %d vblank(s) "
+                    "(presentation interval 0x%08X); not applied "
+                    "(RECOMP_TITLE_INTERVAL=1 to keep it)\n", n, interval);
+            fflush(stderr);
+            return;
+        }
+    }
     g_flip_gate_title = n;
     flip_gate_divisor();                    /* reads the player's cap, once */
     if (g_flip_gate_user) {
