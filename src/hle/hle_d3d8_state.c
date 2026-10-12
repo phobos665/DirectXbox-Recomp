@@ -822,11 +822,27 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev)
     {
         static long compare_at = -2, draws;
 
+        /* RECOMP_HLE_D3D8_PS_COMPARE=all: once for each shader object, the
+         * first 32 of them, instead of at one draw. */
+        static uint32_t compared[32];
+        static int ncompared, all;
+        int this_one = 0;
+
         if (compare_at == -2) {
             const char *v = getenv("RECOMP_HLE_D3D8_PS_COMPARE");
-            compare_at = v ? strtol(v, NULL, 0) : -1;
+            all = v && strcmp(v, "all") == 0;
+            compare_at = v && !all ? strtol(v, NULL, 0) : -1;
         }
-        if (compare_at >= 0 && draws++ == compare_at) {
+        if (all && g_ps_def) {
+            int k;
+            for (k = 0; k < ncompared && compared[k] != g_ps_def; k++)
+                ;
+            if (k == ncompared && ncompared < 32) {
+                compared[ncompared++] = g_ps_def;
+                this_one = 1;
+            }
+        }
+        if (this_one || (compare_at >= 0 && draws++ == compare_at)) {
             uint32_t x;
 
             fprintf(stderr, "[HLE-D3D8] PS compare at draw %ld: handle 0x%08X def 0x%08X\n",

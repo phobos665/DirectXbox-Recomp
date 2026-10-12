@@ -35,6 +35,8 @@
  *                    clears after the nth draw are skipped too).
  *   --skip-draw <n>  leave out draw n (0-based); <a-b> a range; may repeat.
  *   --list-draws     print every draw with the state it runs under.
+ *   --dump-drawn     with --draws n: the target draw n-1 drew into, as it
+ *                    stood after that draw (a pass's own output).
  *   --dump-target    write the render target bound when the frame ends
  *                    instead of the back buffer: with --draws, the way to see
  *                    an offscreen pass that is composited to the screen later.
@@ -141,6 +143,10 @@ static int draw_skipped(long n)
 }
 static int  g_list_draws;
 static int  g_dump_target;
+/* --dump-drawn: with --draws n, the target draw n-1 drew into, as it stood
+ * after that draw -- a pass's own output, which --dump-target (the target of
+ * the first undrawn draw) cannot show. */
+static int  g_dump_drawn;
 /* --dump-target with --draws: the target the first undrawn draw would have
  * gone to, held from that moment, since later state still runs. */
 static IDirect3DDevice8  *g_replay_dev;
@@ -317,7 +323,8 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
                     (unsigned long)rs[D3DRS_FOGCOLOR]);
         }
     }
-    if (g_dump_target && n == g_max_draws && g_replay_dev && !g_target_at_limit)
+    if (g_dump_target && n == g_max_draws - (g_dump_drawn ? 1 : 0) && g_replay_dev &&
+        !g_target_at_limit)
         g_replay_dev->lpVtbl->GetRenderTarget(g_replay_dev, &g_target_at_limit);
     if (g_max_draws >= 0 && n >= g_max_draws)
         return 0;
@@ -1701,6 +1708,10 @@ static int replay_main(int argc, char **argv)
             g_quiet = 1;
         else if (!strcmp(argv[i], "--no-combiners"))
             g_no_combiners = 1;
+        else if (!strcmp(argv[i], "--dump-drawn")) {
+            g_dump_target = 1;
+            g_dump_drawn = 1;
+        }
         else if (!strcmp(argv[i], "--draws") && i + 1 < argc)
             g_max_draws = atol(argv[++i]);
         else if (!strcmp(argv[i], "--skip-draw") && i + 1 < argc) {
