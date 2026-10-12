@@ -201,6 +201,20 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height)
  * screen-space quad by the scene size would shrink it. */
 UINT d3d8_GetGuestWidth(void)  { return g_guest_width  ? g_guest_width  : g_device_state.present_width; }
 
+/* The bound target's size in the guest's pixels: an offscreen target's own
+ * (created at the size the title asked for), else the guest's back buffer.
+ * What pre-transformed vertices are measured against. */
+void d3d8_GetTargetGuestSize(UINT *w, UINT *h)
+{
+    if (g_cur_rt && g_cur_rt->width && g_cur_rt->height) {
+        *w = g_cur_rt->width;
+        *h = g_cur_rt->height;
+    } else {
+        *w = d3d8_GetGuestWidth();
+        *h = d3d8_GetGuestHeight();
+    }
+}
+
 RhiImage *d3d8_GetSceneImage(void)      { return g_device_state.rhi_scene_image; }
 RhiView  *d3d8_GetSceneView(void)       { return g_device_state.rhi_scene_srv; }
 RhiView  *d3d8_GetDefaultTargetView(void) { return g_device_state.rhi_default_rtv; }

@@ -981,11 +981,20 @@ static void ff_vs_prepare_draw(DWORD fvf)
             memcpy(cb->world_inv_transpose, identity, sizeof(identity));
             memcpy(cb->world_view, identity, sizeof(identity));
             memcpy(cb->world_view_inv_transpose, identity, sizeof(identity));
-            /* Pre-transformed vertices are in the guest's screen pixels,
-             * not the host back buffer's: the two differ once the host
-             * renders larger than the guest asked (d3d8_GetGuestWidth). */
-            cb->screen_w = (float)d3d8_GetGuestWidth();
-            cb->screen_h = (float)d3d8_GetGuestHeight();
+            /* Pre-transformed vertices are in the guest's pixels of the
+             * target they are drawn into: not the host back buffer's (the
+             * two differ once the host renders larger than the guest asked,
+             * d3d8_GetGuestWidth), and not the screen's when the target is a
+             * smaller texture. Measured against the screen, Rainbow Six 3's
+             * thermal and night vision blurs into 640x240 and 320x240 targets
+             * landed in their top half and top-left quarter, and the vision
+             * showed as a 320x120 picture in the corner. */
+            {
+                UINT tw, th;
+                d3d8_GetTargetGuestSize(&tw, &th);
+                cb->screen_w = (float)tw;
+                cb->screen_h = (float)th;
+            }
             cb->flags = 0x01; /* pre-transformed */
         } else {
             float wv[16], wvp[16], wvp_t[16], world_t[16];

@@ -26,6 +26,7 @@ HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 /* The guest's presentation size (d3d8_device.c); the back buffer's when unset. */
 UINT                 d3d8_GetGuestWidth(void);
+void                 d3d8_GetTargetGuestSize(UINT *w, UINT *h);
 /* The finished frame as a shader input: the offscreen scene target when
  * the host renders larger than the guest, the swap chain's back buffer
  * when it does not. NULL before the device exists. */
