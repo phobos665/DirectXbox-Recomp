@@ -387,9 +387,19 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
 
 ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
 {
+    /* RECOMP_ETHERNET_LINK=0: no cable. There is no network card behind
+     * this, so "link up" sends XNet to DHCP with nobody to answer: Rainbow
+     * Six 3 polls XNetGetTitleXnAddr in a loop at start-up and sat in DHCP
+     * retries for 25 to 100 s before XNet gave up. With no link XNet marks
+     * the address "troubleshoot" at once and the title moves on, as a
+     * console with nothing plugged in does. Off by default, because a title
+     * with a System Link menu says "no cable" rather than searching. */
+    static int link = -1;
     (void)Verify;
-    /* Return link up, 100 Mbps, full duplex */
-    return 0x01; /* XNET_ETHERNET_LINK_ACTIVE */
+    if (link < 0)
+        link = xbox_EnvSwitch("RECOMP_ETHERNET_LINK", 1);
+    /* Link up, 100 Mbps, full duplex */
+    return link ? 0x01 : 0x00; /* XNET_ETHERNET_LINK_ACTIVE or nothing */
 }
 
 NTSTATUS __stdcall xbox_PhyInitialize(BOOLEAN ForceReset, PVOID Param2)

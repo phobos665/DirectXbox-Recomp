@@ -2467,6 +2467,121 @@ int hle_d3d8_movie_layer_shown(void)
     return g_movie_drawn;
 }
 
+/* A frame the title wrote into the back buffer with the CPU.
+ *
+ * The host draws what the title asks the GPU to draw, and nothing writes the
+ * result back to guest memory, so a picture the CPU puts straight into the
+ * back buffer is never shown. Rainbow Six 3 does exactly that: its splash
+ * screen and every Bink movie (the intro, the main menu's background) are
+ * copied into the locked back buffer and swapped, with no draw into the
+ * screen at all, and the window stayed black while guest memory held the
+ * movie.
+ *
+ * So at a Swap with no host draw or clear into the screen since the last
+ * one, look at the back buffer's memory: if it has changed and is not
+ * empty, the CPU wrote it, and it goes on the movie layer over the frame.
+ * It stays there until the title draws into the screen again. A title that
+ * draws normally never reaches the check; one whose back buffer memory the
+ * CPU never touches never shows anything from it. RECOMP_CPU_FRAME=0 turns
+ * it off. Linear 32-bit and R5G6B5 back buffers only. */
+static uint32_t g_cpu_frame_surface;    /* the back buffer at this Swap */
+static unsigned long g_cpu_frame_changes = (unsigned long)-1;
+static uint32_t g_cpu_frame_hash;
+static int g_cpu_frame_live;
+
+static void cpu_frame_note(uint32_t surface)
+{
+    g_cpu_frame_surface = surface;
+}
+
+static int cpu_frame_present(void)
+{
+    static int enabled = -1, logged;
+    static uint8_t *bgra;
+    static size_t cap;
+    uint32_t surface = g_cpu_frame_surface, data, format, size, fmt, w, h, pitch;
+    uint32_t hash = 2166136261u, x, y, bpp;
+    unsigned long changes = g_screen_changes;
+    const uint8_t *src;
+    int any = 0;
+
+    if (enabled < 0)
+        enabled = xbox_EnvSwitch("RECOMP_CPU_FRAME", 1);
+    if (!enabled || !surface)
+        return 0;
+    if (changes != g_cpu_frame_changes) {
+        /* The host drew into the screen: its frame is the picture. */
+        g_cpu_frame_changes = changes;
+        g_cpu_frame_live = 0;
+        return 0;
+    }
+    data = HLE_MEM32(surface + 4);
+    format = HLE_MEM32(surface + 12);
+    size = HLE_MEM32(surface + 16);
+    fmt = (format >> 8) & 0xFFu;
+    bpp = (fmt == 0x12u || fmt == 0x1Eu) ? 4u : fmt == 0x11u ? 2u : 0u;
+    w = (size & 0xFFFu) + 1u;
+    h = ((size >> 12) & 0xFFFu) + 1u;
+    pitch = (((size >> 24) & 0xFFu) + 1u) * 64u;
+    if (!size || !data || !bpp || pitch < w * bpp ||
+        (uint64_t)(data & 0x03FFFFFFu) + (uint64_t)pitch * h > 0x04000000u)
+        return g_cpu_frame_live ? (d3d8_movie_draw(), 1) : 0;
+    src = (const uint8_t *)HLE_PTR(0x80000000u | (data & 0x0FFFFFFFu));
+
+    /* A sample of the picture, not all of it: one word in 64 of each row
+     * changes when a movie frame does. */
+    for (y = 0; y < h; y += 4) {
+        const uint32_t *row = (const uint32_t *)(src + (size_t)y * pitch);
+        for (x = 0; x < w * bpp / 4u; x += 16) {
+            hash = (hash ^ row[x]) * 16777619u;
+            any |= row[x] != 0;
+        }
+    }
+    if (hash != g_cpu_frame_hash) {
+        g_cpu_frame_hash = hash;
+        if (any) {
+            if ((size_t)w * h * 4u > cap) {
+                free(bgra);
+                cap = (size_t)w * h * 4u;
+                bgra = (uint8_t *)malloc(cap);
+                if (!bgra) {
+                    cap = 0;
+                    return 0;
+                }
+            }
+            for (y = 0; y < h; y++) {
+                const uint8_t *row = src + (size_t)y * pitch;
+                uint8_t *out = bgra + (size_t)y * w * 4u;
+
+                if (bpp == 4u) {
+                    memcpy(out, row, (size_t)w * 4u);
+                    for (x = 0; x < w; x++)
+                        out[x * 4u + 3u] = 0xFF;
+                    continue;
+                }
+                for (x = 0; x < w; x++) {           /* R5G6B5 */
+                    uint32_t p = row[x * 2u] | (uint32_t)row[x * 2u + 1u] << 8;
+                    out[x * 4u + 0u] = (uint8_t)(((p & 0x1Fu) * 527u + 23u) >> 6);
+                    out[x * 4u + 1u] = (uint8_t)((((p >> 5) & 0x3Fu) * 259u + 33u) >> 6);
+                    out[x * 4u + 2u] = (uint8_t)((((p >> 11) & 0x1Fu) * 527u + 23u) >> 6);
+                    out[x * 4u + 3u] = 0xFF;
+                }
+            }
+            d3d8_movie_set_frame(bgra, w, h);
+            if (!g_cpu_frame_live && logged < 4) {
+                logged++;
+                fprintf(stderr, "[HLE-D3D8] swap %lu: the back buffer (0x%08X, format 0x%02X "
+                        "%ux%u) was written by the CPU, not drawn; showing guest memory "
+                        "(RECOMP_CPU_FRAME=0 to switch off)\n", g_shadow_swaps, data, fmt, w, h);
+            }
+            g_cpu_frame_live = 1;
+        }
+    }
+    if (g_cpu_frame_live)
+        d3d8_movie_draw();
+    return g_cpu_frame_live;
+}
+
 static void frame_end_shadow(void)
 {
     if (g_shadow) {
@@ -2529,6 +2644,8 @@ static void frame_end_shadow(void)
              * cost is that anything drawn over such a movie is covered,
              * which is why RECOMP_XMV_LAYER=0 turns this case off. */
             d3d8_movie_draw();
+            g_movie_drawn = 1;
+        } else if (cpu_frame_present()) {
             g_movie_drawn = 1;
         }
         g_movie_sampled = 0;
@@ -2639,6 +2756,7 @@ HLE_EXPORT(D3DDevice_Swap)
     xbox_FpsCountSwap();
     if (g_backbuffer_va)
         note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
+    cpu_frame_note(g_backbuffer_va);
     if (shadow_trace_on())
         fprintf(stderr, "[TRACE swap %lu] Swap flags 0x%X (back buffer 0x%08X data 0x%08X)\n",
                 g_shadow_swaps, HLE_ARG(0), g_backbuffer_va,
@@ -2697,6 +2815,7 @@ HLE_EXPORT(D3DDevice_Present)
     xbox_FpsCountSwap();
     if (g_backbuffer_va)
         note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
+    cpu_frame_note(g_backbuffer_va);
     {
         LARGE_INTEGER t0, t1, t2;
         QueryPerformanceCounter(&t0);
