@@ -4928,7 +4928,27 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
             continue;
         }
         if (g_heap_blocks[i].addr & (alignment - 1)) {
-            continue;   /* wrong alignment for this request */
+            /* Not aligned here, but an aligned stretch inside it may fit.
+             * Skipping such a block outright made every 64 KB-aligned
+             * request (RECOMP_VA_64K) pass over all the space freed at odd
+             * addresses: Rainbow Six 3's first level load ran the bump
+             * pointer to the top of the 48 MB with about 21 MB live in large
+             * blocks. The head becomes a free block of its own, before this
+             * one, so the table stays in address order. */
+            uint32_t addr = g_heap_blocks[i].addr;
+            uint32_t aligned = (addr + alignment - 1) & ~(alignment - 1);
+            uint32_t head = aligned - addr;
+
+            if (head < 64u || (uint64_t)head + size > g_heap_blocks[i].size ||
+                g_heap_block_count >= XBOX_HEAP_MAX_BLOCKS)
+                continue;
+            memmove(&g_heap_blocks[i + 1], &g_heap_blocks[i],
+                    (size_t)(g_heap_block_count - i) * sizeof g_heap_blocks[0]);
+            g_heap_block_count++;
+            g_heap_blocks[i].size = head;            /* stays free */
+            i++;
+            g_heap_blocks[i].addr = aligned;
+            g_heap_blocks[i].size -= head;
         }
         /* Hand back only what was asked for, and keep the rest available.
          *
@@ -4999,6 +5019,27 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
                     fprintf(stderr, "  [HEAP] %d live blocks of %u bytes (%u KB)\n",
                             hist[j].n, hist[j].size,
                             (unsigned)((uint64_t)hist[j].n * hist[j].size / 1024));
+                }
+                /* And what is free but could not be used: a heap with most
+                 * of its space free is fragmented, not full. */
+                {
+                    uint64_t live = 0, spare = 0;
+                    uint32_t largest = 0;
+                    int nfree = 0;
+                    for (int i = 0; i < g_heap_block_count; i++) {
+                        if (!g_heap_blocks[i].free) {
+                            live += g_heap_blocks[i].size;
+                            continue;
+                        }
+                        nfree++;
+                        spare += g_heap_blocks[i].size;
+                        if (g_heap_blocks[i].size > largest)
+                            largest = g_heap_blocks[i].size;
+                    }
+                    fprintf(stderr, "  [HEAP] %u KB live; %u KB free in %d blocks, the "
+                            "largest %u KB (alignment asked: %u)\n",
+                            (unsigned)(live / 1024), (unsigned)(spare / 1024), nfree,
+                            largest / 1024, alignment);
                 }
                 fflush(stderr);
             }
