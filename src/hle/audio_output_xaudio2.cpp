@@ -577,6 +577,13 @@ extern "C" void recomp_audio_output_reset_voice(uint32_t slot)
     if (slot < kVoiceCount) destroyVoice(voices[slot]);
 }
 
+/* Not drained here yet: as reset_voice, the behaviour this backend has
+ * always had (the SDL backend drains; see audio_output.h). */
+extern "C" void recomp_audio_output_release_voice(uint32_t slot)
+{
+    recomp_audio_output_reset_voice(slot);
+}
+
 extern "C" void recomp_audio_output_set_mix(uint32_t slot, const RecompAudioMix *mix)
 {
     if (slot >= kVoiceCount || !mix) return;

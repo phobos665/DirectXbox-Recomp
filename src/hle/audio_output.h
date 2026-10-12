@@ -23,6 +23,12 @@ extern "C" {
 void recomp_audio_output_initialize(void);
 void recomp_audio_output_shutdown(void);
 void recomp_audio_output_reset_voice(uint32_t slot);
+/* A voice whose buffer was stopped: no more sound is coming, but what was
+   already submitted -- the sound due before the stop, which the voice plays a
+   pre-roll late -- plays out instead of being cut mid-waveform, and the slot's
+   next submission starts a new voice. On a backend that cannot drain, the
+   same as reset_voice. */
+void recomp_audio_output_release_voice(uint32_t slot);
 
 /* Copies PCM before returning; never retains a guest-memory pointer.
    Slots: 0..255 for buffers, 256..271 for streams, 272

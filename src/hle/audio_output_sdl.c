@@ -51,6 +51,14 @@ typedef struct {
      * holds are MIX_FRAME_BYTES per caller frame. */
     int      mixed;
     uint32_t mix_applied;
+    /* RECOMP_AUDIO_METER: submissions that found the voice already empty
+     * (it ran dry: a gap in that voice), and the last two samples sent, to
+     * see whether the next submission joins on smoothly. */
+    uint32_t dry, joins, bad_joins, gain_steps, big_gain_steps, remade, level_steps;
+    float    last_levels[2][RECOMP_SPEAKERS];
+    float    last_gain;
+    int16_t  tail[2];
+    int      have_tail;
 } voice;
 
 /* recomp_audio_output_set_mix / _route, per slot (see the XAudio2 file),
@@ -79,6 +87,9 @@ typedef struct {
 static pthread_mutex_t   g_lock = PTHREAD_MUTEX_INITIALIZER;
 static SDL_AudioDeviceID g_device;
 static voice             g_voices[VOICE_COUNT];
+/* Voices let go of by release_voice, playing out what they hold. */
+#define DRAINING_MAX 64u
+static SDL_AudioStream  *g_draining[DRAINING_MAX];
 static slot_mix          g_mixes[VOICE_COUNT];
 static submix            g_submixes[SUBMIXES];
 static int               g_reported_nonzero[VOICE_COUNT];
@@ -225,6 +236,171 @@ static void retire_played(voice *v)
  * as before the first voice exists. */
 static float g_open_gain;
 
+/* The mix, after SDL has summed every voice and before the device: one place
+ * for what the XAudio2 backend does on its mastering voice, and for the
+ * diagnostics that need the finished sound.
+ *
+ *   - A limiter, on by default (RECOMP_AUDIO_LIMITER=0 for none), as the
+ *     XAudio2 file's FXMasteringLimiter: unity below full scale, and above it
+ *     the gain drops at once to the frame's peak and recovers over about
+ *     6 ms (FXMASTERINGLIMITER_DEFAULT_RELEASE), instead of the hard clip SDL
+ *     does when it converts the float mix. Rainbow Six 3's firefights summed
+ *     past full scale and crackled.
+ *   - RECOMP_AUDIO_METER=1: every five seconds, the peak, the frames past full
+ *     scale before the limiter, and the frames that were silent.
+ *   - RECOMP_AUDIO_CAPTURE=<file.wav>: the mix as heard (after the limiter),
+ *     32-bit float WAV, for listening to or measuring a run that was muted.
+ *   - RECOMP_MUTE: done here, by zeroing the mix after the capture and the
+ *     meter, so a muted run's mix is still there to measure. The device still
+ *     pulls every voice at its own rate, so play positions are unchanged.
+ * Runs on SDL's audio thread. */
+static int      g_post_muted, g_post_limit = 1, g_post_meter;
+static float    g_limit_gain = 1.0f, g_limit_release = 1.0f;
+static FILE    *g_capture;
+static uint64_t g_capture_bytes;
+static uint32_t g_capture_rate, g_capture_channels;
+static uint64_t g_meter_frames, g_meter_over, g_meter_silent;
+static uint32_t g_remade_rate, g_remade_mixed, g_remade_queued;
+static double   g_cut_ms, g_drained_ms;      /* sound thrown away / played out at a stop */
+static uint32_t g_cuts, g_drains;
+static float    g_meter_peak;
+static Uint64   g_meter_last;
+
+static void capture_header(FILE *f, uint32_t rate, uint32_t channels, uint64_t bytes)
+{
+    uint32_t data = bytes > 0xFFFFFFF0u ? 0xFFFFFFF0u : (uint32_t)bytes;
+    uint32_t riff = data + 36u, byte_rate = rate * channels * 4u, fmt_len = 16u;
+    uint16_t fmt_tag = 3u, ch = (uint16_t)channels, align = (uint16_t)(channels * 4u), bits = 32u;
+
+    fseek(f, 0, SEEK_SET);
+    fwrite("RIFF", 1, 4, f); fwrite(&riff, 4, 1, f); fwrite("WAVEfmt ", 1, 8, f);
+    fwrite(&fmt_len, 4, 1, f); fwrite(&fmt_tag, 2, 1, f); fwrite(&ch, 2, 1, f);
+    fwrite(&rate, 4, 1, f); fwrite(&byte_rate, 4, 1, f); fwrite(&align, 2, 1, f);
+    fwrite(&bits, 2, 1, f); fwrite("data", 1, 4, f); fwrite(&data, 4, 1, f);
+    fseek(f, 0, SEEK_END);
+}
+
+static void SDLCALL postmix(void *userdata, const SDL_AudioSpec *spec, float *buffer, int buflen)
+{
+    int channels = spec->channels > 0 ? spec->channels : 2;
+    int frames = buflen / (int)sizeof(float) / channels, i, c;
+
+    (void)userdata;
+    for (i = 0; i < frames; i++) {
+        float *f = buffer + (size_t)i * channels, peak = 0.0f;
+
+        for (c = 0; c < channels; c++) {
+            float a = fabsf(f[c]);
+            if (a > peak) peak = a;
+        }
+        if (peak > g_meter_peak) g_meter_peak = peak;
+        if (peak > 1.0f) g_meter_over++;
+        if (peak < 1e-6f) g_meter_silent++;
+        if (g_post_limit) {
+            float want = peak > 1.0f ? 1.0f / peak : 1.0f;
+            if (want < g_limit_gain)
+                g_limit_gain = want;                         /* at once */
+            else
+                g_limit_gain += (1.0f - g_limit_gain) * g_limit_release;
+            if (g_limit_gain < 1.0f)
+                for (c = 0; c < channels; c++)
+                    f[c] *= g_limit_gain;
+        }
+    }
+    g_meter_frames += (uint64_t)frames;
+    if (g_capture) {
+        if (!g_capture_rate) {
+            g_capture_rate = (uint32_t)spec->freq;
+            g_capture_channels = (uint32_t)channels;
+            capture_header(g_capture, g_capture_rate, g_capture_channels, 0);
+        }
+        fwrite(buffer, 1, (size_t)buflen, g_capture);
+        g_capture_bytes += (uint64_t)buflen;
+    }
+    if (g_post_meter) {
+        Uint64 now = SDL_GetTicks();
+        if (!g_meter_last) g_meter_last = now;
+        if (now - g_meter_last >= 5000u) {
+            fprintf(stderr, "[audio-output] meter: peak %.1f dBFS, %llu of %llu frames past full "
+                    "scale before the limiter, %llu silent\n",
+                    g_meter_peak > 0.0f ? 20.0 * log10((double)g_meter_peak) : -144.0,
+                    (unsigned long long)g_meter_over, (unsigned long long)g_meter_frames,
+                    (unsigned long long)g_meter_silent);
+            g_meter_peak = 0.0f;
+            g_meter_over = g_meter_frames = g_meter_silent = 0;
+            g_meter_last = now;
+            {
+                /* Per voice, from submit(): buffers are slots 0-255, streams
+                 * 256-271, the movie 272. Read without the lock: counters
+                 * for a report, not state. */
+                uint32_t i, dry_b = 0, dry_s = 0, bad = 0, joins = 0, worst = 0, worst_slot = 0;
+                uint32_t steps = 0, big = 0, levels = 0;
+                for (i = 0; i < VOICE_COUNT; i++) {
+                    voice *v = &g_voices[i];
+                    if (i < 256u) dry_b += v->dry; else dry_s += v->dry;
+                    bad += v->bad_joins;
+                    joins += v->joins;
+                    if (v->dry + v->bad_joins > worst) {
+                        worst = v->dry + v->bad_joins;
+                        worst_slot = i;
+                    }
+                    levels += v->level_steps;
+                    v->level_steps = 0;
+                    steps += v->gain_steps;
+                    big += v->big_gain_steps;
+                    v->dry = v->joins = v->bad_joins = 0;
+                    v->gain_steps = v->big_gain_steps = 0;
+                }
+                fprintf(stderr, "[audio-output] gain changes between submissions: %u, %u of them "
+                        "over half a dB, each applied at once; 3D level changes %u; voices "
+                        "remade with sound still queued %u (%u for a new rate, %u mix on/off)\n",
+                        steps, big, levels, g_remade_queued, g_remade_rate, g_remade_mixed);
+                g_remade_queued = g_remade_rate = g_remade_mixed = 0;
+                fprintf(stderr, "[audio-output] voices reset with sound queued: %u, %.0f ms cut; "
+                        "stopped and played out: %u, %.0f ms\n", g_cuts, g_cut_ms, g_drains,
+                        g_drained_ms);
+                g_cuts = g_drains = 0;
+                g_cut_ms = g_drained_ms = 0.0;
+                fprintf(stderr, "[audio-output] voices: ran dry %u (buffers) %u (streams); "
+                        "%u of %u joins between submissions jump; worst slot %u (%u)\n",
+                        dry_b, dry_s, bad, joins, worst_slot, worst);
+            }
+        }
+    }
+    if (g_post_muted)
+        memset(buffer, 0, (size_t)buflen);
+}
+
+static int postmix_install(SDL_AudioDeviceID dev, int muted)
+{
+    const char *limit = getenv("RECOMP_AUDIO_LIMITER");
+    const char *meter = getenv("RECOMP_AUDIO_METER");
+    const char *capture = getenv("RECOMP_AUDIO_CAPTURE");
+    SDL_AudioSpec spec;
+    int frames = 0;
+
+    SDL_zero(spec);
+    SDL_GetAudioDeviceFormat(dev, &spec, &frames);
+    g_post_muted = muted;
+    g_post_limit = !(limit && strcmp(limit, "0") == 0);
+    g_post_meter = meter && *meter && strcmp(meter, "0") != 0;
+    /* Recover over about 6 ms: e^(-1 / (6 ms * rate)) per frame. */
+    g_limit_release = 1.0f - expf(-1.0f / (0.006f * (float)(spec.freq > 0 ? spec.freq : 48000)));
+    if (capture && *capture) {
+        g_capture = fopen(capture, "wb");
+        fprintf(stderr, "[audio-output] capturing the mix to %s%s\n", capture,
+                g_capture ? "" : " -- could not open it");
+    }
+    if (!SDL_SetAudioPostmixCallback(dev, postmix, NULL)) {
+        fprintf(stderr, "[audio-output] no post-mix stage (%s): no limiter%s\n",
+                SDL_GetError(), muted ? "; muting by the device gain" : "");
+        return 0;
+    }
+    if (g_post_limit)
+        fprintf(stderr, "[audio-output] limiter on the mix (RECOMP_AUDIO_LIMITER=0 for none)\n");
+    return 1;
+}
+
 static void *open_device_thread(void *arg)
 {
     SDL_AudioDeviceID dev;
@@ -252,10 +428,10 @@ static void *open_device_thread(void *arg)
      * ones an audible run would see (see the XAudio2 file). The gain is set
      * before the device is published, so nothing is ever bound to it unmuted,
      * and a device that cannot be muted is not used at all. */
-    if (muted) {
-        gain = 0.0f;
+    if (muted)
         fprintf(stderr, "[audio-output] RECOMP_MUTE: playing silently\n");
-    }
+    if (!postmix_install(dev, muted) && muted)
+        gain = 0.0f;                         /* no post-mix stage: mute the device */
     if (!SDL_SetAudioDeviceGain(dev, gain)) {
         fprintf(stderr, "[audio-output] disabled operation=SetAudioDeviceGain error=%s\n",
                 SDL_GetError());
@@ -340,9 +516,20 @@ void recomp_audio_output_shutdown(void)
     }
     for (i = 0; i < VOICE_COUNT; i++)
         destroy_voice(&g_voices[i]);
+    for (i = 0; i < DRAINING_MAX; i++)
+        if (g_draining[i]) {
+            SDL_DestroyAudioStream(g_draining[i]);
+            g_draining[i] = NULL;
+        }
     if (g_device)
         SDL_CloseAudioDevice(g_device);
     g_device = 0;
+    if (g_capture) {
+        capture_header(g_capture, g_capture_rate ? g_capture_rate : 48000u,
+                       g_capture_channels ? g_capture_channels : 2u, g_capture_bytes);
+        fclose(g_capture);
+        g_capture = NULL;
+    }
     g_attempted = 1;
     g_summary_printed = 1;
     fprintf(stderr, "[audio-output] summary submitted_buffers=%llu submitted_bytes=%llu "
@@ -351,11 +538,76 @@ void recomp_audio_output_shutdown(void)
     pthread_mutex_unlock(&g_lock);
 }
 
+/* The draining voices (g_draining) are freed by reap_draining once empty, from the callers' threads (never from SDL's audio
+ * thread, which holds the device lock while it mixes). */
+/* What a voice still holds, in milliseconds of its source. */
+static double queued_ms(const voice *v)
+{
+    int q = v->stream ? SDL_GetAudioStreamQueued(v->stream) : 0;
+    uint32_t frame = v->mixed ? MIX_FRAME_BYTES : v->channels * (v->bits_per_sample / 8u);
+    if (q <= 0 || !frame || !v->sample_rate)
+        return 0.0;
+    return (double)q / frame * 1000.0 / v->sample_rate;
+}
+
+static void reap_draining(void)
+{
+    uint32_t i;
+    for (i = 0; i < DRAINING_MAX; i++)
+        if (g_draining[i] && SDL_GetAudioStreamQueued(g_draining[i]) <= 0) {
+            SDL_DestroyAudioStream(g_draining[i]);
+            g_draining[i] = NULL;
+        }
+}
+
+void recomp_audio_output_release_voice(uint32_t slot)
+{
+    static int drain = -1;
+    voice *v;
+    uint32_t i;
+
+    if (slot >= VOICE_COUNT)
+        return;
+    if (drain < 0) {
+        const char *e = getenv("RECOMP_AUDIO_DRAIN");      /* 0: cut, as before */
+        drain = !(e && strcmp(e, "0") == 0);
+    }
+    if (!drain) {
+        recomp_audio_output_reset_voice(slot);
+        return;
+    }
+    pthread_mutex_lock(&g_lock);
+    reap_draining();
+    v = &g_voices[slot];
+    if (v->stream && SDL_GetAudioStreamQueued(v->stream) > 0) {
+        for (i = 0; i < DRAINING_MAX && g_draining[i]; i++)
+            ;
+        if (i == DRAINING_MAX) {
+            g_cut_ms += queued_ms(v);
+            g_cuts++;
+        } else {
+            g_drained_ms += queued_ms(v);
+            g_drains++;
+            /* The resampler's last frames too, then let it go. The slot's
+             * counters restart, as after a reset. */
+            SDL_FlushAudioStream(v->stream);
+            g_draining[i] = v->stream;
+            v->stream = NULL;
+        }
+    }
+    destroy_voice(v);
+    pthread_mutex_unlock(&g_lock);
+}
+
 void recomp_audio_output_reset_voice(uint32_t slot)
 {
     if (slot >= VOICE_COUNT)
         return;
     pthread_mutex_lock(&g_lock);
+    if (g_voices[slot].stream && SDL_GetAudioStreamQueued(g_voices[slot].stream) > 0) {
+        g_cut_ms += queued_ms(&g_voices[slot]);
+        g_cuts++;
+    }
     destroy_voice(&g_voices[slot]);
     pthread_mutex_unlock(&g_lock);
 }
@@ -491,6 +743,7 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
+    reap_draining();
     v = &g_voices[slot];
     {
         RecompAudioMix probe;
@@ -500,8 +753,13 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     }
     if (v->stream && (v->sample_rate != sample_rate || v->channels != channels ||
                       v->bits_per_sample != bits_per_sample ||
-                      v->mixed != mixed_now))
+                      v->mixed != mixed_now)) {
+        if (g_post_meter && SDL_GetAudioStreamQueued(v->stream) > 0)
+            g_remade_rate += v->sample_rate != sample_rate,
+            g_remade_mixed += v->mixed != mixed_now,
+            g_remade_queued++;
         destroy_voice(v);
+    }
     if (!v->stream) {
         SDL_AudioSpec src;
 
@@ -538,13 +796,50 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     if (volume_hundredth_db > 0)
         volume_hundredth_db = 0;
     gain = volume_hundredth_db == -10000 ? 0.0f : powf(10.0f, (float)volume_hundredth_db / 2000.0f);
+    if (g_post_meter && v->submitted && gain != v->last_gain) {
+        v->gain_steps++;
+        if (fabsf(gain - v->last_gain) > 0.06f * (gain > v->last_gain ? gain : v->last_gain) + 1e-4f)
+            v->big_gain_steps++;     /* more than about half a dB */
+    }
+    v->last_gain = gain;
     SDL_SetAudioStreamGain(v->stream, gain);
 
     retire_played(v);
+    if (g_post_meter && v->submitted && SDL_GetAudioStreamQueued(v->stream) == 0)
+        v->dry++;
+    if (g_post_meter && bits_per_sample == 16 && bytes >= 4u * channels) {
+        const int16_t *p16 = (const int16_t *)pcm;
+        if (v->have_tail) {
+            /* The first sample against the line through the last two. A
+             * join is bad when it misses by more than a quarter of full
+             * scale and by more than four times the step before it. */
+            int predicted = 2 * v->tail[1] - v->tail[0];
+            int miss = abs((int)p16[0] - predicted);
+            int step = abs((int)v->tail[1] - (int)v->tail[0]);
+            v->joins++;
+            if (miss > 8192 && miss > 4 * step + 256)
+                v->bad_joins++;
+        }
+        v->tail[0] = p16[bytes / 2u - 2u * channels];
+        v->tail[1] = p16[bytes / 2u - channels];
+        v->have_tail = 1;
+    }
     if (v->queued == QUEUE_SIZE) {
         drop_buffer(slot, "queue-full");
         pthread_mutex_unlock(&g_lock);
         return 0;
+    }
+    if (v->mixed && g_post_meter) {
+        uint32_t c2, s2;
+        int changed = 0;
+        for (c2 = 0; c2 < 2u; c2++)
+            for (s2 = 0; s2 < RECOMP_SPEAKERS; s2++) {
+                float a = v->last_levels[c2][s2], b2 = eff.levels[c2][s2];
+                if (fabsf(a - b2) > 0.06f * (a > b2 ? a : b2) + 1e-3f)
+                    changed = 1;
+                v->last_levels[c2][s2] = b2;
+            }
+        v->level_steps += (uint32_t)changed;
     }
     if (v->mixed) {
         uint32_t out_bytes = 0;
