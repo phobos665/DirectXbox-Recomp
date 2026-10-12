@@ -102,6 +102,10 @@ typedef struct {
 static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
+/* The Size word of what each stage last had bound: the image rectangle and
+ * pitch the hardware keeps when SwitchTexture changes only the offset and
+ * format (hle_d3d8_texture_by_state). */
+static uint32_t g_stage_size[MAX_STAGES];
 static texture_entry *g_bound_entry[MAX_STAGES];
 
 /* Each stage's palette: where the guest keeps it (physical, 0 for none) and
@@ -150,23 +154,26 @@ static uint32_t level_rows(uint32_t fmt, uint32_t h)
  * their Format word carries every dimension, where a linear one needs the
  * object's Size. */
 #define SYNTH_MAX 4096
-static struct { uint32_t data, format; } g_synth[SYNTH_MAX];
+static struct { uint32_t data, format, size; } g_synth[SYNTH_MAX];
 static int g_synth_count, g_synth_next;
 
 static int is_synth(uint32_t va) { return (va & 1u) != 0u; }
 
-static uint32_t synth_key(uint32_t data, uint32_t format)
+/* `size` is a linear texture's Size word, which its Format does not carry:
+ * 0 for the swizzled and compressed ones. */
+static uint32_t synth_key_sized(uint32_t data, uint32_t format, uint32_t size)
 {
     /* A direct-mapped memo in front of the scan: a title switches between
      * the same few hundred textures thousands of times a frame. */
     static int memo[1024];
-    uint32_t h = ((data >> 7) ^ (data >> 17) ^ (format * 0x9E3779B1u)) & 1023u;
+    uint32_t h = ((data >> 7) ^ (data >> 17) ^ (format * 0x9E3779B1u) ^ (size * 0x85EBCA6Bu)) & 1023u;
     int i = memo[h] - 1;
 
-    if (i >= 0 && i < g_synth_count && g_synth[i].data == data && g_synth[i].format == format)
+    if (i >= 0 && i < g_synth_count && g_synth[i].data == data && g_synth[i].format == format &&
+        g_synth[i].size == size)
         return ((uint32_t)(i + 1) << 4) | 1u;
     for (i = 0; i < g_synth_count; i++)
-        if (g_synth[i].data == data && g_synth[i].format == format) {
+        if (g_synth[i].data == data && g_synth[i].format == format && g_synth[i].size == size) {
             memo[h] = i + 1;
             return ((uint32_t)(i + 1) << 4) | 1u;
         }
@@ -178,8 +185,14 @@ static uint32_t synth_key(uint32_t data, uint32_t format)
     }
     g_synth[i].data = data;
     g_synth[i].format = format;
+    g_synth[i].size = size;
     memo[h] = i + 1;
     return ((uint32_t)(i + 1) << 4) | 1u;
+}
+
+static uint32_t synth_key(uint32_t data, uint32_t format)
+{
+    return synth_key_sized(data, format, 0u);
 }
 
 /* A field of a texture object: Common (+0), Data (+4), Format (+12) or
@@ -194,6 +207,7 @@ static uint32_t obj_field(uint32_t va, uint32_t off)
         case 0:  return COMMON_TYPE_TEXTURE | 1u;
         case 4:  return g_synth[i].data;
         case 12: return g_synth[i].format;
+        case 16: return g_synth[i].size;
         default: return 0;
         }
     }
@@ -1817,6 +1831,40 @@ void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format)
                 break;
             }
         }
+        /* A linear texture's size is not in its Format: the hardware keeps
+         * the stage's image rectangle and pitch from what it had bound, and
+         * only the offset changes. What decides how the memory is read is the
+         * pitch, so the texture the offset names is one over that memory with
+         * the stage's pitch, at its own size (a smaller target reads the same
+         * rows), or failing any, the stage's size itself. Rainbow Six 3's
+         * thermal and night vision copy the screen into a 640x480 surface and
+         * SwitchTexture its offset into a stage that had the 640x480 back
+         * buffer; a 320x240 texture over the same memory (another pitch) was
+         * taken instead, held last frame's blur, and the vision came out one
+         * flat colour. Its next pass switches to a 640x240 target with the
+         * same pitch, which must be read as itself. */
+        if (d3d8_format_is_linear((D3DFORMAT)((format >> 8) & 0xFFu)) && g_stage_size[stage]) {
+            uint32_t want = g_stage_size[stage], pitch = want >> 24;
+            uint32_t same = 0;
+
+            if (va && (HLE_MEM32(va + 16) >> 24) != pitch)
+                va = 0;
+            for (i = 0; !va && i < g_texture_count; i++) {
+                texture_entry *c = &g_textures[i];
+                if (c->host && c->va && !is_synth(c->va) && c->data == data &&
+                    c->format == format && (c->size >> 24) == pitch &&
+                    HLE_MEM32(c->va + 4) == data && HLE_MEM32(c->va + 12) == format)
+                    va = c->va;
+            }
+            for (i = 0; !va && !same && i < g_texture_count; i++) {
+                texture_entry *c = &g_textures[i];
+                if (c->host && c->rendered && c->va == 0 && c->data == data &&
+                    (c->size >> 24) == pitch)
+                    same = c->size;
+            }
+            if (!va)
+                va = synth_key_sized(data, format, same ? same : want);
+        }
         /* Not one SetTexture has bound: a swizzled or compressed texture is
          * described completely by its Format, so it is mirrored from that. */
         if (!va && !d3d8_format_is_linear((D3DFORMAT)((format >> 8) & 0xFFu)) &&
@@ -1849,6 +1897,8 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
 
         if (!dev || stage >= MAX_STAGES)
             return;
+        if (texture && obj_field(texture, 16))
+            g_stage_size[stage] = obj_field(texture, 16);
         if (texture) {
             /* A cube the title rendered into is bound as itself, and one it
              * filled from memory as a copy of those bytes (static_cube). */
