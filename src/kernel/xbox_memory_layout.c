@@ -684,6 +684,8 @@ static HANDLE        g_flip_gate_event;
 static volatile LONG g_flip_gate_vblanks;
 static int           g_flip_gate_divisor = -1;      /* -1: not configured */
 static int           g_flip_gate_strict;            /* RECOMP_FPS_CAP given */
+static int           g_flip_gate_user;              /* a cap other than adaptive */
+static int           g_flip_gate_title = 1;         /* vblanks per Swap the title asked */
 
 /* What the on-screen toggle cycles through: the settings a player picks
  * between, in that order. A RECOMP_FPS_CAP outside this list still works --
@@ -2042,12 +2044,14 @@ static int flip_gate_divisor(void)
         const char *cap = recomp_config_lookup("RECOMP_FPS_CAP", "frame_cap");
         const char *hz = getenv("RECOMP_VBLANK_HZ");
         int vblank = hz && atoi(hz) > 0 ? atoi(hz) : 60;
-        int d = 1;                                      /* adaptive unless asked */
+        int d = g_flip_gate_title;                      /* adaptive unless asked */
 
         if (cap && *cap) {
             int fps = atoi(cap);
+            if (strcmp(cap, "adaptive") != 0)
+                g_flip_gate_user = 1;
             if (strcmp(cap, "adaptive") == 0)
-                d = 1;
+                d = g_flip_gate_title;
             else if (strcmp(cap, "0") == 0 || strcmp(cap, "off") == 0)
                 d = 0;
             else if (fps > 0) {
@@ -2059,6 +2063,7 @@ static int flip_gate_divisor(void)
         g_flip_gate_divisor = d;
         fprintf(stderr, "  [NV2A] flip gate: %s\n",
                 d == 0 ? "off, Swap never waits (RECOMP_FPS_CAP=adaptive or 60 to pace)"
+                       : !g_flip_gate_strict && d > 1 ? "adaptive, at most one Swap per N vblanks, as the title asks"
                        : !g_flip_gate_strict ? "adaptive, at most one Swap per vblank (RECOMP_FPS_CAP=0 to switch off)"
                        : d == 1 ? "strict, one Swap per vblank" : "strict, one Swap per N vblanks");
         if (d > 1)
@@ -2067,6 +2072,44 @@ static int flip_gate_divisor(void)
         fflush(stderr);
     }
     return g_flip_gate_divisor;
+}
+
+/* The title's presentation interval, as vblanks per Swap.
+ *
+ * On the console the flip itself waits: D3D puts the interval into the push
+ * buffer and the GPU holds the flip until that many vblanks have passed. The
+ * GPU here is replaced, so nothing waited, and a title that asked for
+ * INTERVAL_TWO ran at 60 instead of 30. Rainbow Six 3 does (0x80000002,
+ * TWO_OR_IMMEDIATE) and steps its movies and cutscenes once a frame, so they
+ * played at about twice their speed. Adaptive stays adaptive: a Swap that is
+ * late goes at once, which is what the _OR_IMMEDIATE intervals ask for and
+ * harmless for the plain ones. */
+void xbox_Nv2aFlipGateSetTitleInterval(uint32_t interval)
+{
+    int n;
+
+    switch (interval & 0x7FFFFFFFu) {
+    case 2:  n = 2; break;                  /* D3DPRESENT_INTERVAL_TWO */
+    case 4:  n = 3; break;                  /* D3DPRESENT_INTERVAL_THREE */
+    case 8:  n = 4; break;                  /* D3DPRESENT_INTERVAL_FOUR */
+    default: n = 1; break;                  /* DEFAULT, ONE, IMMEDIATE */
+    }
+    if (n == g_flip_gate_title)
+        return;
+    g_flip_gate_title = n;
+    flip_gate_divisor();                    /* reads the player's cap, once */
+    if (g_flip_gate_user) {
+        fprintf(stderr, "  [NV2A] flip gate: the title asks for one Swap per %d vblank(s) "
+                "(presentation interval 0x%08X); RECOMP_FPS_CAP decides instead\n",
+                n, interval);
+    } else {
+        g_flip_gate_divisor = n;
+        g_flip_gate_strict = 0;
+        fprintf(stderr, "  [NV2A] flip gate: one Swap per %d vblank(s), as the title asks "
+                "(presentation interval 0x%08X; RECOMP_FPS_CAP=60 or F10 to override)\n",
+                n, interval);
+    }
+    fflush(stderr);
 }
 
 /* Where the current setting sits in that list, or -1 for one that is not in

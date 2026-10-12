@@ -291,6 +291,13 @@ void xbox_GuestConcurrencyReport(void);
 void xbox_Nv2aFlipGateArm(void);
 void xbox_Nv2aFlipGateRelease(void);
 
+/* The presentation interval the title gave CreateDevice
+ * (D3DPRESENT_PARAMETERS.FullScreen_PresentationInterval). With the gate at
+ * its default (adaptive, no RECOMP_FPS_CAP), INTERVAL_TWO and
+ * TWO_OR_IMMEDIATE hold Swaps to one every two vblanks, THREE every three,
+ * FOUR every four, as the console's flip does; a cap the player set wins. */
+void xbox_Nv2aFlipGateSetTitleInterval(uint32_t interval);
+
 /* Lend the gate's wait to fn (frame interpolation draws its in-between
  * frames in it). While the gate holds a Swap, it calls fn with the time now
  * and the time it expects the release (the next vblank), both

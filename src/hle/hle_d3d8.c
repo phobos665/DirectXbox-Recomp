@@ -2208,6 +2208,10 @@ HLE_EXPORT(Direct3D_CreateDevice)
          * Flags +0x28, FullScreen_PresentationInterval +0x30. The swap effect
          * decides what a Swap means (frame_end_shadow). */
         g_swap_effect = HLE_MEM32(pp_va + 0x14);
+        /* The flip that would have waited for it is on a GPU that is not
+         * there; the flip gate keeps the title's cadence instead. */
+        if ((int32_t)g_eax >= 0)
+            xbox_Nv2aFlipGateSetTitleInterval(HLE_MEM32(pp_va + 0x30));
         fprintf(stderr, "[HLE-D3D8] CreateDevice: %ux%u format 0x%02X, %u back buffer(s), "
                 "swap effect %u (1 discard, 2 flip, 3 copy, 4 copy vsync), flags 0x%08X, "
                 "refresh %u Hz, presentation interval 0x%08X -> 0x%08X\n",
