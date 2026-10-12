@@ -1973,6 +1973,37 @@ static HRESULT __stdcall dev_GetDepthStencilSurface(IDirect3DDevice8 *self, IDir
     return S_OK;
 }
 
+/* The NV2A's screen-space offset, in guest pixels.
+ *
+ * The XDK adds 0.53125 to every screen position the hardware rasterises
+ * (D3DDevice_SetScreenSpaceOffset stores the title's offset plus that
+ * constant, 0x003C34D8 in Rainbow Six 3's 5659 build), which puts the
+ * console's pixel centres on integer coordinates: the D3D8 rule titles write
+ * their screen-space quads for, -0.5 to 639.5 over a 640-wide target. The
+ * host puts them at +0.5, so everything was drawn half a pixel up and to the
+ * left of where the console draws it. Alone that is a slight softening; in a
+ * pass that reads the previous pass's pixels it accumulates. Rainbow Six 3's
+ * bloom halves the picture eight times, and its glow came out 24 pixels above
+ * the lights it belongs to, a ghost of the scene over every frame.
+ *
+ * Applied to the viewport, as the hardware applies it, so every draw moves:
+ * pre-transformed, vertex programs and the fixed function alike. 0.5 rather
+ * than 0.53125: the 1/32 is the hardware's rounding bias, and at 0.5 a
+ * texel-for-pixel copy lands exactly. RECOMP_D3D8_PIXEL_OFFSET=<pixels>
+ * overrides it (0 for the old placement). */
+static float pixel_offset(void)
+{
+    static float offset = -1.0f;
+
+    if (offset < 0.0f) {
+        const char *e = getenv("RECOMP_D3D8_PIXEL_OFFSET");
+        offset = e && *e ? (float)atof(e) : 0.5f;
+        if (offset < 0.0f || offset > 1.0f)
+            offset = 0.5f;
+    }
+    return offset;
+}
+
 static void apply_host_viewport(void)
 {
     const D3DVIEWPORT8 *vp = &g_device_state.viewport;
@@ -1983,8 +2014,8 @@ static void apply_host_viewport(void)
     if (!rhi_device_ready())
         return;
 
-    hv.x         = (FLOAT)vp->X * sx;
-    hv.y         = (FLOAT)vp->Y * sy;
+    hv.x         = ((FLOAT)vp->X + pixel_offset()) * sx;
+    hv.y         = ((FLOAT)vp->Y + pixel_offset()) * sy;
     hv.width     = (FLOAT)vp->Width * sx;
     hv.height    = (FLOAT)vp->Height * sy;
     hv.min_depth = vp->MinZ;
