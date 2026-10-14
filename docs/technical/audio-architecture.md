@@ -34,10 +34,12 @@ Not yet:
 - Step 5 (the GP) is not started: xemu's DSP interpreter is 13.7k lines,
   its GP output is stereo, and it would replace the speaker stage rather
   than add to it. Worth it for titles with their own effects image.
-- Level: the APU path is about 6 dB under the native path in TS2. The
-  speaker stage undoes the bins' headroom; the rest is the voice headroom
-  DirectSound folds into the VP's volume, which the native stream path
-  leaves out. Which is right is for the GP (step 5) or a console to say.
+- Level: the two paths now measure the same in TS2. The native stream path
+  had left out the voice headroom DirectSound folds into a voice's volume
+  (TS2's music: -602 asked, -1202 kept), playing music 6 dB over the APU
+  path; it reads the kept value now (XDK 4721's layout, checked before it is
+  trusted). Whether both are the console's level is for the GP (step 5) or
+  a console to say.
 - The native path on SDL has no reverb (no shared send to feed one).
 
 Sound is the subsystem where this toolkit keeps paying per title. Each new

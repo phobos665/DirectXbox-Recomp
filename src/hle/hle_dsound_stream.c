@@ -190,6 +190,45 @@ static int guest_readable(uint32_t va, uint32_t bytes)
     return va >= 0x80000000u && (uint64_t)va + bytes <= 0x80000000ull + 0x04000000ull;
 }
 
+/* The stream's volume as DirectSound keeps it. The stream's
+ * CDirectSoundVoice is 4 bytes into it (CDirectSoundStream_SetVolume calls
+ * CDirectSoundVoice_SetVolume(this + 4, ...); XDK 4721), the voice's
+ * settings are behind [voice + 0x10], and there CDirectSoundVoice_SetVolume
+ * keeps, at +0x1C, lVolume less the headroom at +0x20 -- the number the
+ * console's voice
+ * processor is given, and the one the buffer path has always read
+ * (hle_dsound.c SET_VOLUME). The raw lVolume from SetVolume left the headroom
+ * out, so streams played 6 dB over buffers here, and over the APU path
+ * (TimeSplitters 2's music: -602 asked, -1202 kept; with this the native and
+ * APU paths measure the same). The raw value is the fallback while the
+ * object is not known or the field does not read as a volume with headroom
+ * taken off. The offsets are XDK 4721's; the APU path needs none of this. */
+static int32_t stream_volume(Stream *s)
+{
+    uint32_t settings;
+    int32_t v;
+    if (!s->object || !guest_readable(s->object + 0x14u, 4u))
+        return s->volume;
+    settings = HLE_MEM32(s->object + 0x14u);
+    if (!guest_readable(settings + 0x1Cu, 4u))
+        return s->volume;
+    v = (int32_t)HLE_MEM32(settings + 0x1Cu);
+    /* Headroom only ever takes volume away, by at most 10000: anything else
+     * is not this field (another XDK's layout), and the raw value stands. */
+    if (v < -10000 || v > 0 || v > s->volume || s->volume - v > 10000)
+        return s->volume;
+    {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "[DSOUND] stream volume from its voice settings: %d "
+                    "(the title asked %d; the difference is the voice's headroom)\n",
+                    v, s->volume);
+        }
+    }
+    return v;
+}
+
 static uint32_t slot_of(const Stream *s) { return SLOT_BASE + (uint32_t)(s - g_streams); }
 
 /* Decoded bytes per second and per frame. Output is 16-bit for ADPCM. */
@@ -494,7 +533,7 @@ static void pump(Stream *s, uint64_t now)
              * submitted however fast it plays. */
             RecompAudioMix mix;
             uint32_t route = 0u;
-            if (hle_ds3d_mix(s->iface, s->channels, s->volume, 0, &mix, &route)) {
+            if (hle_ds3d_mix(s->iface, s->channels, stream_volume(s), 0, &mix, &route)) {
                 uint32_t asked = hle_ds3d_stream_frequency(s->iface);
                 mix.ratio *= asked ? (float)asked / (float)s->rate : 1.0f;
                 recomp_audio_output_set_mix(slot_of(s), &mix);
@@ -507,7 +546,7 @@ static void pump(Stream *s, uint64_t now)
             }
         }
         if (!recomp_audio_output_submit(slot_of(s), pcm, bytes, s->rate, s->channels,
-                                        out_bits(s), s->volume))
+                                        out_bits(s), stream_volume(s)))
             break;
         s->sent += bytes;
     }
