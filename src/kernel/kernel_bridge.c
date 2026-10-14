@@ -3096,8 +3096,8 @@ static void kernel_vblank_tick(void)
 /* The APU's interrupt, delivered.
  *
  * The emulated APU works out its interrupt line correctly and then drops it:
- * its pci_irq_assert() is a stub. DirectSound connects its ISR on vector 6 and
- * reads voice notifiers only from there (and the DPC it queues), so without
+ * its pci_irq_assert() is a stub. DirectSound reads voice notifiers only from
+ * its APU ISR (and the DPC it queues; the vector is below), so without
  * this a stopped buffer keeps reporting PLAYING. Burnout 2 stops its front-end
  * sound before the attract movie and waits for exactly that, forever.
  *
@@ -3108,7 +3108,16 @@ static void kernel_vblank_tick(void)
  *
  * The line comes from a callback the host program registers -- the APU is a
  * separate library, and the kernel must not need it to link. */
-#define APU_VECTOR 6u
+/* The APU is PCI device 5 on the MCPX and interrupts on IRQ 5; the AC'97
+ * controller (ACI), device 6, on IRQ 6. DirectSound connects one ISR to each
+ * (TimeSplitters 2, XDK 4721: vector 5 -> CMcpxAPU's, 0x00202F3A; vector 6 ->
+ * the AC'97's, 0x00208BB3, which reads 0xFEC00030 and the bus-master status
+ * registers). This raised the APU's line on 6 only, so the APU's own ISR never
+ * ran: a voice that went idle was never reported, and DirectSound's Flush
+ * waited out its 5 s timeout on every stream it flushed. The line goes to 5
+ * now, and to 6 only for a title that connected nothing to 5, as before. */
+#define APU_VECTOR      5u
+#define APU_VECTOR_ACI  6u
 
 static int (*s_apu_irq_pending)(void);
 
@@ -3122,13 +3131,20 @@ static void kernel_apu_tick(void)
     static unsigned n;
     int claimed;
 
-    if (!s_apu_irq_pending || !xbox_GetConnectedInterrupt(APU_VECTOR))
+    uint32_t vector = APU_VECTOR;
+
+    if (!s_apu_irq_pending)
         return;
+    if (!xbox_GetConnectedInterrupt(vector)) {
+        vector = APU_VECTOR_ACI;
+        if (!xbox_GetConnectedInterrupt(vector))
+            return;
+    }
     if (!s_apu_irq_pending())
         return;
-    claimed = kernel_raise_interrupt(APU_VECTOR);
+    claimed = kernel_raise_interrupt(vector);
     if (n++ < 3) {
-        fprintf(stderr, "  [APU] interrupt -> ISR %s\n",
+        fprintf(stderr, "  [APU] interrupt (vector %u) -> ISR %s\n", vector,
                 claimed < 0 ? "not callable" :
                 claimed ? "claimed it" : "declined it");
         fflush(stderr);
