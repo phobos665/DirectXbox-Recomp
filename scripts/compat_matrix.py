@@ -51,6 +51,50 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+AUDIO_HEALTH_RE = re.compile(
+    r"\[AUDIO\] health t=(\d+)s path=(\w+): buffers used (\d+) heard (\d+) silent (\d+); "
+    r"streams used (\d+) heard (\d+) silent (\d+); refused (\d+)")
+
+
+def audio_health(text):
+    """The last [AUDIO] health line of a run's log (src/hle/audio_health.h),
+    as a dict, or None when the run printed none (no sound, or a build that
+    predates the line)."""
+    found = AUDIO_HEALTH_RE.findall(text)
+    if not found:
+        return None
+    t, path, bu, bh, bs, su, sh, ss, refused = found[-1]
+    return {"t": int(t), "path": path, "buffers_used": int(bu), "buffers_heard": int(bh),
+            "buffers_silent": int(bs), "streams_used": int(su), "streams_heard": int(sh),
+            "streams_silent": int(ss), "refused": int(refused)}
+
+
+def audio_verdict(a):
+    """'ok', or why the run's sound is wrong. A run that started effects and
+    heard none of them is the failure this exists for: TimeSplitters 2 lost
+    every sound effect and every run still passed."""
+    if a is None:
+        return "no line"
+    if a["buffers_used"] and not a["buffers_heard"]:
+        return "effects silent"
+    if a["streams_used"] and not a["streams_heard"]:
+        return "streams silent"
+    if not a["buffers_used"] and not a["streams_used"]:
+        return "no sound"
+    return "ok"
+
+
+def audio_cell(a):
+    """A report cell: heard/used for buffers and streams, and refusals."""
+    if a is None:
+        return "-"
+    cell = (f"B {a['buffers_heard']}/{a['buffers_used']} "
+            f"S {a['streams_heard']}/{a['streams_used']}")
+    if a["refused"]:
+        cell += f" r{a['refused']}"
+    verdict = audio_verdict(a)
+    return cell if verdict == "ok" else f"{cell} **{verdict}**"
+
 CMAKE_CANDIDATES = [
     Path("C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/Common7"
          "/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"),

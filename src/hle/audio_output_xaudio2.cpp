@@ -6,6 +6,7 @@
  * RECOMP_AUDIO_GAIN means full gain here rather than muted.
  */
 #include "audio_output.h"
+#include "audio_health.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -405,6 +406,7 @@ void pollMeter()
 void dropBuffer(uint32_t slot, const char *reason)
 {
     ++dropped_buffers;
+    recomp_audio_health_refused();
     if (dropped_buffers <= 4 ||
         (dropped_buffers & (dropped_buffers - 1)) == 0) {
         std::fprintf(stderr,
@@ -565,6 +567,7 @@ extern "C" void recomp_audio_output_initialize(void)
 extern "C" void recomp_audio_output_shutdown(void)
 {
     if (summary_printed) return;
+    recomp_audio_health_report();
     checkCriticalError();
     releaseOutput();
     attempted = true;
@@ -844,5 +847,6 @@ extern "C" int recomp_audio_output_submit(
             nonzero ? 1u : 0u, static_cast<double>(gain));
     }
     if (nonzero) reported_nonzero[slot] = true;
+    recomp_audio_health_sound(slot, slot >= 256u, nonzero);
     return 1;
 }

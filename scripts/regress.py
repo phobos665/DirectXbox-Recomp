@@ -335,7 +335,28 @@ def run_once(side, wt, t, mode, seconds, out_root, run_lock=None):
     s["unresolved"] = sorted(set(re.findall(
         r"\[ICALL\] (?:unknown|unresolved (?:call |jump )?) ?target (0x[0-9A-Fa-f]+)", text)))[:5]
     s["frames"] = str(out_dir / "frames")
+    s["audio"] = cm.audio_health(text)
     return s
+
+
+def audio_worse(b, c):
+    """Whether the change's sound is worse than the base's: it went wrong
+    where the base was right, or it hears a smaller share of the voices it
+    starts (more than one voice's worth), or it refuses sound the base did
+    not."""
+    if c is None:
+        return b is not None
+    if cm.audio_verdict(c) != "ok" and (b is None or cm.audio_verdict(b) == "ok"):
+        return True
+    if b is None:
+        return False
+
+    def share(a):
+        return a["buffers_heard"] / a["buffers_used"] if a["buffers_used"] else 1.0
+    used = max(b["buffers_used"], c["buffers_used"], 1)
+    if share(c) < share(b) - 1.0 / used:
+        return True
+    return c["refused"] > 0 and b["refused"] == 0
 
 
 def run_title_chain(t, sides, seconds, out_root, run_lock=None):
@@ -449,8 +470,9 @@ def main():
 
     lines = [f"# Regression: {args.change} ({shas['change'][:9]}) vs {args.base} "
              f"({shas['base'][:9]})", "",
-             "| title | mode | side | verdict | swaps | fps | lit | motion | crashed | unresolved |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+             "| title | mode | side | verdict | swaps | fps | lit | motion | crashed | unresolved "
+             "| audio |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     worse = []
     for name, res in results.items():
         for mode in ("driven", "idle"):
@@ -459,12 +481,14 @@ def main():
                 lines.append(f"| {name} | {mode} | {side} | {s['verdict']} | {s['swaps']} | "
                              f"{s['fps']} | {s['lit']} | {s['motion']} | "
                              f"{'yes ' + str(s['exit']) if s['crashed'] else 'no'} | "
-                             f"{' '.join(s['unresolved']) or '-'} |")
+                             f"{' '.join(s['unresolved']) or '-'} | "
+                             f"{cm.audio_cell(s.get('audio'))} |")
                 if not s["saves_isolated"]:
                     log(f"WARNING {name} {side} {mode}: no [PATH] line naming its own save "
                         f"dir -- this build may have used the player's saves")
             if (c["crashed"] and not b["crashed"]) or (b["swaps"] and not c["swaps"]) \
-                    or (c["unresolved"] and not b["unresolved"]):
+                    or (c["unresolved"] and not b["unresolved"]) \
+                    or audio_worse(b.get("audio"), c.get("audio")):
                 worse.append(f"{name} {mode}")
     lines += ["", "Frame difference by capture index (mean |diff| 0-255; timing shifts "
               "show as isolated spikes, a rendering change as a run of them):", ""]
@@ -476,7 +500,7 @@ def main():
         f"{s} {n} {'from ' + st if st else 'no lift'} {lt:.0f}+{bt:.0f}s"
         for (s, n), (st, lt, bt, _rc) in timings.items())]
     lines += ["", ("**Worse on:** " + ", ".join(worse)) if worse else
-              "No title is worse on crashes, swaps or unresolved calls "
+              "No title is worse on crashes, swaps, unresolved calls or audio "
               "(one run per side and mode cannot see an intermittent fault)."]
     report = "\n".join(lines)
     (out_root / "report.md").write_text(report, encoding="utf-8")

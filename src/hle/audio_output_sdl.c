@@ -25,6 +25,7 @@
  */
 #include "audio_output.h"
 #include "audio_speakers.h"
+#include "audio_health.h"
 
 #include <SDL3/SDL.h>
 
@@ -109,6 +110,7 @@ static unsigned long long g_dropped_buffers;
 static void drop_buffer(uint32_t slot, const char *reason)
 {
     ++g_dropped_buffers;
+    recomp_audio_health_refused();
     if (g_dropped_buffers <= 4 || (g_dropped_buffers & (g_dropped_buffers - 1)) == 0)
         fprintf(stderr, "[audio-output] dropped=%llu slot=%u reason=%s\n",
                 g_dropped_buffers, slot, reason);
@@ -531,6 +533,8 @@ void recomp_audio_output_shutdown(void)
 {
     uint32_t i;
 
+    recomp_audio_health_report();
+
     pthread_mutex_lock(&g_lock);
     if (g_summary_printed) {
         pthread_mutex_unlock(&g_lock);
@@ -906,5 +910,6 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     if (nonzero)
         g_reported_nonzero[slot] = 1;
     pthread_mutex_unlock(&g_lock);
+    recomp_audio_health_sound(slot, slot >= 256u, nonzero);
     return 1;
 }

@@ -26,6 +26,8 @@ import sys
 import time
 from pathlib import Path
 
+from compat_matrix import audio_cell, audio_health   # scripts/, beside this file
+
 
 def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None,
         kernel_log=None):
@@ -177,6 +179,7 @@ def summarise(err_path: Path) -> dict:
         "functions_reached": max(reached) if reached else 0,
         "still_growing": growing,
         "table_full": table_full,
+        "audio": audio_health(text),
     }
 
 
@@ -292,6 +295,10 @@ def main() -> int:
          len(before["icall_failures"]) if before else None)
     show("abi violations", len(now["abi_violations"]),
          len(before["abi_violations"]) if before else None)
+
+    print("\naudio")
+    show("sound", audio_cell(now.get("audio")),
+         audio_cell(before.get("audio")) if before else None)
 
     print("\nstopped")
     if now["crash_in"]:
