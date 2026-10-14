@@ -139,7 +139,7 @@ typedef struct DSPState {
 } DSPState;
 
 /* ============================================================
- * VP State: xemu's own vp/vp.h (third_party/xemu), with its filters,
+ * VP State: xemu's own vp/vp.h (copied in src/apu/xemu), with its filters,
  * HRTF and ADPCM decoder. These used to be copied here from an older
  * xemu; the voice processor is now compiled from xemu's source
  * (apu_vp_xemu.c), so its state comes from the same place.

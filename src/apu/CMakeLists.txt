@@ -37,11 +37,12 @@ target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # xemu's APU headers, by their xemu paths (hw/xbox/mcpx/apu/...): the shim
 # directory first, so QEMU's headers and apu_int.h are answered by
-# xemu_shim, then xemu itself for vp/vp.h, svf.h, hrtf.h, adpcm.h.
+# xemu_shim, then the copies of xemu's vp/vp.h, svf.h, hrtf.h and adpcm.h in
+# src/apu/xemu (see its README), so the xemu submodule is not needed.
 target_include_directories(xbox_apu BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/xemu_shim
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/xemu
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/xemu/hw/xbox/mcpx/apu/vp  # adpcm.h, beside vp.c in xemu
+    ${CMAKE_CURRENT_SOURCE_DIR}/xemu
+    ${CMAKE_CURRENT_SOURCE_DIR}/xemu/hw/xbox/mcpx/apu/vp  # adpcm.h, beside vp.c in xemu
 )
 target_link_libraries(xbox_apu PUBLIC xbox_samplerate)
 # The speaker stage plays through the host's audio output, and the path

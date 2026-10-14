@@ -61,7 +61,8 @@ jobs:
         run: |
           git submodule update --init --depth 1 \
             third_party/SDL third_party/Vulkan-Headers \
-            third_party/volk third_party/VulkanMemoryAllocator
+            third_party/volk third_party/VulkanMemoryAllocator \
+            third_party/libsamplerate
 
       # As on macOS: DXC's headers only. Without them the renderer is built
       # with no Vulkan backend and the DXC shader tests are left out.
@@ -116,7 +117,8 @@ jobs:
         run: |
           git submodule update --init --depth 1 \
             third_party/SDL third_party/Vulkan-Headers \
-            third_party/volk third_party/VulkanMemoryAllocator
+            third_party/volk third_party/VulkanMemoryAllocator \
+            third_party/libsamplerate
 
       # DXC's headers (dxcapi.h and the WinAdapter.h it needs off Windows),
       # without the rest of the repository. If this fails the renderer is
@@ -159,7 +161,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Fetch SDL3
-        run: git submodule update --init --depth 1 third_party/SDL
+        run: git submodule update --init --depth 1 third_party/SDL third_party/libsamplerate
 
       - name: Configure
         run: cmake -S . -B build -A x64

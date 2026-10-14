@@ -13,7 +13,8 @@
  *      goes through apu_phys_read (apu_shim.h), as every other access does,
  *      so a physical address in low RAM is read from low RAM.
  *
- * Its includes (QEMU's and xemu's apu_int.h) are answered by src/apu/xemu_shim.
+ * Its includes (QEMU's and xemu's apu_int.h) are answered by src/apu/xemu_shim;
+ * xemu's own VP headers are copied, from the same commit, in src/apu/xemu.
  */
 /*
  * QEMU MCPX Audio Processing Unit implementation
