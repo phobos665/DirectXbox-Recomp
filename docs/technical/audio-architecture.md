@@ -21,6 +21,7 @@ settings file). Native is the default.
 | The APU interrupt on vector 5 (it was 6, the AC'97's) | `src/kernel/kernel_bridge.c` | Flush no longer waits 5 s; ISR claims and acknowledges |
 | Speaker stage, one host stream, paced by the device | `src/apu/apu_core.c`, `recomp_audio_output_mix_*` | TS2 to Siberia: every voice heard, 60 fps |
 | Reverb: the room observed on the APU path; XAudio2's reverb, and one for SDL | `hle_dsound_3d.c`, `src/hle/audio_reverb.c` | `tests/audio_dsp` (T60 within 3%) |
+| Reverb on the native path on SDL: each voice's send as a stream of its own, on a second logical device whose post-mix is the room | `audio_output_sdl.c` | `tests/audio_output` (the send arrives with the voice, 304 ms behind 300 ms of silence) |
 
 Not yet:
 
@@ -40,7 +41,6 @@ Not yet:
   path; it reads the kept value now (XDK 4721's layout, checked before it is
   trusted). Whether both are the console's level is for the GP (step 5) or
   a console to say.
-- The native path on SDL has no reverb (no shared send to feed one).
 
 Sound is the subsystem where this toolkit keeps paying per title. Each new
 title has found something the last one did not use, and each finding has been

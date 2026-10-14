@@ -5,7 +5,7 @@
  * RECOMP_MUTE=1 is forced, so nothing is ever heard. Checks:
  *   1. muted, the device still opens and a voice's play position advances
  *      at the device's rate (about real time), and stops when it runs dry;
- *   2. at most 12 submissions in flight: the 13th is refused, not dropped
+ *   2. at most 64 submissions in flight: the 65th is refused, not dropped
  *      silently, and is taken again once the device has played some;
  *   3. reset_voice forgets the voice (position reports no voice).
  * Needs an audio device; prints SKIP and exits 0 when there is none.
@@ -24,7 +24,8 @@ static int g_fail;
 
 int main(void)
 {
-    enum { RATE = 22050, CHUNK = RATE / 10 * 4 };   /* 100 ms of 16-bit stereo */
+    enum { RATE = 22050, CHUNK = RATE / 10 * 4,      /* 100 ms of 16-bit stereo */
+           QUEUE = 64 };                             /* audio_output_sdl.c QUEUE_SIZE */
     static uint8_t pcm[CHUNK];
     uint64_t played = 0, played2 = 0;
     uint32_t queued = 0;
@@ -62,11 +63,11 @@ int main(void)
     printf("device up after %.0f ms\n", (double)(SDL_GetTicksNS() - t0) / 1e6);
     taken = 1;
     /* 2: fill the queue, then one more is refused. */
-    while (taken < 12 && recomp_audio_output_submit(256, pcm, CHUNK, RATE, 2, 16, 0))
+    while (taken < QUEUE && recomp_audio_output_submit(256, pcm, CHUNK, RATE, 2, 16, 0))
         taken++;
-    CHECK(taken == 12, "only %d of 12 submissions taken", taken);
+    CHECK(taken == QUEUE, "only %d of %d submissions taken", taken, QUEUE);
     CHECK(!recomp_audio_output_submit(256, pcm, CHUNK, RATE, 2, 16, 0),
-          "a 13th submission was taken with 12 in flight");
+          "submission %d was taken with %d in flight", QUEUE + 1, QUEUE);
 
     /* 1: the clock runs while muted. */
     CHECK(recomp_audio_output_position(256, &played, &queued), "no position for a live voice");
@@ -82,20 +83,20 @@ int main(void)
                (unsigned long long)played, (unsigned long long)played2, secs, rate, RATE, queued);
         CHECK(rate > RATE * 0.8 && rate < RATE * 1.2, "muted voice plays at %.0f frames/s, not ~%d",
               rate, RATE);
-        CHECK(queued < 12, "nothing retired after 500 ms");
+        CHECK(queued < QUEUE, "nothing retired after 500 ms");
     }
     CHECK(recomp_audio_output_submit(256, pcm, CHUNK, RATE, 2, 16, 0),
           "a submission was refused after the device played some");
 
-    /* It runs dry and stops: 13 x 100 ms queued in all. */
-    SDL_Delay(1500);
+    /* It runs dry and stops: QUEUE + 1 x 100 ms queued in all. */
+    SDL_Delay((QUEUE + 1) * 100 - 500 + 1000);
     recomp_audio_output_position(256, &played, &queued);
     SDL_Delay(200);
     recomp_audio_output_position(256, &played2, &queued);
     printf("dry: %llu -> %llu bytes, %u queued\n", (unsigned long long)played,
            (unsigned long long)played2, queued);
-    CHECK(played2 == played && played2 == 13ull * CHUNK, "position %llu after running dry, want %llu",
-          (unsigned long long)played2, 13ull * CHUNK);
+    CHECK(played2 == played && played2 == (QUEUE + 1ull) * CHUNK, "position %llu after running dry, want %llu",
+          (unsigned long long)played2, (QUEUE + 1ull) * CHUNK);
     CHECK(queued == 0, "%u still queued after running dry", queued);
 
     /* 3 */
