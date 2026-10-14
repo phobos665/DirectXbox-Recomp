@@ -151,6 +151,17 @@ run: the DSP effects image beyond its reverb (32 of 37 titles in `games/` downlo
 mix-bin headroom (31), HRTF (24, panned instead), LFO (10), ParaEQ, and reverb on the SDL
 backend.
 
+**Two audio paths (Oct 2026, `docs/technical/audio-architecture.md`).** `RECOMP_AUDIO=native`
+(the default) replaces DirectSound by name, as above. `RECOMP_AUDIO=apu` runs the title's own
+DirectSound against the emulated APU: xemu's current voice processor (`src/apu/apu_vp_xemu.c`),
+a speaker stage for the mix bins, one host stream paced by the device, and the I3DL2 reverb.
+The switch is in the generated thunks (`HLE_GROUP(audio)` in the DirectSound files; a
+replacement that only watches is `HLE_APU_OBSERVE`), so both paths are in one build. Every run
+prints `[AUDIO] health ... buffers used N heard M`, and `scripts/regress.py` fails a title whose
+voices start and are never heard. `RECOMP_APU_TRACE=1` logs the front-end methods and the
+interrupt traffic. Two things learned the hard way: the APU interrupts on vector 5 (6 is the
+AC'97's), and `DSENVELOPEDESC.dwEG` 1 is the amplitude envelope.
+
 **Widescreen and internal resolution** are investigated in
 `docs/technical/widescreen-and-resolution.md`, with every work item classified toolkit or
 game-specific. Two things to know before touching either: `XGetVideoFlags` returns 0 today

@@ -1,6 +1,44 @@
 # Audio: how Xbox sound works, and a design that covers every title
 
-Status: in progress on branch feat/audio-rework (14 October 2026).
+Status (14 October 2026, branch feat/audio-rework): steps 0 to 3 of the plan
+are built and TimeSplitters 2 plays through the APU path; see "Built" below.
+The native path is still the default.
+
+## Built
+
+Choose the path with `RECOMP_AUDIO=apu|native` (or `audio = ...` in the
+settings file). Native is the default.
+
+| Piece | Where | Checked |
+| --- | --- | --- |
+| Envelope index (SetEG's dwEG 1 is amplitude) | `hle_dsound_3d.c` | TS2's effects heard on the native path |
+| A slowed buffer's pre-roll in playing time; voice queues of 64 | `hle_dsound.c`, both backends | no queue-full refusals in a TS2 run |
+| One fold-down from Xbox speakers to the host's, SDL included | `src/hle/audio_speakers.c` | `tests/audio_dsp`; SDL no longer plays mixed voices 10 dB low |
+| `[AUDIO] health` line; regress and run_and_report judge it | `src/hle/audio_health.c`, `scripts/` | prints "effects silent" for the envelope bug |
+| Run-time switch: grouped HLE falls through to the XDK's body | `tools/recomp/hle.py` (`HLE_GROUP`, `HLE_APU_OBSERVE`), `src/hle/audio_path.c` | TS2: 29 replacements fall through, 2 observe |
+| xemu's current voice processor, real libsamplerate, HRTF on | `src/apu/apu_vp_xemu.c`, `third_party/libsamplerate` | builds on clang; MSVC patches marked |
+| Physical addresses through `xbox_PhysToGuest` | `src/apu/apu_shim.h` | buffers in the XBE image read from low RAM |
+| The APU interrupt on vector 5 (it was 6, the AC'97's) | `src/kernel/kernel_bridge.c` | Flush no longer waits 5 s; ISR claims and acknowledges |
+| Speaker stage, one host stream, paced by the device | `src/apu/apu_core.c`, `recomp_audio_output_mix_*` | TS2 to Siberia: every voice heard, 60 fps |
+| Reverb: the room observed on the APU path; XAudio2's reverb, and one for SDL | `hle_dsound_3d.c`, `src/hle/audio_reverb.c` | `tests/audio_dsp` (T60 within 3%) |
+
+Not yet:
+
+- Not compiled on Windows: the XAudio2 half of the APU stream and the
+  health hooks, and MSVC's view of `apu_vp_xemu.c`. Build and run there
+  before merging.
+- Not listened to by a person on the APU path. Scripted runs measure that
+  every voice is heard; they cannot say it sounds right.
+- Step 4 (every title on the APU path) has one title. The others in
+  `games/` are not on this machine.
+- Step 5 (the GP) is not started: xemu's DSP interpreter is 13.7k lines,
+  its GP output is stereo, and it would replace the speaker stage rather
+  than add to it. Worth it for titles with their own effects image.
+- Level: the APU path is about 6 dB under the native path in TS2. The
+  speaker stage undoes the bins' headroom; the rest is the voice headroom
+  DirectSound folds into the VP's volume, which the native stream path
+  leaves out. Which is right is for the GP (step 5) or a console to say.
+- The native path on SDL has no reverb (no shared send to feed one).
 
 Sound is the subsystem where this toolkit keeps paying per title. Each new
 title has found something the last one did not use, and each finding has been
