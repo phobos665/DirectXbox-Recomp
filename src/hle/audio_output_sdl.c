@@ -26,6 +26,7 @@
 #include "audio_output.h"
 #include "audio_speakers.h"
 #include "audio_health.h"
+#include "audio_reverb.h"
 
 #include <SDL3/SDL.h>
 
@@ -696,13 +697,28 @@ void recomp_audio_output_set_submix(uint32_t key, uint32_t channels, const Recom
 }
 
 /* No reverb on this backend yet: voices play dry. */
+/* The room (audio_reverb.c). The APU path's stream runs its reverb send
+ * (mix bin 10) through it; the native path's voices are mixed by SDL one by
+ * one, with no shared send to feed it, and play dry on this backend. */
+static RecompReverb *g_reverb;
+static RecompI3dl2   g_room;
+static int           g_room_set;
+
 void recomp_audio_output_set_reverb(const RecompI3dl2 *room)
 {
     static int said;
+    pthread_mutex_lock(&g_lock);
+    g_room_set = room != NULL;
+    if (room)
+        g_room = *room;
+    if (g_reverb)
+        recomp_reverb_set_room(g_reverb, room);
+    pthread_mutex_unlock(&g_lock);
     if (room && room->room > -10000 && !said) {
         said = 1;
-        fprintf(stderr, "[audio-output] the title describes an I3DL2 room; this backend "
-                "has no reverb yet, so it plays dry\n");
+        fprintf(stderr, "[audio-output] I3DL2 room %d, decay %.2f s: reverb on the APU "
+                "path's stream (the native path plays dry on this backend)\n",
+                room->room, (double)room->decay_time);
     }
 }
 
@@ -975,6 +991,32 @@ int recomp_audio_output_mix_submit(const float *frames, uint32_t count, uint32_t
             for (s = 0; s < RECOMP_SPEAKERS; s++)
                 v += in[s] * g_fold[s][k];
             o[k] = v;
+        }
+    }
+    /* The reverb send, through the room, into the front pair (both halves
+     * into a mono device). */
+    if (!g_reverb && g_room_set) {
+        g_reverb = recomp_reverb_create(rate);
+        if (g_reverb)
+            recomp_reverb_set_room(g_reverb, &g_room);
+    }
+    if (recomp_reverb_active(g_reverb)) {
+        if (n >= 2) {
+            recomp_reverb_process(g_reverb, frames + RECOMP_SPEAKERS, RECOMP_MIX_CHANNELS,
+                                  g_mix_buf, g_mix_buf + 1, n, count);
+        } else {
+            static float wet[2 * 512];
+            uint32_t done = 0;
+            while (done < count) {
+                uint32_t chunk = count - done < 512u ? count - done : 512u;
+                memset(wet, 0, sizeof wet);
+                recomp_reverb_process(g_reverb,
+                                      frames + (size_t)done * RECOMP_MIX_CHANNELS + RECOMP_SPEAKERS,
+                                      RECOMP_MIX_CHANNELS, wet, wet + 1, 2, chunk);
+                for (f = 0; f < chunk; f++)
+                    g_mix_buf[done + f] += 0.70710678f * (wet[2 * f] + wet[2 * f + 1]);
+                done += chunk;
+            }
         }
     }
     if (!SDL_PutAudioStreamData(g_mix_stream, g_mix_buf, (int)need)) {

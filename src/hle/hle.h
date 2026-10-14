@@ -38,6 +38,11 @@ extern ptrdiff_t g_xbox_mem_offset;
  * audio: the DirectSound replacement, off under RECOMP_AUDIO=apu. */
 #define HLE_GROUP(group)
 
+/* On a line of its own, in a grouped file: this replacement stays on while
+ * its group is off. Only for one that runs the original body and records
+ * what it was told, so the title's own code still does the work. */
+#define HLE_APU_OBSERVE(name)
+
 /* Imports an XDK variable's guest address by name, as hle_var_<name>. Must
  * start a line, like HLE_EXPORT: tools.recomp scans for the marker and writes
  * the definition into recomp_hle.c from the title's XDK symbols. 0 means the

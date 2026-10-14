@@ -71,6 +71,7 @@
 /* The DirectSound replacement: off under RECOMP_AUDIO=apu, when the title's
  * own DirectSound drives the emulated APU (src/hle/audio_path.c). */
 HLE_GROUP(audio)
+#include "audio_path.h"
 #include "hle_dsound_3d.h"
 
 int xbox_EnvSwitch(const char *name, int default_on);
@@ -1191,6 +1192,10 @@ static void read_room(RecompI3dl2 *r, uint32_t p)
     r->hf_reference = as_float(HLE_MEM32(p + 0x2Cu));
 }
 
+/* On the APU path too: the title's own DirectSound programs the chip, and
+ * the room it describes reaches the host's reverb from here, as the native
+ * path's service thread would hand it on (it does not run there). */
+HLE_APU_OBSERVE(IDirectSound_SetI3DL2Listener)
 HLE_ORIGINAL(IDirectSound_SetI3DL2Listener);
 HLE_EXPORT(IDirectSound_SetI3DL2Listener)
 {
@@ -1216,6 +1221,8 @@ HLE_EXPORT(IDirectSound_SetI3DL2Listener)
         }
     }
     PASS(IDirectSound_SetI3DL2Listener);
+    if (recomp_audio_path_apu())
+        hle_ds3d_service();
 }
 
 /* DSI3DL2BUFFER { lDirect, lDirectHF, lRoom, lRoomHF, flRoomRolloffFactor,
@@ -1362,7 +1369,9 @@ HLE_EXPORT(IDirectSoundStream_SetEG)
     PASS(IDirectSoundStream_SetEG);
 }
 
-/* Everything deferred becomes what is heard. */
+/* Everything deferred becomes what is heard. Kept on the APU path for the
+ * deferred room (see SetI3DL2Listener). */
+HLE_APU_OBSERVE(IDirectSound_CommitDeferredSettings)
 HLE_ORIGINAL(IDirectSound_CommitDeferredSettings);
 HLE_EXPORT(IDirectSound_CommitDeferredSettings)
 {
@@ -1384,6 +1393,8 @@ HLE_EXPORT(IDirectSound_CommitDeferredSettings)
         }
     unlock();
     PASS(IDirectSound_CommitDeferredSettings);
+    if (recomp_audio_path_apu())
+        hle_ds3d_service();
 }
 
 /* Creation: DSBUFFERDESC { dwSize, dwFlags, dwBufferBytes, lpwfxFormat,

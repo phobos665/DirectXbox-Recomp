@@ -229,6 +229,12 @@ BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 # replacement, off when sound goes through the emulated APU (RECOMP_AUDIO=apu,
 # docs/technical/audio-architecture.md).
 GROUP_RE = re.compile(r"^\s*HLE_GROUP\(\s*([A-Za-z_]\w*)\s*\)", re.M)
+# A replacement in a group that only watches -- it runs the original body and
+# records what it was told -- can stay on while the group is off. It marks
+# itself HLE_APU_OBSERVE(Name): its thunk has no fall-through. The I3DL2
+# listener is one: on the APU path the title's own DirectSound programs the
+# chip, and the room still has to reach the host's reverb.
+OBSERVE_RE = re.compile(r"^\s*HLE_APU_OBSERVE\(\s*([A-Za-z_]\w*)\s*\)", re.M)
 GROUPS = {"audio": "recomp_hle_audio_native"}   # group -> its runtime switch
 
 
@@ -246,8 +252,10 @@ def grouped_names(paths):
                 continue
             if len(set(groups)) > 1 or groups[0] not in GROUPS:
                 raise ValueError(f"{f}: HLE_GROUP must name one of {sorted(GROUPS)}")
+            observed = set(OBSERVE_RE.findall(text))
             for name in EXPORT_RE.findall(text):
-                out[name] = groups[0]
+                if name not in observed:
+                    out[name] = groups[0]
     return out
 
 
