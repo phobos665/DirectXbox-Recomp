@@ -34,7 +34,7 @@
 #include <string.h>
 
 #define VOICE_COUNT     (256u + 16u + 1u)
-#define QUEUE_SIZE      12u          /* audio_output_xaudio2.cpp kQueueSize */
+#define QUEUE_SIZE      64u          /* audio_output_xaudio2.cpp kQueueSize */
 #define MAX_BUFFER      160000u
 #define MIN_RATE        1000u
 #define MAX_RATE        200000u

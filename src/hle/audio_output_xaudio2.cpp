@@ -29,8 +29,12 @@ constexpr uint32_t kVoiceCount = 256 + 16 + 1;
    its clock in CHUNK_MS pieces (hle_dsound_stream.c), so four was one short
    of what the music path asks for and every frame past the first dropped a
    whole chunk: the sound fell behind the picture by 100 ms at a time, and a
-   two-minute run lost 42 seconds of music. */
-constexpr uint32_t kQueueSize = 12;
+   two-minute run lost 42 seconds of music. Twelve was then short for a
+   buffer played at a low ratio, whose 10 ms slices queue behind a pre-roll
+   that plays longer: counted in submissions, a voice's queue depends on how
+   finely its sound is sliced, not on how much sound it holds. 64 is
+   XAudio2's own limit (XAUDIO2_MAX_QUEUED_BUFFERS). */
+constexpr uint32_t kQueueSize = 64;
 constexpr uint32_t kMaxBufferBytes = 160000;
 
 struct PcmBuffer {
