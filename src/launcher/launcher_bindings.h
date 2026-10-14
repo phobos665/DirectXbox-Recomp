@@ -58,7 +58,9 @@ typedef struct BindConfig {
 void bind_defaults(BindConfig *c);
 
 /* The per-user file both ends agree on: RECOMP_INPUT_CONFIG if set,
- * else %APPDATA%\xboxrecomp\input_bindings.json. */
+ * else %APPDATA%\xboxrecomp\input_bindings.json on Windows, and
+ * input_bindings.json in the runtime's per-user directory elsewhere
+ * (recomp_config_user_dir: ~/Library/Application Support/xboxrecomp). */
 int  bind_config_path(char *out, size_t n);
 
 /* Read and write that schema. A read that finds no file leaves the

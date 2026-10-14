@@ -1,10 +1,11 @@
 /*
  * launcher_theme.h -- how the launcher looks, kept behind an interface.
  *
- * Everything drawn goes through here, so the whole of the platform's
- * drawing lives in one file. Today that is GDI into a 32-bit DIB;
- * whenever the launcher needs to run somewhere other than Windows, this
- * is the file that is replaced rather than the launcher.
+ * Everything drawn goes through here, so the platform's drawing is kept
+ * out of the launcher. The shapes are arithmetic over a 32-bit buffer
+ * (launcher_theme.c), the same everywhere; the buffer and the text are the
+ * host's: GDI and a DIB on Windows (launcher_theme_gdi.c), CoreText on
+ * macOS (launcher_theme_coretext.c).
  *
  * The look is the original Xbox dashboard's: black, a green glow that
  * comes from behind, panels with soft edges, and the selected thing
@@ -15,7 +16,15 @@
 #ifndef XBOXRECOMP_LAUNCHER_THEME_H
 #define XBOXRECOMP_LAUNCHER_THEME_H
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <stdint.h>
+/* GDI's colour, 0x00BBGGRR, so the colours below read the same everywhere. */
+typedef uint32_t COLORREF;
+#define RGB(r, g, b) ((COLORREF)(((r) & 0xFF) | (((g) & 0xFF) << 8) | \
+                                 (((b) & 0xFF) << 16)))
+#endif
 
 typedef struct ThemeRect { int x, y, w, h; } ThemeRect;
 
@@ -28,8 +37,19 @@ typedef struct ThemeRect { int x, y, w, h; } ThemeRect;
 /* A back buffer the size of the window. Everything below draws into it
  * and theme_present puts it on screen in one go, so nothing flickers. */
 int  theme_begin(int width, int height);
-void theme_present(HDC dc);
 void theme_shutdown(void);
+#ifdef _WIN32
+void theme_present(HDC dc);
+#else
+/* Pixels per window unit, for a display with more than one (Retina): the
+ * buffer is drawn at the display's own resolution rather than stretched up
+ * to it. Takes effect at the next theme_begin; 1 until then. */
+void theme_set_scale(double scale);
+/* The buffer as it is now, for the front end to put on screen: a
+ * CGImageRef the caller releases, or NULL. A copy, so drawing the next
+ * frame does not reach into the one being shown. */
+void *theme_image(void);
+#endif
 
 /* The background: black, with the glow behind where the content sits.
  * `pulse` runs 0..1 and drifts, so the glow breathes as the dashboard's

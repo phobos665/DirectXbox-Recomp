@@ -13,33 +13,60 @@
  * or stick to move, A to play, B to quit, shoulders to change tab.
  *
  * The drawing is all in launcher_theme.c, so this file is about what the
- * settings are and how they are moved between, not about pixels.
+ * settings are and how they are moved between, not about pixels. The window
+ * is the front end's (launcher.h), so nothing here is one host's.
  */
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#else
+#include <strings.h>
+#endif
+
+#include "launcher.h"
 #include "launcher_theme.h"
 #include "launcher_bindings.h"
 #include "recomp_config.h"
 #include "recomp_pad.h"
 #include "net_upnp.h"
+#include "platform/host_main.h"
 
 #ifndef LAUNCHER_GAME_EXE
 #define LAUNCHER_GAME_EXE "game.exe"
 #endif
+/* The image the game boots, which the launcher reads for its name and id.
+ * recomp_add_launcher reads it out of the title's main.c, as it does the
+ * folder. */
+#ifndef LAUNCHER_GAME_XBE
+#define LAUNCHER_GAME_XBE "default.xbe"
+#endif
 
-#define WINDOW_W 900
-#define WINDOW_H 800                    /* eight Video rows, their help, the footer */
+#define LAUNCHER_PATH 1024
+
+/* Who asks about the firewall, and the clipboard's keys, as the player
+ * knows them. */
+#if defined(__APPLE__)
+#define LAUNCHER_FIREWALL  "macOS"
+#define LAUNCHER_COPY_KEY  "Cmd+C"
+#define LAUNCHER_PASTE_KEY "Cmd+V"
+#elif defined(_WIN32)
+#define LAUNCHER_FIREWALL  "Windows"
+#define LAUNCHER_COPY_KEY  "Ctrl+C"
+#define LAUNCHER_PASTE_KEY "Ctrl+V"
+#else
+#define LAUNCHER_FIREWALL  "Your system"
+#define LAUNCHER_COPY_KEY  "Ctrl+C"
+#define LAUNCHER_PASTE_KEY "Ctrl+V"
+#endif
 
 /* The client area as it really is. On a display at 125% these are not
- * WINDOW_W/H: asking Windows not to scale us and then laying out
+ * LAUNCHER_WINDOW_W/H: asking Windows not to scale us and then laying out
  * against the true size is the difference between a crisp launcher and
  * one stretched up from a smaller drawing. */
-static int g_cw = WINDOW_W, g_ch = WINDOW_H;
+static int g_cw = LAUNCHER_WINDOW_W, g_ch = LAUNCHER_WINDOW_H;
 
 /* ------------------------------------------------------------- settings */
 
@@ -83,8 +110,8 @@ static Row           g_link_rows[6];
 static int           g_link_count;
 static char          g_lan_addr[64];    /* this PC on its network */
 static NetUpnpResult g_probe;           /* what the router said */
-static volatile LONG g_probe_state;     /* 0 not asked, 1 asking, 2 answered */
-static ULONGLONG     g_copied_until;    /* "copied" shown until then */
+static volatile long g_probe_state;     /* 0 not asked, 1 asking, 2 answered */
+static uint64_t      g_copied_until;    /* "copied" shown until then */
 
 /* ---- input ---- */
 
@@ -222,7 +249,7 @@ static void build_link_rows(void)
     if (g_link_mode == LINK_JOIN) {
         r->label = "Host's address";
         r->help  = "What the host gave you, like 81.2.3.4 or a name, with :port if"
-                   " theirs is not the port below. Type it, or Ctrl+V to paste.";
+                   " theirs is not the port below. Type it, or " LAUNCHER_PASTE_KEY " to paste.";
         r->kind  = ROW_TEXT; r->text = g_settings.syslink_host;
         r->text_len = sizeof g_settings.syslink_host; r->empty = "type the host's address";
         r++;
@@ -387,29 +414,23 @@ static void row_type(Row *r, unsigned ch)
     }
 }
 
-static void row_paste(Row *r, HWND owner)
+static void row_paste(Row *r)
 {
-    HANDLE h;
+    char text[256];
     const char *s;
 
-    if (r->kind != ROW_TEXT || !OpenClipboard(owner))
+    if (r->kind != ROW_TEXT || !lhost_paste(text, sizeof text))
         return;
-    h = GetClipboardData(CF_TEXT);
-    s = h ? (const char *)GlobalLock(h) : NULL;
-    if (s) {
-        /* The first line only, and only what could have been typed. */
-        for (; *s && *s != '\r' && *s != '\n'; s++)
-            row_type(r, (unsigned char)*s);
-        GlobalUnlock(h);
-    }
-    CloseClipboard();
+    /* The first line only, and only what could have been typed. */
+    for (s = text; *s && *s != '\r' && *s != '\n'; s++)
+        row_type(r, (unsigned char)*s);
 }
 
 /* ------------------------------------------------------------- the title */
 
 static char g_title_name[128] = "Xbox game";
 static uint32_t g_title_id;
-static char g_xbe_found[MAX_PATH];      /* empty: the game's files were not found */
+static char g_xbe_found[LAUNCHER_PATH]; /* empty: the game's files were not found */
 
 /* The name and id out of the game's own XBE, so the launcher says what it
  * launches without being told at build time -- and, more to the point, so
@@ -419,10 +440,14 @@ static char g_xbe_found[MAX_PATH];      /* empty: the game's files were not foun
  * nothing.
  *
  * Looked for exactly where the game's find_game() looks, in its order:
- * RECOMP_GAME_DIR alone if it is set, else a "game" folder beside the
- * executable, else the title's YOUR_GAME_DIR (LAUNCHER_GAME_DIR, read out
- * of its main.c by recomp_add_launcher) -- all relative to this executable,
- * not the working directory, as the game's are. */
+ * RECOMP_GAME_DIR alone if it is set; on macOS, from inside an application
+ * bundle, a "game" folder beside the bundle, then one in its Resources; else
+ * a "game" folder beside the executable, else the title's YOUR_GAME_DIR
+ * (LAUNCHER_GAME_DIR, read out of its main.c by recomp_add_launcher), else
+ * that one level up, for a single-configuration build -- all relative to
+ * this executable, not the working directory, as the game's are. And the
+ * XBE read is the one the game boots (LAUNCHER_GAME_XBE): a disc whose
+ * default.xbe only picks a language has the title's id there but no name. */
 static int read_cert(const char *xbe)
 {
     FILE *f = fopen(xbe, "rb");
@@ -452,35 +477,50 @@ static int read_cert(const char *xbe)
         g_title_name[k] = '\0';
         if (!k) snprintf(g_title_name, sizeof g_title_name, "Xbox game");
     }
-    if (!GetFullPathNameA(xbe, sizeof g_xbe_found, g_xbe_found, NULL))
-        snprintf(g_xbe_found, sizeof g_xbe_found, "%s", xbe);
+    lhost_full_path(xbe, g_xbe_found, sizeof g_xbe_found);
     return 1;
 }
 
 static void read_title(void)
 {
     const char *env = getenv("RECOMP_GAME_DIR");
-    char dir[MAX_PATH], xbe[MAX_PATH], *slash;
+    char dir[LAUNCHER_PATH], xbe[LAUNCHER_PATH + 64], app[LAUNCHER_PATH];
 
     /* Set means only this, as it does for the game: finding the XBE
-     * somewhere else would name a settings file for a different copy. */
+     * somewhere else would name a settings file for a different copy.
+     * Forward slashes throughout, which Windows takes as well. */
     if (env && *env) {
-        snprintf(xbe, sizeof xbe, "%s\\default.xbe", env);
+        snprintf(xbe, sizeof xbe, "%s/" LAUNCHER_GAME_XBE, env);
         read_cert(xbe);
         return;
     }
 
-    if (!GetModuleFileNameA(NULL, dir, sizeof dir))
-        return;
-    slash = strrchr(dir, '\\');
-    if (slash) *slash = '\0';
+    if (host_app_bundle_dir(app, sizeof app)) {
+        snprintf(dir, sizeof dir, "%s", app);
+        host_path_dirname(dir);
+        snprintf(xbe, sizeof xbe, "%s/game/" LAUNCHER_GAME_XBE, dir);
+        if (read_cert(xbe))
+            return;
+        snprintf(xbe, sizeof xbe, "%s/Contents/Resources/game/" LAUNCHER_GAME_XBE, app);
+        if (read_cert(xbe))
+            return;
+    }
 
-    snprintf(xbe, sizeof xbe, "%s\\game\\default.xbe", dir);
+    if (!host_exe_path(dir, sizeof dir))
+        return;
+    host_path_dirname(dir);
+
+    snprintf(xbe, sizeof xbe, "%s/game/" LAUNCHER_GAME_XBE, dir);
     if (read_cert(xbe))
         return;
 #ifdef LAUNCHER_GAME_DIR
-    snprintf(xbe, sizeof xbe, "%s\\%s\\default.xbe", dir, LAUNCHER_GAME_DIR);
-    read_cert(xbe);
+    snprintf(xbe, sizeof xbe, "%s/%s/" LAUNCHER_GAME_XBE, dir, LAUNCHER_GAME_DIR);
+    if (read_cert(xbe))
+        return;
+    if (strncmp(LAUNCHER_GAME_DIR, "../", 3) == 0) {
+        snprintf(xbe, sizeof xbe, "%s/%s/" LAUNCHER_GAME_XBE, dir, &LAUNCHER_GAME_DIR[3]);
+        read_cert(xbe);
+    }
 #endif
 }
 
@@ -497,7 +537,7 @@ static const char *capture_pad(int pad_index)
 {
     static char out[BIND_SOURCE_LEN];
     RecompPadState st;
-    static const struct { WORD mask; const char *name; } k_buttons[] = {
+    static const struct { uint16_t mask; const char *name; } k_buttons[] = {
         { RECOMP_PAD_A, "a" }, { RECOMP_PAD_B, "b" },
         { RECOMP_PAD_X, "x" }, { RECOMP_PAD_Y, "y" },
         { RECOMP_PAD_LEFT_SHOULDER, "lshoulder" },
@@ -511,7 +551,7 @@ static const char *capture_pad(int pad_index)
         { RECOMP_PAD_DPAD_RIGHT, "dpad_right" },
         { 0, NULL }
     };
-    const SHORT push = 22000;             /* well past any resting stick */
+    const int16_t push = 22000;           /* well past any resting stick */
     int i;
 
     if (!recomp_pad_read(pad_index, &st))
@@ -539,12 +579,12 @@ static const char *capture_pad(int pad_index)
 /* The key names the runtime knows by name; everything else is a letter
  * or a digit and spells itself. Escape is not offered: it is how a
  * person gets out of the capture. */
-static const struct { int vk; const char *name; } k_named_keys[] = {
-    { VK_RETURN, "RETURN" }, { VK_BACK, "BACK" }, { VK_SPACE, "SPACE" },
-    { VK_TAB, "TAB" }, { VK_UP, "UP" }, { VK_DOWN, "DOWN" },
-    { VK_LEFT, "LEFT" }, { VK_RIGHT, "RIGHT" },
-    { VK_LSHIFT, "LSHIFT" }, { VK_RSHIFT, "RSHIFT" },
-    { VK_LCONTROL, "LCTRL" }, { VK_RCONTROL, "RCTRL" },
+static const struct { int key; const char *name; } k_named_keys[] = {
+    { LKEY_RETURN, "RETURN" }, { LKEY_BACK, "BACK" }, { LKEY_SPACE, "SPACE" },
+    { LKEY_TAB, "TAB" }, { LKEY_UP, "UP" }, { LKEY_DOWN, "DOWN" },
+    { LKEY_LEFT, "LEFT" }, { LKEY_RIGHT, "RIGHT" },
+    { LKEY_LSHIFT, "LSHIFT" }, { LKEY_RSHIFT, "RSHIFT" },
+    { LKEY_LCTRL, "LCTRL" }, { LKEY_RCTRL, "RCTRL" },
     { 0, NULL }
 };
 
@@ -554,17 +594,17 @@ static const char *capture_key(void)
     int i, vk;
 
     for (i = 0; k_named_keys[i].name; i++)
-        if (GetAsyncKeyState(k_named_keys[i].vk) & 0x8000) {
+        if (lhost_key_held(k_named_keys[i].key)) {
             snprintf(out, sizeof out, "key:%s", k_named_keys[i].name);
             return out;
         }
     for (vk = 'A'; vk <= 'Z'; vk++)
-        if (GetAsyncKeyState(vk) & 0x8000) {
+        if (lhost_key_held(vk)) {
             snprintf(out, sizeof out, "key:%c", (char)vk);
             return out;
         }
     for (vk = '0'; vk <= '9'; vk++)
-        if (GetAsyncKeyState(vk) & 0x8000) {
+        if (lhost_key_held(vk)) {
             snprintf(out, sizeof out, "key:%c", (char)vk);
             return out;
         }
@@ -576,7 +616,7 @@ static const char *capture_key(void)
 static int everything_released(int pad_index)
 {
     return capture_pad(pad_index) == NULL && capture_key() == NULL &&
-           !(GetAsyncKeyState(VK_ESCAPE) & 0x8000);
+           !lhost_key_held(LKEY_ESCAPE);
 }
 
 static void capture_tick(void)
@@ -589,7 +629,7 @@ static void capture_tick(void)
         g_capture_armed = everything_released(pad);
         return;
     }
-    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+    if (lhost_key_held(LKEY_ESCAPE)) {
         g_capturing = 0;
         return;
     }
@@ -625,7 +665,7 @@ static void settings_load(void)
     {
         int i;
         for (i = 0; k_frame_caps[i]; i++)
-            if (_stricmp(g_settings.frame_cap, k_frame_caps[i]) == 0) {
+            if (strcasecmp(g_settings.frame_cap, k_frame_caps[i]) == 0) {
                 g_frame_cap_index = i;
                 break;
             }
@@ -635,11 +675,11 @@ static void settings_load(void)
     {
         int i;
         for (i = 0; k_link_modes[i]; i++)
-            if (_stricmp(g_settings.syslink, k_link_modes[i]) == 0)
+            if (strcasecmp(g_settings.syslink, k_link_modes[i]) == 0)
                 g_link_mode = i;
     }
     /* A pair set up by hand is left as it is unless the row is moved. */
-    if (_stricmp(g_settings.syslink, "udp") == 0)
+    if (strcasecmp(g_settings.syslink, "udp") == 0)
         g_link_mode = LINK_BY_HAND;
     snprintf(g_port_text, sizeof g_port_text, "%d", g_settings.syslink_port);
     build_link_rows();
@@ -699,33 +739,19 @@ static int settings_save(void)
 
 static int launch_game(void)
 {
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    char exe[MAX_PATH], dir[MAX_PATH], *slash;
+    char exe[LAUNCHER_PATH + 64], dir[LAUNCHER_PATH];
 
     /* Beside this executable, whatever the working directory is: a
      * shortcut on a desktop must work as well as a double-click. */
-    GetModuleFileNameA(NULL, dir, sizeof dir);
-    slash = strrchr(dir, '\\');
-    if (slash) *slash = '\0';
+    if (!host_exe_path(dir, sizeof dir))
+        dir[0] = '\0';
+    host_path_dirname(dir);
+#ifdef _WIN32
     snprintf(exe, sizeof exe, "%s\\%s", dir, LAUNCHER_GAME_EXE);
-
-    memset(&si, 0, sizeof si);
-    si.cb = sizeof si;
-    memset(&pi, 0, sizeof pi);
-
-    if (!CreateProcessA(exe, NULL, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
-        char msg[MAX_PATH + 160];
-
-        snprintf(msg, sizeof msg,
-                 "The game could not be started.\n\n%s\n\n"
-                 "The launcher expects it beside itself.", exe);
-        MessageBoxA(NULL, msg, "Cannot start the game", MB_OK | MB_ICONERROR);
-        return 0;
-    }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return 1;
+#else
+    snprintf(exe, sizeof exe, "%s/%s", dir, LAUNCHER_GAME_EXE);
+#endif
+    return lhost_launch(exe, dir);
 }
 
 /* ------------------------------------------------------------------- pad */
@@ -733,9 +759,9 @@ static int launch_game(void)
 /* A pad held in a direction should repeat, but not instantly and not at
  * the polling rate, or one nudge runs the value to its end. */
 typedef struct PadNav {
-    WORD  last;
-    DWORD held_since, last_repeat;
-    int   last_dir_x, last_dir_y;
+    uint16_t last;
+    uint64_t held_since, last_repeat;
+    int      last_dir_x, last_dir_y;
 } PadNav;
 
 static PadNav g_pad;
@@ -743,9 +769,9 @@ static PadNav g_pad;
 #define PAD_REPEAT_DELAY 380
 #define PAD_REPEAT_RATE  110
 
-static int pad_axis(SHORT v)
+static int pad_axis(int16_t v)
 {
-    const SHORT dead = 16000;
+    const int16_t dead = 16000;
     return v > dead ? 1 : (v < -dead ? -1 : 0);
 }
 
@@ -754,8 +780,8 @@ static int pad_axis(SHORT v)
 static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
 {
     RecompPadState st;
-    DWORD now = GetTickCount();
-    WORD b;
+    uint64_t now = lhost_ticks();
+    uint16_t b;
     int x, y, i, connected = 0;
 
     *dx = *dy = *accept = *cancel = *tab = 0;
@@ -814,7 +840,6 @@ static double g_tab_t = 1.0;
 static int    g_rows_on_tab;
 static double g_pulse;
 static int    g_pad_seen;
-static HWND   g_hwnd;
 
 /* The list of settings rows on this tab, or NULL for a tab without one. */
 static Row *tab_rows(int *count)
@@ -833,12 +858,10 @@ static Row *tab_rows(int *count)
 
 /* ---- the System Link tab's addresses ---- */
 
-static DWORD WINAPI probe_thread(LPVOID unused)
+static void probe_thread(void)
 {
-    (void)unused;
     net_upnp_probe(&g_probe);
-    InterlockedExchange(&g_probe_state, 2);
-    return 0;
+    lhost_publish(&g_probe_state, 2);
 }
 
 /* While the tab is showing: this PC's address, once, and -- for a host that
@@ -849,13 +872,12 @@ static void link_tab_tick(void)
 {
     if (!g_lan_addr[0] && !net_local_address(g_lan_addr, sizeof g_lan_addr))
         snprintf(g_lan_addr, sizeof g_lan_addr, "?");
+    /* Only this thread moves it off 0, so asking and starting are one. */
     if (g_link_mode == LINK_HOST && g_settings.syslink_upnp &&
-        InterlockedCompareExchange(&g_probe_state, 1, 0) == 0) {
-        HANDLE t = CreateThread(NULL, 0, probe_thread, NULL, 0, NULL);
-        if (t)
-            CloseHandle(t);
-        else
-            InterlockedExchange(&g_probe_state, 0);
+        lhost_read(&g_probe_state) == 0) {
+        lhost_publish(&g_probe_state, 1);
+        if (!lhost_thread(probe_thread))
+            lhost_publish(&g_probe_state, 0);
     }
 }
 
@@ -863,7 +885,8 @@ static void link_tab_tick(void)
  * one, else this PC's address on its own network. */
 static void link_share_address(char *out, size_t n)
 {
-    if (g_settings.syslink_upnp && g_probe_state == 2 && g_probe.state == NET_UPNP_FOUND)
+    if (g_settings.syslink_upnp && lhost_read(&g_probe_state) == 2 &&
+        g_probe.state == NET_UPNP_FOUND)
         snprintf(out, n, "%s:%d", g_probe.external, link_port());
     else
         snprintf(out, n, "%s:%d", g_lan_addr, link_port());
@@ -871,22 +894,8 @@ static void link_share_address(char *out, size_t n)
 
 static void copy_text(const char *s)
 {
-    size_t len = strlen(s) + 1;
-    HGLOBAL h;
-
-    if (!OpenClipboard(g_hwnd))
-        return;
-    EmptyClipboard();
-    h = GlobalAlloc(GMEM_MOVEABLE, len);
-    if (h) {
-        memcpy(GlobalLock(h), s, len);
-        GlobalUnlock(h);
-        if (!SetClipboardData(CF_TEXT, h))
-            GlobalFree(h);
-        else
-            g_copied_until = GetTickCount64() + 1500;
-    }
-    CloseClipboard();
+    if (lhost_copy(s))
+        g_copied_until = lhost_ticks() + 1500;
 }
 
 /* After the mode row moved: the list is a different length now. */
@@ -971,7 +980,7 @@ static void do_play(void)
     settings_save();
     bindings_save();
     if (launch_game())
-        PostMessage(g_hwnd, WM_CLOSE, 0, 0);
+        lhost_close();
 }
 
 /* The input list is longer than the screen, so moving off either end
@@ -1064,7 +1073,7 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
             }
         }
         if (cancel)
-            PostMessage(g_hwnd, WM_CLOSE, 0, 0);
+            lhost_close();
         return;
     }
 
@@ -1083,7 +1092,7 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
     if (accept)
         do_play();
     if (cancel)
-        PostMessage(g_hwnd, WM_CLOSE, 0, 0);
+        lhost_close();
 }
 
 /* ------------------------------------------------------------------ draw */
@@ -1168,7 +1177,7 @@ static void draw_link(void)
         if (!asked) {
             snprintf(text, sizeof text, "On the internet      only with UDP port %d forwarded"
                      " to this PC by hand, or over a virtual network", link_port());
-        } else if (g_probe_state != 2) {
+        } else if (lhost_read(&g_probe_state) != 2) {
             snprintf(text, sizeof text, "On the internet      asking the router...");
         } else if (g_probe.state == NET_UPNP_FOUND) {
             snprintf(text, sizeof text, "On the internet      %s:%d   (the router is asked"
@@ -1178,16 +1187,18 @@ static void draw_link(void)
         }
         line.h = 40;
         theme_text_wrapped(line, text, 12,
-                           (asked && g_probe_state == 2 && g_probe.state == NET_UPNP_FOUND)
+                           (asked && lhost_read(&g_probe_state) == 2 &&
+                            g_probe.state == NET_UPNP_FOUND)
                                ? THEME_TEXT : THEME_TEXT_DIM);
         line.y += 46;
         line.h = 60;
         link_share_address(share, sizeof share);
         snprintf(text, sizeof text,
-                 "%s  Windows may ask to let the game through its firewall the first"
-                 " time: allow it. Then host or join a game in the game's own System"
-                 " Link menu.",
-                 GetTickCount64() < g_copied_until ? "Copied." : "Ctrl+C or a click here copies it.");
+                 "%s  " LAUNCHER_FIREWALL " may ask to let the game through its"
+                 " firewall the first time: allow it. Then host or join a game in"
+                 " the game's own System Link menu.",
+                 lhost_ticks() < g_copied_until ? "Copied."
+                                                : LAUNCHER_COPY_KEY " or a click here copies it.");
         theme_text_wrapped(line, text, 11, THEME_TEXT_DIM);
     } else if (g_link_mode == LINK_JOIN) {
         theme_text(line, "JOINING", 10, 700, THEME_GREEN, THEME_LEFT);
@@ -1470,221 +1481,162 @@ static int hit_play(int mx, int my)
            my >= g_ch - 74 && my < g_ch - 32;
 }
 
-static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+/* ---------------------------------------------------- the front end's calls */
+
+void launcher_init(void)
 {
-    switch (msg) {
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(h, &ps);
-
-        draw();
-        theme_present(dc);
-        EndPaint(h, &ps);
-        return 0;
-    }
-    case WM_ERASEBKGND:
-        return 1;                       /* everything is painted */
-    case WM_KEYDOWN:
-        switch (wp) {
-        case VK_UP:     nav(0, -1, 0, 0, 0); break;
-        case VK_DOWN:   nav(0,  1, 0, 0, 0); break;
-        case VK_LEFT:   nav(-1, 0, 0, 0, 0); break;
-        case VK_RIGHT:  nav(1,  0, 0, 0, 0); break;
-        case VK_RETURN: nav(0, 0, 1, 0, 0); break;
-        case VK_ESCAPE: nav(0, 0, 0, 1, 0); break;
-        case VK_TAB:    nav(0, 0, 0, 0, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1); break;
-        default: break;
-        }
-        InvalidateRect(h, NULL, FALSE);
-        return 0;
-    case WM_CHAR:
-        /* Typing goes to the System Link tab's text rows; Ctrl+C there
-         * copies the address a host gives out, Ctrl+V pastes into a row. */
-        if (g_tab == TAB_LINK && g_sel < g_link_count && !g_capturing) {
-            Row *row = &g_link_rows[g_sel];
-
-            if (wp == 3 && g_link_mode == LINK_HOST) {
-                char share[96];
-
-                link_share_address(share, sizeof share);
-                copy_text(share);
-            } else if (wp == 22) {
-                row_paste(row, h);
-            } else {
-                row_type(row, (unsigned)wp);
-            }
-            InvalidateRect(h, NULL, FALSE);
-        }
-        return 0;
-    case WM_LBUTTONDOWN: {
-        int mx = LOWORD(lp), my = HIWORD(lp), i;
-
-        for (i = 0; i < TAB_COUNT; i++) {
-            ThemeRect t = tab_rect(i);
-
-            if (mx >= t.x && mx < t.x + t.w && my >= t.y && my < t.y + t.h)
-                set_tab((Tab)i);
-        }
-        if (g_tab == TAB_INPUT) {
-            int j;
-
-            for (j = 0; j < BIND_ROWS_VISIBLE; j++) {
-                ThemeRect rr = row_rect(j);
-
-                rr.h = 46;
-                if (my >= rr.y && my < rr.y + rr.h && mx >= rr.x &&
-                    mx < rr.x + rr.w && g_bind_top + j < BIND_TOTAL_ROWS) {
-                    int k = g_bind_top + j;
-
-                    g_sel = j;
-                    if (k < BIND_HEAD_ROWS) {
-                        /* The head rows change on a click: back or forward
-                         * on the arrows, forward anywhere else on the row.
-                         * (Splitting the whole row in half put both drawn
-                         * arrows in the forward half.) */
-                        int dir = hit_arrow(rr, mx);
-
-                        nav(dir ? dir : 1, 0, k == BIND_ROW_RESET, 0, 0);
-                    } else {
-                        g_bind_col = (mx >= rr.x + 510) ? 1 : 0;
-                        g_capturing = 1;
-                        g_capture_armed = 0;
-                    }
-                }
-            }
-            if (hit_play(mx, my))
-                do_play();
-            InvalidateRect(h, NULL, FALSE);
-            return 0;
-        }
-        i = hit_row(mx, my);
-        if (i >= 0) {
-            int dir = hit_arrow(row_rect(i), mx), count;
-            Row *rows = tab_rows(&count);
-
-            g_sel = i;
-            /* Back or forward on the arrows; anywhere else on the row steps
-             * it forward, which is how a toggle is clicked. A text row only
-             * takes the selection, to be typed into. */
-            row_move(&rows[i], dir ? dir : 1);
-            if (g_tab == TAB_LINK)
-                link_rows_changed();
-        } else if (g_tab == TAB_LINK && g_link_mode == LINK_HOST &&
-                   mx >= g_link_panel.x && mx < g_link_panel.x + g_link_panel.w &&
-                   my >= g_link_panel.y && my < g_link_panel.y + g_link_panel.h) {
-            char share[96];
-
-            link_share_address(share, sizeof share);
-            copy_text(share);
-        }
-        if (hit_play(mx, my))
-            do_play();
-        InvalidateRect(h, NULL, FALSE);
-        return 0;
-    }
-    case WM_MOUSEMOVE: {
-        int i = hit_row(LOWORD(lp), HIWORD(lp));
-
-        /* The highlight follows the mouse on both lists -- but not away from
-         * a row waiting for the key to bind to it. */
-        if (i < 0 && !g_capturing)
-            i = hit_bind_row(LOWORD(lp), HIWORD(lp));
-        if (i >= 0 && i != g_sel) {
-            g_sel = i;
-            InvalidateRect(h, NULL, FALSE);
-        }
-        return 0;
-    }
-    case WM_TIMER: {
-        int dx, dy, a, b, t;
-
-        g_pulse += 0.006;
-        if (g_pulse > 1.0) g_pulse -= 1.0;
-        if (g_tab_t < 1.0) {
-            g_tab_t += 0.12;
-            if (g_tab_t > 1.0) g_tab_t = 1.0;
-        }
-        if (g_tab == TAB_LINK)
-            link_tab_tick();
-        g_pad_seen = pad_poll(&dx, &dy, &a, &b, &t);
-        if (g_capturing)
-            capture_tick();             /* the press is the answer, not a move */
-        else if (g_pad_seen && (dx || dy || a || b || t))
-            nav(dx, dy, a, b, t);
-        rows_for_tab();
-        InvalidateRect(h, NULL, FALSE);
-        return 0;
-    }
-    case WM_SIZE:
-        g_cw = LOWORD(lp);
-        g_ch = HIWORD(lp);
-        if (g_cw > 0 && g_ch > 0)
-            theme_begin(g_cw, g_ch);
-        InvalidateRect(h, NULL, FALSE);
-        return 0;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    default:
-        break;
-    }
-    return DefWindowProcA(h, msg, wp, lp);
-}
-
-int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
-{
-    WNDCLASSA wc;
-    MSG msg;
-    RECT r;
-
-    (void)prev; (void)cmd;
-
-    /* Before any window exists: otherwise Windows draws us smaller and
-     * scales the result up, which on a look made of soft edges and
-     * glows shows as a blur over all of it. */
-    SetProcessDPIAware();
-
     read_title();
     settings_load();
     bindings_load();
     build_rows();
     rows_for_tab();
+}
 
-    memset(&wc, 0, sizeof wc);
-    wc.lpfnWndProc   = wndproc;
-    wc.hInstance     = inst;
-    wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
-    wc.lpszClassName = "xboxrecomp_launcher";
-    if (!RegisterClassA(&wc))
-        return 1;
+const char *launcher_title(void)
+{
+    return g_title_name;
+}
 
-    r.left = r.top = 0;
-    r.right = WINDOW_W;
-    r.bottom = WINDOW_H;
-    AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+void launcher_draw(void)
+{
+    draw();
+}
 
-    {
-        char caption[160];
-
-        snprintf(caption, sizeof caption, "%s", g_title_name);
-        g_hwnd = CreateWindowA(wc.lpszClassName, caption,
-                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                               CW_USEDEFAULT, CW_USEDEFAULT,
-                               r.right - r.left, r.bottom - r.top,
-                               NULL, NULL, inst, NULL);
+void launcher_key(int key, int shift)
+{
+    switch (key) {
+    case LKEY_UP:     nav(0, -1, 0, 0, 0); break;
+    case LKEY_DOWN:   nav(0,  1, 0, 0, 0); break;
+    case LKEY_LEFT:   nav(-1, 0, 0, 0, 0); break;
+    case LKEY_RIGHT:  nav(1,  0, 0, 0, 0); break;
+    case LKEY_RETURN: nav(0, 0, 1, 0, 0); break;
+    case LKEY_ESCAPE: nav(0, 0, 0, 1, 0); break;
+    case LKEY_TAB:    nav(0, 0, 0, 0, shift ? -1 : 1); break;
+    default: break;
     }
-    if (!g_hwnd)
-        return 1;
-    if (!theme_begin(WINDOW_W, WINDOW_H))
-        return 1;
+}
 
-    ShowWindow(g_hwnd, show);
-    SetTimer(g_hwnd, 1, 16, NULL);          /* the pad, and the glow */
+void launcher_char(unsigned ch)
+{
+    /* Typing goes to the System Link tab's text rows; copy there copies
+     * the address a host gives out, paste pastes into a row. */
+    if (g_tab == TAB_LINK && g_sel < g_link_count && !g_capturing) {
+        Row *row = &g_link_rows[g_sel];
 
-    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        if (ch == 3 && g_link_mode == LINK_HOST) {
+            char share[96];
+
+            link_share_address(share, sizeof share);
+            copy_text(share);
+        } else if (ch == 22) {
+            row_paste(row);
+        } else {
+            row_type(row, ch);
+        }
     }
-    theme_shutdown();
-    return 0;
+}
+
+void launcher_click(int mx, int my)
+{
+    int i;
+
+    for (i = 0; i < TAB_COUNT; i++) {
+        ThemeRect t = tab_rect(i);
+
+        if (mx >= t.x && mx < t.x + t.w && my >= t.y && my < t.y + t.h)
+            set_tab((Tab)i);
+    }
+    if (g_tab == TAB_INPUT) {
+        int j;
+
+        for (j = 0; j < BIND_ROWS_VISIBLE; j++) {
+            ThemeRect rr = row_rect(j);
+
+            rr.h = 46;
+            if (my >= rr.y && my < rr.y + rr.h && mx >= rr.x &&
+                mx < rr.x + rr.w && g_bind_top + j < BIND_TOTAL_ROWS) {
+                int k = g_bind_top + j;
+
+                g_sel = j;
+                if (k < BIND_HEAD_ROWS) {
+                    /* The head rows change on a click: back or forward
+                     * on the arrows, forward anywhere else on the row.
+                     * (Splitting the whole row in half put both drawn
+                     * arrows in the forward half.) */
+                    int dir = hit_arrow(rr, mx);
+
+                    nav(dir ? dir : 1, 0, k == BIND_ROW_RESET, 0, 0);
+                } else {
+                    g_bind_col = (mx >= rr.x + 510) ? 1 : 0;
+                    g_capturing = 1;
+                    g_capture_armed = 0;
+                }
+            }
+        }
+        if (hit_play(mx, my))
+            do_play();
+        return;
+    }
+    i = hit_row(mx, my);
+    if (i >= 0) {
+        int dir = hit_arrow(row_rect(i), mx), count;
+        Row *rows = tab_rows(&count);
+
+        g_sel = i;
+        /* Back or forward on the arrows; anywhere else on the row steps
+         * it forward, which is how a toggle is clicked. A text row only
+         * takes the selection, to be typed into. */
+        row_move(&rows[i], dir ? dir : 1);
+        if (g_tab == TAB_LINK)
+            link_rows_changed();
+    } else if (g_tab == TAB_LINK && g_link_mode == LINK_HOST &&
+               mx >= g_link_panel.x && mx < g_link_panel.x + g_link_panel.w &&
+               my >= g_link_panel.y && my < g_link_panel.y + g_link_panel.h) {
+        char share[96];
+
+        link_share_address(share, sizeof share);
+        copy_text(share);
+    }
+    if (hit_play(mx, my))
+        do_play();
+}
+
+void launcher_hover(int mx, int my)
+{
+    int i = hit_row(mx, my);
+
+    /* The highlight follows the mouse on both lists -- but not away from
+     * a row waiting for the key to bind to it. */
+    if (i < 0 && !g_capturing)
+        i = hit_bind_row(mx, my);
+    if (i >= 0 && i != g_sel)
+        g_sel = i;
+}
+
+void launcher_tick(void)
+{
+    int dx, dy, a, b, t;
+
+    g_pulse += 0.006;
+    if (g_pulse > 1.0) g_pulse -= 1.0;
+    if (g_tab_t < 1.0) {
+        g_tab_t += 0.12;
+        if (g_tab_t > 1.0) g_tab_t = 1.0;
+    }
+    if (g_tab == TAB_LINK)
+        link_tab_tick();
+    g_pad_seen = pad_poll(&dx, &dy, &a, &b, &t);
+    if (g_capturing)
+        capture_tick();             /* the press is the answer, not a move */
+    else if (g_pad_seen && (dx || dy || a || b || t))
+        nav(dx, dy, a, b, t);
+    rows_for_tab();
+}
+
+void launcher_resize(int w, int h)
+{
+    g_cw = w;
+    g_ch = h;
+    if (g_cw > 0 && g_ch > 0)
+        theme_begin(g_cw, g_ch);
 }

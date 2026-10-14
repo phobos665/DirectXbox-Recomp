@@ -21,6 +21,7 @@
 #  define BIND_MKDIR(p) _mkdir(p)
 #else
 #  include <sys/stat.h>
+#  include "recomp_config.h"        /* recomp_config_user_dir */
 #  define BIND_MKDIR(p) mkdir((p), 0755)
 #endif
 
@@ -99,8 +100,12 @@ int bind_config_path(char *out, size_t n)
     const char *home = getenv("APPDATA");
     const char *tail = "\\xboxrecomp\\input_bindings.json";
 #else
-    const char *home = getenv("XDG_CONFIG_HOME");
-    const char *tail = "/xboxrecomp/input_bindings.json";
+    /* The runtime's own per-user directory, which it reads the file from
+     * (input_bindings.c): ~/Library/Application Support/xboxrecomp on
+     * macOS, where there is no XDG_CONFIG_HOME to ask. */
+    char dir[600];
+    const char *home = recomp_config_user_dir(dir, sizeof dir) ? dir : NULL;
+    const char *tail = "/input_bindings.json";
 #endif
 
     if (env && *env) {
