@@ -24,6 +24,7 @@
  * sizes (the stream holds the bytes).
  */
 #include "audio_output.h"
+#include "audio_speakers.h"
 
 #include <SDL3/SDL.h>
 
@@ -81,7 +82,15 @@ typedef struct {
 } submix;
 #define SUBMIXES 32u
 
-#define MIX_FRAME_BYTES (RECOMP_SPEAKERS * 4u)
+/* Every voice is handed to SDL as float frames in the device's own channel
+ * layout, with its mix and the fold-down (audio_speakers.h) already applied:
+ * SDL's 5.1-to-stereo conversion would play a mixed voice 10 dB under an
+ * unmixed one, and a voice whose format changed with its mix had to be
+ * remade, losing what it had queued. Set when the device opens, before any
+ * voice exists. */
+static uint32_t g_out_channels = 2u;
+static float    g_fold[RECOMP_SPEAKERS][RECOMP_FOLD_MAX_CHANNELS];
+#define MIX_FRAME_BYTES (g_out_channels * 4u)
 #define MAX_RATIO       8.0f
 
 static pthread_mutex_t   g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -175,9 +184,10 @@ static int effective_mix(uint32_t slot, uint32_t channels, RecompAudioMix *out)
     return 1;
 }
 
-/* The caller's PCM as 5.1 float frames with the slot's mix applied: the
- * voice's low-pass (a state-variable filter, as the console's and XAudio2's
- * are) on each channel, then its speaker levels. */
+/* The caller's PCM as float frames in the device's layout with the slot's
+ * mix applied: the voice's low-pass (a state-variable filter, as the
+ * console's and XAudio2's are) on each channel, then its speaker levels,
+ * folded onto the device's channels. */
 static float *mix_pcm(slot_mix *m, const RecompAudioMix *mix, const uint8_t *pcm,
                       uint32_t bytes, uint32_t channels, uint32_t bits, uint32_t *out_bytes)
 {
@@ -193,10 +203,19 @@ static float *mix_pcm(slot_mix *m, const RecompAudioMix *mix, const uint8_t *pcm
         buf = grown;
         cap = need;
     }
+    float into[2][RECOMP_FOLD_MAX_CHANNELS];
+    uint32_t n = g_out_channels, k;
+
+    for (c = 0; c < 2u; c++)
+        for (k = 0; k < n; k++) {
+            into[c][k] = 0.0f;
+            for (s = 0; s < RECOMP_SPEAKERS; s++)
+                into[c][k] += mix->levels[c][s] * g_fold[s][k];
+        }
     for (f = 0; f < frames; f++) {
-        float *o = buf + (size_t)f * RECOMP_SPEAKERS;
-        for (s = 0; s < RECOMP_SPEAKERS; s++)
-            o[s] = 0.0f;
+        float *o = buf + (size_t)f * n;
+        for (k = 0; k < n; k++)
+            o[k] = 0.0f;
         for (c = 0; c < channels && c < 2u; c++) {
             float x = bits == 8u ? ((float)pcm[f * frame + c] - 128.0f) / 128.0f
                                  : (float)(int16_t)(pcm[f * frame + c * 2u] |
@@ -207,8 +226,8 @@ static float *mix_pcm(slot_mix *m, const RecompAudioMix *mix, const uint8_t *pcm
                 m->svf_low[c] += mix->filter.frequency * m->svf_band[c];
                 x = m->svf_low[c];
             }
-            for (s = 0; s < RECOMP_SPEAKERS; s++)
-                o[s] += x * mix->levels[c][s];
+            for (k = 0; k < n; k++)
+                o[k] += x * into[c][k];
         }
     }
     *out_bytes = need;
@@ -444,6 +463,9 @@ static void *open_device_thread(void *arg)
 
         SDL_zero(spec);
         SDL_GetAudioDeviceFormat(dev, &spec, &frames);
+        g_out_channels = spec.channels >= 1 && spec.channels <= (int)RECOMP_FOLD_MAX_CHANNELS
+                       ? (uint32_t)spec.channels : 2u;
+        recomp_audio_fold_matrix(g_out_channels, g_fold);
         fprintf(stderr, "[audio-output] initialized backend=sdl3_%s master_gain=%.6f "
                 "device=%d Hz %d ch, %d-frame buffer\n", SDL_GetCurrentAudioDriver(),
                 (double)gain, spec.freq, spec.channels, frames);
@@ -747,9 +769,22 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     v = &g_voices[slot];
     {
         RecompAudioMix probe;
-        mixed_now = effective_mix(slot, channels, &probe);
-        if (mixed_now)
+        if (effective_mix(slot, channels, &probe)) {
             eff = probe;
+        } else {
+            /* No mix: the channels to the front speakers at full level, as
+             * SDL's own mono and stereo conversions put them. Every voice
+             * is mixed here, so a mix being set or cleared never changes
+             * the stream's format. */
+            memset(&eff, 0, sizeof eff);
+            eff.ratio = 1.0f;
+            eff.levels[0][RECOMP_SPEAKER_FRONT_LEFT] = 1.0f;
+            if (channels == 2u)
+                eff.levels[1][RECOMP_SPEAKER_FRONT_RIGHT] = 1.0f;
+            else
+                eff.levels[0][RECOMP_SPEAKER_FRONT_RIGHT] = 1.0f;
+        }
+        mixed_now = 1;
     }
     if (v->stream && (v->sample_rate != sample_rate || v->channels != channels ||
                       v->bits_per_sample != bits_per_sample ||
@@ -768,7 +803,7 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         src.freq = (int)sample_rate;
         if (mixed_now) {
             src.format = SDL_AUDIO_F32;
-            src.channels = RECOMP_SPEAKERS;   /* SDL's 5.1 order is the Xbox's */
+            src.channels = (int)g_out_channels;   /* folded: audio_speakers.h */
         }
         v->stream = SDL_CreateAudioStream(&src, NULL);
         if (!v->stream || !SDL_BindAudioStream(g_device, v->stream)) {
