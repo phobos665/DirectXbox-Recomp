@@ -16,6 +16,7 @@
 #include <xapofx.h>
 
 #include <atomic>
+#include <mutex>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -111,6 +112,17 @@ IXAudio2SubmixVoice *meter_mix;
 IXAudio2SubmixVoice *reverb_voice;
 uint32_t reverb_inputs;             /* 1, or 2 where the reverb would not take mono */
 Submix submixes[kSubmixCount];
+/* The APU path's stream (recomp_audio_output_mix_*): one float source voice
+   of RECOMP_MIX_CHANNELS, the six speakers folded onto the mix by
+   foldSpeaker and the last channel sent only to the reverb. Its own lock: it
+   is fed from the APU's frame thread, not under DirectSound's. */
+std::mutex mix_lock;
+IXAudio2SourceVoice *mix_voice;
+uint32_t mix_rate;
+constexpr uint32_t kMixQueue = 64;
+struct { float *data; uint32_t capacity; } mix_bufs[kMixQueue];
+uint32_t mix_front, mix_queued;
+unsigned long long mix_submitted_frames;
 unsigned long long meter_last_poll, meter_last_report;
 float meter_peak_max;
 unsigned long meter_readings, meter_over;
@@ -170,6 +182,10 @@ void destroyVoice(OutputVoice &voice)
 
 void releaseOutput()
 {
+    if (mix_voice) mix_voice->DestroyVoice();
+    mix_voice = nullptr;
+    mix_rate = 0;
+    mix_front = mix_queued = 0;
     for (auto &voice : voices) destroyVoice(voice);
     for (auto &sub : submixes) {
         if (sub.voice) sub.voice->DestroyVoice();
@@ -849,4 +865,111 @@ extern "C" int recomp_audio_output_submit(
     if (nonzero) reported_nonzero[slot] = true;
     recomp_audio_health_sound(slot, slot >= 256u, nonzero);
     return 1;
+}
+
+/* ── The APU path's stream (audio_output.h, recomp_audio_output_mix_*) ── */
+
+extern "C" int recomp_audio_output_mix_submit(const float *frames, uint32_t count,
+                                              uint32_t rate)
+{
+    recomp_audio_output_initialize();
+    std::lock_guard<std::mutex> hold(mix_lock);
+    if (!engine || !master_channels || !frames || !count || rate < 1000 || rate > 200000) {
+        recomp_audio_health_refused();
+        return 0;
+    }
+    constexpr uint32_t ch = RECOMP_MIX_CHANNELS;
+    if (mix_voice && mix_rate != rate) {
+        mix_voice->DestroyVoice();
+        mix_voice = nullptr;
+        mix_front = mix_queued = 0;
+    }
+    if (!mix_voice) {
+        WAVEFORMATEX format{};
+        format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        format.nChannels = static_cast<WORD>(ch);
+        format.nSamplesPerSec = rate;
+        format.wBitsPerSample = 32;
+        format.nBlockAlign = static_cast<WORD>(ch * 4);
+        format.nAvgBytesPerSec = rate * ch * 4;
+        HRESULT error = engine->CreateSourceVoice(&mix_voice, &format, 0,
+                                                  XAUDIO2_DEFAULT_FREQ_RATIO);
+        if (FAILED(error)) {
+            std::fprintf(stderr, "[audio-output] APU stream: CreateSourceVoice "
+                         "failed (0x%08lX)\n", static_cast<unsigned long>(error));
+            mix_voice = nullptr;
+            recomp_audio_health_refused();
+            return 0;
+        }
+        XAUDIO2_SEND_DESCRIPTOR d[2] = {};
+        uint32_t n = 0;
+        d[n++] = {0, dryTarget()};
+        if (reverb_voice) d[n++] = {0, reverb_voice};
+        XAUDIO2_VOICE_SENDS sends{n, d};
+        mix_voice->SetOutputVoices(&sends);
+        /* The speakers, folded as every other voice is; the reverb send off
+           the dry mix. */
+        float dry[XAUDIO2_MAX_AUDIO_CHANNELS * ch] = {};
+        for (int sp = 0; sp < RECOMP_SPEAKERS; ++sp)
+            foldSpeaker(dry, ch, static_cast<uint32_t>(sp), sp, 1.0f);
+        mix_voice->SetOutputMatrix(dryTarget(), ch, master_channels, dry);
+        if (reverb_voice) {
+            float wet[2 * ch] = {};
+            for (uint32_t i = 0; i < reverb_inputs; ++i)
+                wet[i * ch + RECOMP_SPEAKERS] = 1.0f;
+            mix_voice->SetOutputMatrix(reverb_voice, ch, reverb_inputs, wet);
+        }
+        mix_voice->Start();
+        mix_rate = rate;
+        mix_submitted_frames = 0;
+        std::fprintf(stderr, "[audio-output] APU stream: %u Hz, folded onto %u channel(s)\n",
+                     rate, master_channels);
+    }
+    XAUDIO2_VOICE_STATE state{};
+    mix_voice->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    while (mix_queued > state.BuffersQueued) {
+        mix_front = (mix_front + 1) % kMixQueue;
+        --mix_queued;
+    }
+    if (mix_queued == kMixQueue) {
+        recomp_audio_health_refused();
+        return 0;
+    }
+    auto &owned = mix_bufs[(mix_front + mix_queued) % kMixQueue];
+    const uint32_t bytes = count * ch * 4;
+    if (owned.capacity < bytes) {
+        auto *data = static_cast<float *>(std::realloc(owned.data, bytes));
+        if (!data) {
+            recomp_audio_health_refused();
+            return 0;
+        }
+        owned.data = data;
+        owned.capacity = bytes;
+    }
+    std::memcpy(owned.data, frames, bytes);
+    XAUDIO2_BUFFER buffer{};
+    buffer.AudioBytes = bytes;
+    buffer.pAudioData = reinterpret_cast<const BYTE *>(owned.data);
+    if (FAILED(mix_voice->SubmitSourceBuffer(&buffer))) {
+        recomp_audio_health_refused();
+        return 0;
+    }
+    ++mix_queued;
+    mix_submitted_frames += count;
+    return 1;
+}
+
+extern "C" int recomp_audio_output_mix_queued_ms(void)
+{
+    std::lock_guard<std::mutex> hold(mix_lock);
+    if (!engine)
+        return -1;
+    if (!mix_voice || !mix_rate)
+        return 0;
+    XAUDIO2_VOICE_STATE state{};
+    mix_voice->GetState(&state, 0);
+    const unsigned long long played = state.SamplesPlayed;
+    if (played >= mix_submitted_frames)
+        return 0;
+    return static_cast<int>((mix_submitted_frames - played) * 1000ull / mix_rate);
 }

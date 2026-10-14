@@ -44,6 +44,9 @@ target_include_directories(xbox_apu BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/xemu/hw/xbox/mcpx/apu/vp  # adpcm.h, beside vp.c in xemu
 )
 target_link_libraries(xbox_apu PUBLIC xbox_samplerate)
+# The speaker stage plays through the host's audio output, and the path
+# switch and health report live beside it (src/hle/audio_*).
+target_link_libraries(xbox_apu PRIVATE xbox_hle)
 
 # qemu_shim.h lives in nv2a/ - shared QEMU type abstraction
 target_include_directories(xbox_apu PRIVATE

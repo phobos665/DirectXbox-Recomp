@@ -913,3 +913,94 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     recomp_audio_health_sound(slot, slot >= 256u, nonzero);
     return 1;
 }
+
+/* ── The APU path's stream (audio_output.h, recomp_audio_output_mix_*) ──
+ *
+ * One SDL stream in the device's layout, fed the speaker stage's frames
+ * folded with g_fold, so the APU path and the native path put a sound at the
+ * same level. The reverb send (the last channel) is not played yet: SDL has
+ * no reverb of its own. */
+static SDL_AudioStream *g_mix_stream;
+static uint32_t         g_mix_rate;
+static float           *g_mix_buf;
+static uint32_t         g_mix_cap;
+
+int recomp_audio_output_mix_submit(const float *frames, uint32_t count, uint32_t rate)
+{
+    uint32_t n, f, k, s, need;
+
+    recomp_audio_output_initialize();
+    if (!__atomic_load_n(&g_device, __ATOMIC_ACQUIRE) || !frames || !count ||
+        rate < MIN_RATE || rate > MAX_RATE)
+        return 0;
+    pthread_mutex_lock(&g_lock);
+    n = g_out_channels;
+    if (!g_mix_stream || g_mix_rate != rate) {
+        SDL_AudioSpec src;
+        if (g_mix_stream)
+            SDL_DestroyAudioStream(g_mix_stream);
+        src.format = SDL_AUDIO_F32;
+        src.channels = (int)n;
+        src.freq = (int)rate;
+        g_mix_stream = SDL_CreateAudioStream(&src, NULL);
+        if (!g_mix_stream || !SDL_BindAudioStream(g_device, g_mix_stream)) {
+            fprintf(stderr, "[audio-output] APU stream: %s\n", SDL_GetError());
+            if (g_mix_stream)
+                SDL_DestroyAudioStream(g_mix_stream);
+            g_mix_stream = NULL;
+            pthread_mutex_unlock(&g_lock);
+            recomp_audio_health_refused();
+            return 0;
+        }
+        g_mix_rate = rate;
+        fprintf(stderr, "[audio-output] APU stream: %u Hz, folded onto %u channel(s)\n",
+                rate, n);
+    }
+    need = count * n * (uint32_t)sizeof(float);
+    if (need > g_mix_cap) {
+        float *grown = (float *)realloc(g_mix_buf, need);
+        if (!grown) {
+            pthread_mutex_unlock(&g_lock);
+            recomp_audio_health_refused();
+            return 0;
+        }
+        g_mix_buf = grown;
+        g_mix_cap = need;
+    }
+    for (f = 0; f < count; f++) {
+        const float *in = frames + (size_t)f * RECOMP_MIX_CHANNELS;
+        float *o = g_mix_buf + (size_t)f * n;
+        for (k = 0; k < n; k++) {
+            float v = 0.0f;
+            for (s = 0; s < RECOMP_SPEAKERS; s++)
+                v += in[s] * g_fold[s][k];
+            o[k] = v;
+        }
+    }
+    if (!SDL_PutAudioStreamData(g_mix_stream, g_mix_buf, (int)need)) {
+        pthread_mutex_unlock(&g_lock);
+        recomp_audio_health_refused();
+        return 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+
+int recomp_audio_output_mix_queued_ms(void)
+{
+    int q, ms;
+
+    if (!__atomic_load_n(&g_device, __ATOMIC_ACQUIRE))
+        return -1;
+    pthread_mutex_lock(&g_lock);
+    if (!g_mix_stream || !g_mix_rate) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    q = SDL_GetAudioStreamQueued(g_mix_stream);
+    ms = q > 0 ? (int)((int64_t)q / (int64_t)(g_out_channels * sizeof(float)) * 1000 /
+                       (int64_t)g_mix_rate)
+               : 0;
+    pthread_mutex_unlock(&g_lock);
+    return ms;
+}

@@ -130,6 +130,21 @@ void recomp_audio_output_set_submix(uint32_t key, uint32_t channels,
                                     int32_t volume_hundredth_db);
 void recomp_audio_output_route(uint32_t slot, uint32_t key);
 
+/* The APU path's output (docs/technical/audio-architecture.md): the speaker
+   stage's mix as one stream, instead of a host voice per title voice.
+   `frames` is `count` interleaved frames of RECOMP_MIX_CHANNELS floats at
+   `rate`: the six Xbox speakers in RecompSpeaker order, then the I3DL2
+   reverb send (mix bin 10), which feeds the room set with
+   recomp_audio_output_set_reverb. Folded onto the device by audio_speakers.h.
+   Returns 0 when refused: no device yet, or the stream could not be made. */
+#define RECOMP_MIX_CHANNELS (RECOMP_SPEAKERS + 1)
+int recomp_audio_output_mix_submit(const float *frames, uint32_t count, uint32_t rate);
+
+/* Milliseconds of that stream submitted and not yet played, so the producer
+   can run at the device's pace; -1 when there is no device to ask, and the
+   producer keeps its own clock. */
+int recomp_audio_output_mix_queued_ms(void);
+
 #ifdef __cplusplus
 }
 #endif

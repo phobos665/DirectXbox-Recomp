@@ -23,6 +23,9 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+#include "hle/audio_output.h"   /* the speaker stage's host stream */
+#include "hle/audio_path.h"
+#include "hle/audio_health.h"
 
 /* ============================================================
  * Globals
@@ -51,8 +54,23 @@ volatile int g_audio_muted = 0;  /* 0 = audio enabled */
  * Debug frame markers (minimal stubs)
  * ============================================================ */
 
-void mcpx_debug_begin_frame(void) {}
-void mcpx_debug_end_frame(void) {}
+/* As xemu's debug.c: each frame starts with no voice marked active, and the
+ * voice processor marks the ones it plays (g_dbg.vp.v[v]); the APU path's
+ * health report reads that. The cache is only needed while a voice is
+ * isolated for listening (g_dbg_voice_monitor), so it is only copied then. */
+void mcpx_debug_begin_frame(void)
+{
+    for (int i = 0; i < MCPX_HW_MAX_VOICES; i++) {
+        g_dbg.vp.v[i].active = false;
+        g_dbg.vp.v[i].multipass_dst_voice = 0xFFFF;
+    }
+}
+
+void mcpx_debug_end_frame(void)
+{
+    if (g_dbg_voice_monitor >= 0)
+        g_dbg_cache = g_dbg;
+}
 
 /* ============================================================
  * IRQ handling (stubbed - no PCI bus in standalone)
@@ -160,7 +178,14 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV_PAPU_XGSCNT:
-        r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
+        /* On the APU path, the samples the voice processor has produced, as
+         * current xemu answers (frames x 32): the count moves with the sound
+         * DirectSound is timing, not with a clock beside it. The native path
+         * keeps the clock it has always had. */
+        if (recomp_audio_path_apu())
+            r = (uint64_t)d->ep_frame_div * NUM_SAMPLES_PER_FRAME;
+        else
+            r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
         break;
     default:
         if (addr < 0x20000) {
@@ -292,6 +317,15 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
+    /* On the APU path the speaker stage plays through the host's audio
+     * output (recomp_audio_output_mix_*); this device of its own is for the
+     * native path's test tone and software mixer only. */
+    if (recomp_audio_path_apu()) {
+        fprintf(stderr, "[APU] sound: the voice processor's mix bins, through the "
+                        "speaker stage (RECOMP_AUDIO=apu)\n");
+        return;
+    }
+
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
@@ -352,6 +386,8 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
+    if (recomp_audio_path_apu())
+        return;                       /* speaker_stage() plays the frame */
     if ((d->ep_frame_div + 1) % 8) {
         return;
     }
@@ -479,6 +515,103 @@ static void throttle(MCPXAPUState *d)
  * se_frame - Process one audio frame (VP -> GP -> EP pipeline)
  * ============================================================ */
 
+/* ============================================================
+ * The speaker stage (docs/technical/audio-architecture.md)
+ *
+ * What the console's GP does with the mix bins under Microsoft's standard
+ * effects image, done here: the speaker bins (DSMIXBIN 0-5: front left,
+ * front right, centre, LFE, back left, back right) to their speakers, the
+ * crosstalk bins (6-9), where the voice processor puts HRTF-filtered 3D
+ * voices, to the four corners, and the I3DL2 bin (10) as the reverb send.
+ * The effect sends (11 and up) feed effects a title's image runs, and are
+ * not played. Eight frames (256 samples, 5.3 ms) go to the host at a time.
+ * ============================================================ */
+
+#define STAGE_SAMPLES 256
+static float g_stage[STAGE_SAMPLES * RECOMP_MIX_CHANNELS];
+static int   g_stage_fill;
+
+/* Headroom, undone. The voice processor shifts each voice down by its bin's
+ * headroom (SET_SUBMIX_HEADROOM; SET_HRTF_HEADROOM for the HRTF bins a 3D
+ * voice goes to) before summing it into the bin, so many voices cannot
+ * overflow the 24-bit mix; the effects image's output stage shifts back up.
+ * The mix here is float and cannot overflow, so the stage restores the gain:
+ * TimeSplitters 2 sets a headroom of 1 on every bin, and without this every
+ * sound played 6 dB under its level. */
+static float bin_gain(MCPXAPUState *d, int bin)
+{
+    unsigned hr = (bin >= 6 && bin <= 9) ? d->vp.hrtf_headroom
+                                         : d->vp.submix_headroom[bin];
+    return (float)(1u << (hr & 7u));
+}
+
+static void speaker_stage(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    float g[11];
+    for (int b = 0; b <= 10; b++)
+        g[b] = bin_gain(d, b);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        float *o = &g_stage[(g_stage_fill + i) * RECOMP_MIX_CHANNELS];
+        o[RECOMP_SPEAKER_FRONT_LEFT]  = mixbins[0][i] * g[0] + mixbins[6][i] * g[6];
+        o[RECOMP_SPEAKER_FRONT_RIGHT] = mixbins[1][i] * g[1] + mixbins[7][i] * g[7];
+        o[RECOMP_SPEAKER_CENTER]      = mixbins[2][i] * g[2];
+        o[RECOMP_SPEAKER_LFE]         = mixbins[3][i] * g[3];
+        o[RECOMP_SPEAKER_BACK_LEFT]   = mixbins[4][i] * g[4] + mixbins[8][i] * g[8];
+        o[RECOMP_SPEAKER_BACK_RIGHT]  = mixbins[5][i] * g[5] + mixbins[9][i] * g[9];
+        o[RECOMP_SPEAKERS]            = mixbins[10][i] * g[10];   /* reverb send */
+    }
+    g_stage_fill += NUM_SAMPLES_PER_FRAME;
+    if (g_stage_fill >= STAGE_SAMPLES) {
+        recomp_audio_output_mix_submit(g_stage, STAGE_SAMPLES, 48000);
+        g_stage_fill = 0;
+    }
+}
+
+/* What the voice processor played this frame, for the [AUDIO] health line:
+ * a voice is "heard" while it is active, not paused, and at least one of its
+ * bins is above silence (0xFFF is full attenuation). Every eighth frame. */
+static void report_voices(MCPXAPUState *d)
+{
+    if (d->ep_frame_div % 8)
+        return;
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        const struct McpxApuDebugVoice *dv = &g_dbg.vp.v[v];
+        int heard = 0;
+        if (!dv->active || dv->paused)
+            continue;
+        for (int b = 0; b < 8; b++)
+            heard |= dv->vol[b] < 0xFFF;
+        recomp_audio_health_sound((uint32_t)v, dv->stream, heard);
+    }
+}
+
+/* The APU path's pacing: a frame is made when the host has room for it. The
+ * device plays the stream at its own rate; keeping about PACE_MS queued
+ * makes the voice processor -- and DirectSound's sense of time, which is its
+ * sample count -- run at the device's rate, with no drift between two clocks.
+ * Before the device is open (it opens on a thread of its own), the clock. */
+#define PACE_MS 40
+
+static void throttle(MCPXAPUState *d);
+
+static void throttle_to_device(MCPXAPUState *d)
+{
+    int q;
+    if (d->ep_frame_div % 8)
+        return;
+    q = recomp_audio_output_mix_queued_ms();
+    if (q < 0) {
+        throttle(d);
+        return;
+    }
+    while (q > PACE_MS && !d->pause_requested && !qatomic_read(&d->exiting)) {
+        qemu_cond_timedwait(&d->cond, &d->lock, 2);
+        q = recomp_audio_output_mix_queued_ms();
+        if (q < 0)
+            break;
+    }
+}
+
 static void se_frame(MCPXAPUState *d)
 {
     mcpx_apu_update_dsp_preference(d);
@@ -503,6 +636,10 @@ static void se_frame(MCPXAPUState *d)
 
     mcpx_apu_vp_frame(d, mixbins);
     mcpx_apu_dsp_frame(d, mixbins);
+    if (recomp_audio_path_apu()) {
+        speaker_stage(d, mixbins);
+        report_voices(d);
+    }
     mcpx_apu_monitor_frame(d);
 
     d->ep_frame_div++;
@@ -528,17 +665,31 @@ static void *mcpx_apu_frame_thread(void *arg)
             continue;
         }
 
-        /* Always run the audio output loop — the software mixer and test tone
-         * need continuous frame delivery regardless of APU register state.
-         * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
-        throttle(d);
-
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+
+        /* The APU path, as xemu runs it: no frame while the front end is
+         * trapped, halted or off -- DirectSound's ISR is handling a trap, and
+         * the sample count stands still as the hardware's does -- and
+         * otherwise a frame when the host has room for it. */
+        if (recomp_audio_path_apu()) {
+            if (!apu_active) {
+                qemu_cond_timedwait(&d->cond, &d->lock, 5);
+                continue;
+            }
+            throttle_to_device(d);
+            se_frame(d);
+            continue;
+        }
+
+        /* Always run the audio output loop — the software mixer and test tone
+         * need continuous frame delivery regardless of APU register state.
+         * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+        throttle(d);
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
