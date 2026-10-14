@@ -30,3 +30,6 @@
 [submodule "third_party/miniupnp"]
 	path = third_party/miniupnp
 	url = https://github.com/miniupnp/miniupnp.git
+[submodule "third_party/libsamplerate"]
+	path = third_party/libsamplerate
+	url = https://github.com/libsndfile/libsamplerate.git

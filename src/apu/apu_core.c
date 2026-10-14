@@ -101,6 +101,55 @@ int mcpx_apu_irq_pending(void)
 }
 
 /* ============================================================
+ * RECOMP_APU_TRACE: the conversation between DirectSound and the chip
+ *
+ * Front-end methods as the voice processor runs them, and the writes
+ * DirectSound answers interrupts with (ISTS acknowledgements, FECTL taking
+ * the front end out of a trap). The first 400 of each are printed; every
+ * five seconds a count of each method seen.
+ * ============================================================ */
+
+static int apu_tracing(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_APU_TRACE");
+        on = v && *v && strcmp(v, "0") != 0;
+    }
+    return on;
+}
+
+#define TRACE_METHODS 64
+static struct { uint32_t method, count; } g_trace_methods[TRACE_METHODS];
+static unsigned g_trace_lines;
+static int64_t g_trace_last_ms;
+
+void apu_trace_method(uint32_t method, uint32_t arg)
+{
+    int i;
+    int64_t now;
+    if (!apu_tracing())
+        return;
+    for (i = 0; i < TRACE_METHODS; i++) {
+        if (g_trace_methods[i].method == method || !g_trace_methods[i].count) {
+            g_trace_methods[i].method = method;
+            g_trace_methods[i].count++;
+            break;
+        }
+    }
+    if (g_trace_lines++ < 400)
+        fprintf(stderr, "  [APUFE] method 0x%04X arg %08X\n", method, arg);
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (now - g_trace_last_ms >= 5000) {
+        g_trace_last_ms = now;
+        fprintf(stderr, "  [APUFE] methods so far:");
+        for (i = 0; i < TRACE_METHODS && g_trace_methods[i].count; i++)
+            fprintf(stderr, " %04X x%u", g_trace_methods[i].method, g_trace_methods[i].count);
+        fprintf(stderr, "\n");
+    }
+}
+
+/* ============================================================
  * MMIO Read / Write
  * ============================================================ */
 
@@ -138,6 +187,15 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
      *         (unsigned long long)addr, size, (unsigned long long)val);
      */
     (void)size;
+
+    if (apu_tracing() && (addr == NV_PAPU_ISTS || addr == NV_PAPU_FECTL ||
+                          addr == NV_PAPU_IEN)) {
+        static unsigned n;
+        if (n++ < 400)
+            fprintf(stderr, "  [APUREG] write %s = %08X (ISTS was %08X, FECTL %08X)\n",
+                    addr == NV_PAPU_ISTS ? "ISTS" : addr == NV_PAPU_FECTL ? "FECTL" : "IEN",
+                    (uint32_t)val, d->regs[NV_PAPU_ISTS], d->regs[NV_PAPU_FECTL]);
+    }
 
     switch (addr) {
     case NV_PAPU_ISTS:
@@ -619,8 +677,10 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
  * to configure voices, SSL, etc.
  * ============================================================ */
 
-uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size);
-void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size);
+/* xemu's voice processor (apu_vp_xemu.c) serves its region through
+ * vp_ops, as it does in xemu. */
+#define mcpx_apu_vp_read(d, a, s)     vp_ops.read((d), (a), (s))
+#define mcpx_apu_vp_write(d, a, v, s) vp_ops.write((d), (a), (v), (s))
 
 /* Dispatch a VP-region access (offset 0x20000-0x2FFFF from APU base) */
 void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,

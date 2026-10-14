@@ -94,43 +94,73 @@ static inline void qemu_thread_join(QemuThread *t) {
 #endif
 
 /* ============================================================
- * Physical memory access (direct RAM pointer)
- * We access Xbox RAM via a global pointer, same as NV2A.
+ * Physical memory access
+ *
+ * The APU is handed physical addresses: voice structures, sample data,
+ * scatter-gather tables, notifiers. In this runtime low RAM and the
+ * contiguous window are separate storage, so a physical address alone does
+ * not say where the bytes are; xbox_PhysToGuest asks the one place that
+ * knows (MmGetPhysicalAddress records, per 4 KB page, which storage it
+ * answered for). A buffer in the XBE image -- TimeSplitters 2 plays four
+ * from 0x00209090 -- is in low RAM, and read through the window it was
+ * another allocation's bytes.
  * ============================================================ */
 
-extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+extern uint8_t *g_apu_ram_ptr; /* the window's host address; kept for callers */
+uint32_t xbox_PhysToGuest(uint32_t phys);      /* kernel/xbox_memory_layout.c */
+extern ptrdiff_t g_xbox_mem_offset;
+
+static inline uint8_t *apu_phys_ptr(hwaddr addr) {
+    uint32_t va = xbox_PhysToGuest((uint32_t)(addr & 0x03FFFFFF));
+    return (uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
+}
+
+/* Copy `len` bytes from physical memory, page by page (two pages of one
+ * block can be in different storage). */
+static inline void apu_phys_read(hwaddr addr, void *out, size_t len) {
+    uint8_t *o = (uint8_t *)out;
+    while (len) {
+        size_t in_page = 4096u - (size_t)(addr & 4095u);
+        size_t n = len < in_page ? len : in_page;
+        memcpy(o, apu_phys_ptr(addr), n);
+        o += n; addr += n; len -= n;
+    }
+}
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
-    (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    uint32_t v; (void)as;
+    memcpy(&v, apu_phys_ptr(addr), 4);
+    return v;
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
-    (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    uint16_t v; (void)as;
+    memcpy(&v, apu_phys_ptr(addr), 2);
+    return v;
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *apu_phys_ptr(addr);
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    memcpy(apu_phys_ptr(addr), &val, 4);
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    memcpy(apu_phys_ptr(addr), &val, 2);
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *apu_phys_ptr(addr) = val;
 }
 
-/* Stub address space - just passed to ldl_le_phys etc. (ignored) */
-static int address_space_memory_dummy;
-#define address_space_memory (&address_space_memory_dummy)
+/* The address space the calls above are given and ignore. An object, not
+ * a macro: current xemu passes &address_space_memory, the older extract
+ * passed address_space_memory itself, and both convert to void *. */
+static void *address_space_memory;
 
 /* Xbox page size */
 #ifndef TARGET_PAGE_SIZE
@@ -176,52 +206,12 @@ static inline uint8_t *memory_region_get_ram_ptr(MemoryRegion *mr) {
 }
 
 /* ============================================================
- * libsamplerate stubs (SRC)
- *
- * The VP uses libsamplerate for pitch-shifted voice resampling.
- * We stub it initially; voices will play at native rate.
+ * libsamplerate: the real one (third_party/libsamplerate, 0.2.2). The
+ * voice processor resamples every voice through it; the stubs this replaced
+ * returned no frames, so a voice at any rate but 48 kHz was silent.
  * ============================================================ */
 
-typedef void SRC_STATE;
-
-#define SRC_SINC_FASTEST 2
-
-typedef long (*src_callback_t)(void *cb_data, float **data);
-
-static inline SRC_STATE *src_callback_new(src_callback_t func, int type,
-                                           int channels, int *error,
-                                           void *cb_data) {
-    (void)func; (void)type; (void)channels; (void)cb_data;
-    if (error) *error = 0;
-    /* Return non-NULL so callers think init succeeded */
-    static int dummy_src;
-    return (SRC_STATE *)&dummy_src;
-}
-
-static inline int src_callback_read(SRC_STATE *state, double ratio,
-                                     long frames, float *data) {
-    (void)state; (void)ratio; (void)frames; (void)data;
-    /* Return 0 frames - caller will handle silence */
-    return 0;
-}
-
-static inline void src_reset(SRC_STATE *state) { (void)state; }
-static inline void src_delete(SRC_STATE *state) { (void)state; }
-static inline const char *src_strerror(int error) {
-    (void)error;
-    return "libsamplerate stubbed";
-}
-
-/* Float-to-short conversion (from libsamplerate) */
-static inline void src_float_to_short_array(const float *in, int16_t *out,
-                                             int len) {
-    for (int i = 0; i < len; i++) {
-        float s = in[i] * 32767.0f;
-        if (s > 32767.0f) s = 32767.0f;
-        if (s < -32768.0f) s = -32768.0f;
-        out[i] = (int16_t)s;
-    }
-}
+#include <samplerate.h>
 
 /* ============================================================
  * SDL Audio stubs
@@ -269,7 +259,17 @@ static inline void SDL_DestroyAudioStream(SDL_AudioStream *s) { (void)s; }
 static inline void SDL_SetAudioStreamGain(SDL_AudioStream *s, float g) {
     (void)s; (void)g;
 }
-static inline int SDL_GetNumLogicalCPUCores(void) { return 1; }
+/* The voice processor spreads voices over this many worker threads. */
+#ifdef _WIN32
+static inline int SDL_GetNumLogicalCPUCores(void) {
+    SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors;
+}
+#else
+#include <unistd.h>
+static inline int SDL_GetNumLogicalCPUCores(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1;
+}
+#endif
 
 /* ============================================================
  * VM state / migration stubs
@@ -337,7 +337,10 @@ static inline void *qemu_add_vm_change_state_handler(VMChangeStateHandler fn,
 
 #define trace_mcpx_apu_reg_read(addr, size, val)    ((void)0)
 #define trace_mcpx_apu_reg_write(addr, size, val)   ((void)0)
-#define trace_mcpx_apu_method(method, arg)          ((void)0)
+/* RECOMP_APU_TRACE: every front-end method xemu's voice processor runs
+ * (apu_core.c apu_trace_method), which is how DirectSound talks to the chip. */
+void apu_trace_method(uint32_t method, uint32_t arg);
+#define trace_mcpx_apu_method(method, arg)          apu_trace_method((uint32_t)(method), (uint32_t)(arg))
 
 /* ============================================================
  * Warn/error reporting
@@ -367,8 +370,13 @@ static struct {
 } g_config = {
     .audio = {
         .volume_limit = 1.0f,
-        .hrtf = false,
-        .vp = { .num_workers = 1 },
+        /* HRTF on, as xemu ships it: 3D voices are filtered for direction
+         * (the crosstalk bins). Off, a 3D sound has distance but no side. */
+        .hrtf = true,
+        /* Workers for the voice processor; 0 is xemu's "one per core",
+         * capped at MAX_VOICE_WORKERS. Four is plenty for 256 voices and
+         * leaves the cores to the title. */
+        .vp = { .num_workers = 4 },
     },
 };
 
@@ -385,6 +393,9 @@ static inline void rcu_unregister_thread(void) {}
 
 #ifndef g_malloc0_n
 #define g_malloc0_n(n, size) calloc((n), (size))
+#endif
+#ifndef g_free
+#define g_free(p) free(p)
 #endif
 
 /* ============================================================

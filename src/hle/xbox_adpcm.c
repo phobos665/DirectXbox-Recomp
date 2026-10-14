@@ -5,7 +5,7 @@
  * recomp-runtime/xbox_adpcm.c), GPL-3.0. Changed here: the reserved header
  * byte is no longer validated and the step index is clamped rather than
  * refused (the same fix as upstream xboxrecomp 9935d82 made to the LLE
- * decoder in src/apu/apu_state.h).
+ * decoder in third_party/xemu/hw/xbox/mcpx/apu/vp/adpcm.h).
  */
 #include "xbox_adpcm.h"
 
@@ -36,7 +36,7 @@ int xbox_adpcm_decode_block(
      * 3.5-4.4% of its blocks were silenced by refusing them). The step index
      * is clamped for the same reason -- and it must be clamped, not trusted,
      * because step_table has 89 entries. It is read as int8_t, as the LLE
-     * decoder in src/apu/apu_state.h reads it, so a byte above 127 clamps
+     * decoder in third_party/xemu/hw/xbox/mcpx/apu/vp/adpcm.h reads it, so a byte above 127 clamps
      * to 0. */
     for (unsigned channel = 0u; channel < channels; ++channel) {
         const uint8_t *header = block + channel * 4u;
