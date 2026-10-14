@@ -31,6 +31,13 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* Marks an implementation, and names it hle_<name>. */
 #define HLE_EXPORT(name) void hle_##name(void)
 
+/* On a line of its own in a file: every HLE_EXPORT in the file belongs to
+ * `group`, and can be switched off at run time. tools.recomp keeps each one's
+ * original body and has its thunk call that body, untouched, while the
+ * group's switch says off (tools/recomp/hle.py GROUPS). The one group is
+ * audio: the DirectSound replacement, off under RECOMP_AUDIO=apu. */
+#define HLE_GROUP(group)
+
 /* Imports an XDK variable's guest address by name, as hle_var_<name>. Must
  * start a line, like HLE_EXPORT: tools.recomp scans for the marker and writes
  * the definition into recomp_hle.c from the title's XDK symbols. 0 means the

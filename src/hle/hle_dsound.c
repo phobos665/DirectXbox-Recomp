@@ -46,6 +46,10 @@
 #include <string.h>
 
 #include "hle.h"
+
+/* The DirectSound replacement: off under RECOMP_AUDIO=apu, when the title's
+ * own DirectSound drives the emulated APU (src/hle/audio_path.c). */
+HLE_GROUP(audio)
 #include "platform/host_timer.h"
 #include "dsound_buffer_model.h"
 #include "xbox_adpcm.h"
