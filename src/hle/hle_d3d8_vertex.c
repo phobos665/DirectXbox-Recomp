@@ -55,6 +55,7 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
 void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *idx,
                                   const void *verts, uint32_t stride, int from_buffer);
 void hle_d3d8_shadow_set_first_vertex(uint32_t first);
+void hle_d3d8_apply_pending_textures(void);   /* hle_d3d8_texture.c */
 
 #define CONTIG_BASE 0x80000000u
 #define CONTIG_SIZE (64u * 1024u * 1024u)    /* kernel.h XBOX_CONTIG_SIZE */
@@ -299,6 +300,14 @@ int xbox_EnvSwitch(const char *name, int default_on);   /* xbox_memory_layout.c 
 #define PB_CONST_FIRST  0x0B80u
 #define PB_CONST_END    0x0C00u
 #define PB_MAX_WORDS    (4u * 1024u * 1024u)
+/* Jumps one walk may follow. Each is the buffer wrapping or a detour into a
+ * segment built ahead of time and back: Turok: Evolution jumps into a
+ * prebuilt segment for every model it draws and back out of it, two jumps
+ * a model. At the old limit of 8 every walk over more than four models gave
+ * up and resynchronised at the put pointer, so the models after the fourth
+ * lost their matrices -- enemies drawn as slabs of sky -- and the walk's
+ * share of a frame's draws. A loop is still caught by PB_MAX_WORDS. */
+#define PB_MAX_JUMPS    4096
 
 static uint32_t g_pb_scan;              /* next unscanned word (VA); 0 = resync */
 static uint32_t g_pb_load;              /* the NV2A's constant load pointer */
@@ -335,6 +344,45 @@ static void pb_constant(uint32_t reg, const float v[4])
     }
     memcpy(g_pb_run[g_pb_run_count++], v, sizeof g_pb_run[0]);
     g_pb_constants++;
+}
+
+/* The NV2A's transform-program memory, as the title writes it itself:
+ * SET_TRANSFORM_PROGRAM_LOAD sets the slot the next instruction goes to,
+ * the 32 SET_TRANSFORM_PROGRAM methods each carry one of an instruction's
+ * four words (method / 4 % 4) and the fourth moves on to the next slot, and
+ * SET_TRANSFORM_PROGRAM_START names the slot a draw runs from. The XDK's own
+ * loads (replaced calls) are mirrored too, so the memory stays whole, but only
+ * a start the title wrote is handed on: the XDK's are the API's selections,
+ * which hle_d3d8.c has already seen. A program runs to the instruction whose
+ * final flag (bit 0 of its fourth word) is set. */
+#define PB_PROG_FIRST   0x0B00u
+#define PB_PROG_END     0x0B80u
+#define PB_PROG_LOAD    0x1E9Cu
+#define PB_PROG_START   0x1EA0u
+#define PB_PROG_SLOTS   136u
+static uint32_t g_pb_prog[PB_PROG_SLOTS][4];
+static uint32_t g_pb_prog_load;
+void hle_d3d8_pb_program_started(const DWORD *microcode, int count);   /* hle_d3d8.c */
+
+static void pb_program_method(uint32_t m, uint32_t v, int replaced)
+{
+    if (m == PB_PROG_LOAD) {
+        g_pb_prog_load = v;
+    } else if (m == PB_PROG_START) {
+        uint32_t end = v;
+
+        if (replaced || v >= PB_PROG_SLOTS)
+            return;
+        while (end < PB_PROG_SLOTS - 1u && !(g_pb_prog[end][3] & 1u))
+            end++;
+        hle_d3d8_pb_program_started((const DWORD *)g_pb_prog[v], (int)(end - v + 1u));
+    } else if (m >= PB_PROG_FIRST && m < PB_PROG_END && g_pb_prog_load < PB_PROG_SLOTS) {
+        uint32_t word = ((m - PB_PROG_FIRST) / 4u) & 3u;
+
+        g_pb_prog[g_pb_prog_load][word] = v;
+        if (word == 3u)
+            g_pb_prog_load++;
+    }
 }
 
 static void pb_method(uint32_t method, uint32_t value)
@@ -434,6 +482,29 @@ static int pb_surface_trace(void)
 
     if (!parsed) {
         const char *e = getenv("RECOMP_PB_SURFACE_TRACE");
+        parsed = 1;
+        if (e && sscanf(e, "%lu-%lu", &lo, &hi) < 2)
+            hi = lo;
+    }
+    if (hi < lo)
+        return 0;
+    now = hle_d3d8_shadow_swaps();
+    return now >= lo && now <= hi;
+}
+
+/* RECOMP_PB_TRACE=<first>-<last>: every method the walk passes over in
+ * those swaps -- address, method, value, and whether a replaced call wrote
+ * it -- plus each jump, call and return it follows. Verbose: one swap of a
+ * busy title is tens of thousands of lines. For what the title itself put in
+ * the push buffer around a draw that comes out wrong. */
+static int pb_trace(void)
+{
+    static int parsed;
+    static unsigned long lo = 1, hi = 0;
+    unsigned long now;
+
+    if (!parsed) {
+        const char *e = getenv("RECOMP_PB_TRACE");
         parsed = 1;
         if (e && sscanf(e, "%lu-%lu", &lo, &hi) < 2)
             hi = lo;
@@ -593,6 +664,38 @@ static void w_group_end(void)
     uint32_t stride, i, lo = 0xFFFFFFFFu, hi = 0;
     uint8_t *gathered;
 
+    /* RECOMP_PB_TRACE as well: each pushed draw's range, every attribute's
+     * array (physical offset and NV097 format word) and the first vertex's
+     * position, for a draw whose geometry comes out wrong. */
+    if (pb_trace()) {
+        uint32_t a, l = 0xFFFFFFFFu, h = 0;
+        for (a = 0; a < g_w_nidx; a++) {
+            if (g_w_idx[a] < l) l = g_w_idx[a];
+            if (g_w_idx[a] > h) h = g_w_idx[a];
+        }
+        fprintf(stderr, "[PB swap %lu] draw prim %u: %u indices (%u..%u), %u inline words;",
+                hle_d3d8_shadow_swaps(), g_w_prim, g_w_nidx, l, h, g_w_ninl);
+        for (a = 0; a < 16u; a++)
+            if ((g_w_known & (1u << a)) && (g_w_fmt[a] & 0xF0u))
+                fprintf(stderr, " v%u@0x%08X/0x%X", a, g_w_off[a], g_w_fmt[a]);
+        if ((g_w_known & 1u) && (g_w_fmt[0] & 0xFFu) == 0x32u && g_w_nidx &&
+            guest_readable((g_w_off[0] & 0x7FFFFFFFu) | CONTIG_BASE, 12u)) {
+            const float *f = (const float *)HLE_PTR(((g_w_off[0] & 0x7FFFFFFFu) | CONTIG_BASE) +
+                                                    l * (g_w_fmt[0] >> 8));
+            fprintf(stderr, " | v0[%u] = %g %g %g", l, f[0], f[1], f[2]);
+        }
+        pb_flush();
+        {
+            const float *c = d3d8_vsh_constants();
+            if (c)
+                fprintf(stderr, " | c154 %g %g %g %g c100 %g %g %g %g c101.w %g c102.w %g",
+                        c[154 * 4], c[154 * 4 + 1], c[154 * 4 + 2], c[154 * 4 + 3],
+                        c[100 * 4], c[100 * 4 + 1], c[100 * 4 + 2], c[100 * 4 + 3],
+                        c[101 * 4 + 3], c[102 * 4 + 3]);
+        }
+        fprintf(stderr, "\n");
+    }
+
     if (g_w_nidx) {
         uint16_t *rebased;
         for (i = 0; i < g_w_nidx; i++) {
@@ -708,6 +811,14 @@ static void pb_array_begin_end(uint32_t v)
     }
 }
 
+/* Set while a walk runs on this thread: its draws are the title's own. */
+static RECOMP_TLS int walking;
+
+int hle_d3d8_pb_walking(void)
+{
+    return walking;
+}
+
 void hle_d3d8_push_constants_sync(void)
 {
     uint32_t device, put, va, ret = 0, words = 0;
@@ -719,8 +830,6 @@ void hle_d3d8_push_constants_sync(void)
      * nothing to do -- and starting again from g_pb_scan, which only moves
      * when a walk ends, would replay the same span and recurse until the
      * stack ran out. Per thread, as the walk is. */
-    static RECOMP_TLS int walking;
-
     if (walking)
         return;
 
@@ -748,8 +857,11 @@ void hle_d3d8_push_constants_sync(void)
         if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {
             /* A jump: the buffer wrapping, or a segment change. */
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
-            if (++jumps > 8)
+            if (++jumps > PB_MAX_JUMPS)
                 goto resync;
+            if (pb_trace())
+                fprintf(stderr, "[PB swap %lu] 0x%08X jump -> 0x%08X\n",
+                        hle_d3d8_shadow_swaps(), va, CONTIG_BASE | (target & 0x0FFFFFFFu));
             va = CONTIG_BASE | (target & 0x0FFFFFFFu);
             continue;
         }
@@ -758,6 +870,8 @@ void hle_d3d8_push_constants_sync(void)
                 goto resync;
             ret = va + 4u;
             va = CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            if (pb_trace())
+                fprintf(stderr, "[PB swap %lu] call -> 0x%08X\n", hle_d3d8_shadow_swaps(), va);
             continue;
         }
         if (w == 0x00020000u) {           /* return */
@@ -771,6 +885,25 @@ void hle_d3d8_push_constants_sync(void)
             goto resync;
         count = (w >> 18) & 0x7FFu;
         method = w & 0x1FFCu;
+        if (pb_trace()) {
+            uint32_t k;
+            for (k = 0; k < count && k < 64u && guest_readable(va + 4u + 4u * k, 4u); k++)
+                fprintf(stderr, "[PB swap %lu] 0x%08X method 0x%04X = 0x%08X%s\n",
+                        hle_d3d8_shadow_swaps(), va, (w & 0x40000000u) ? method : method + 4u * k,
+                        HLE_MEM32(va + 4u + 4u * k), g_w_nodraw ? " (replaced call)" : "");
+            if (count > 64u)
+                fprintf(stderr, "[PB swap %lu] 0x%08X ... %u more\n", hle_d3d8_shadow_swaps(),
+                        va, count - 64u);
+        }
+        if (inl && ((method + 4u * count > PB_PROG_FIRST && method < PB_PROG_END) ||
+                    method == PB_PROG_LOAD || method == PB_PROG_START) &&
+            guest_readable(va + 4u, 4ull * count)) {
+            uint32_t k;
+            pb_flush();                  /* a start applies from here on */
+            for (k = 0; k < count; k++)
+                pb_program_method((w & 0x40000000u) ? method : method + 4u * k,
+                                  HLE_MEM32(va + 4u + 4u * k), g_w_nodraw);
+        }
         if (inl && method + 4u * count > PB_SURFACE_COLOR && method <= PB_SURFACE_ZETA &&
             guest_readable(va + 4u, 4ull * count)) {
             uint32_t k;
@@ -1007,9 +1140,94 @@ HLE_EXPORT(CDevice_SetStateVB)
     HLE_CALL_ORIGINAL(CDevice_SetStateVB);
     g_base_vertex = base;
     g_base_vertex_seen = 1;
+    /* The XDK's lazy state goes out here, textures among it. */
+    hle_d3d8_apply_pending_textures();
 }
 
 void hle_d3d8_push_skip(void);
+
+RECOMP_TLS int g_hle_original_depth;
+
+/* ------------------------------------------------------------------------
+ * The points where the title learns the GPU has caught up.
+ *
+ * The walk reads a pushed draw's vertices from guest memory when it next
+ * runs, which is at the next replaced call -- and the GPU it stands in for
+ * reports everything consumed at once (the ack thread holds DMA_GET at PUT,
+ * the fence mirror holds the completed time at the submitted one). So a
+ * title that writes vertices, kicks them off, waits for the GPU and writes
+ * the next set into the same memory had the walk read only the last set, for
+ * every draw.
+ *
+ * Each of these XDK functions is where a submission is handed to the GPU or
+ * waited for, so the walk is brought up to date first, as at any replaced
+ * call -- unless it is reached from inside a replaced function's own body,
+ * whose writes that replacement accounts for itself (g_hle_original_depth).
+ * RECOMP_HLE_D3D8_PB_SYNC_WAITS=0 leaves them alone. */
+static unsigned long g_wait_syncs;
+
+static void wait_point(const char *name, int *seen)
+{
+    static int on = -1;
+
+    if (!*seen) {
+        *seen = 1;
+        fprintf(stderr, "[HLE] %s replaced by name: the push-buffer walk catches up "
+                "before the title hears from the GPU\n", name);
+    }
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_PB_SYNC_WAITS", 1);
+    if (on && !g_hle_original_depth && hle_d3d8_pb_inline_on()) {
+        g_wait_syncs++;
+        hle_d3d8_push_constants_sync();
+    }
+}
+
+HLE_ORIGINAL(CDevice_KickOff);
+HLE_ORIGINAL(D3D_KickOffAndWaitForIdle);
+HLE_ORIGINAL(D3D_BlockOnTime);
+HLE_ORIGINAL(D3D_BlockOnResource);
+HLE_ORIGINAL(D3DResource_BlockUntilNotBusy);
+
+HLE_EXPORT(CDevice_KickOff)
+{
+    static int seen;
+    wait_point("CDevice_KickOff", &seen);
+    if (hle_original_CDevice_KickOff)
+        HLE_CALL_ORIGINAL(CDevice_KickOff);
+}
+
+HLE_EXPORT(D3D_KickOffAndWaitForIdle)
+{
+    static int seen;
+    wait_point("D3D_KickOffAndWaitForIdle", &seen);
+    if (hle_original_D3D_KickOffAndWaitForIdle)
+        HLE_CALL_ORIGINAL(D3D_KickOffAndWaitForIdle);
+}
+
+HLE_EXPORT(D3D_BlockOnTime)
+{
+    static int seen;
+    wait_point("D3D_BlockOnTime", &seen);
+    if (hle_original_D3D_BlockOnTime)
+        HLE_CALL_ORIGINAL(D3D_BlockOnTime);
+}
+
+HLE_EXPORT(D3D_BlockOnResource)
+{
+    static int seen;
+    wait_point("D3D_BlockOnResource", &seen);
+    if (hle_original_D3D_BlockOnResource)
+        HLE_CALL_ORIGINAL(D3D_BlockOnResource);
+}
+
+HLE_EXPORT(D3DResource_BlockUntilNotBusy)
+{
+    static int seen;
+    wait_point("D3DResource_BlockUntilNotBusy", &seen);
+    if (hle_original_D3DResource_BlockUntilNotBusy)
+        HLE_CALL_ORIGINAL(D3DResource_BlockUntilNotBusy);
+}
 
 /* A replaced draw with no stream buffer to read: its stream setup was
  * inlined (Halo 2 writes SET_VERTEX_DATA_ARRAY_OFFSET itself), so the

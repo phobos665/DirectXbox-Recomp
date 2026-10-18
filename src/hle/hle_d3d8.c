@@ -78,6 +78,8 @@
 #include "../kernel/xbox_memory_layout.h"  /* the guest lock */
 
 void hle_d3d8_push_constants_sync(void);   /* hle_d3d8_vertex.c */
+int  hle_d3d8_pb_walking(void);             /* hle_d3d8_vertex.c */
+void hle_d3d8_apply_pending_textures(void); /* hle_d3d8_texture.c */
 void hle_d3d8_push_skip(void);
 int  hle_d3d8_pb_inline_on(void);
 
@@ -423,6 +425,7 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
     WNDCLASSA wc;
     RECT r;
     MSG msg;
+    DWORD ex_style = 0;
 
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc   = shadow_wndproc;
@@ -436,7 +439,18 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
     r.right = (LONG)req->width;
     r.bottom = (LONG)req->height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    req->hwnd = CreateWindowA(wc.lpszClassName, "xboxrecomp - D3D8 replacement (shadow)",
+    /* A background run's window is never activated, not even by a click:
+     * WS_EX_NOACTIVATE keeps the focus where it is however the window is
+     * shown. WS_EX_APPWINDOW keeps it on the taskbar, which NOACTIVATE
+     * would otherwise take it off. */
+    {
+        const char *bg = getenv("RECOMP_WINDOW_BACKGROUND");
+
+        if (bg && *bg && strcmp(bg, "0") != 0)
+            ex_style = WS_EX_NOACTIVATE | WS_EX_APPWINDOW;
+    }
+    req->hwnd = CreateWindowExA(ex_style, wc.lpszClassName,
+                              "xboxrecomp - D3D8 replacement (shadow)",
                               WS_OVERLAPPEDWINDOW,
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               r.right - r.left, r.bottom - r.top,
@@ -1183,6 +1197,81 @@ static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
         host_SetVertexShader(g_shadow, g_programs[i].host);
 }
 
+/* A program the title loads and starts itself, by writing
+ * SET_TRANSFORM_PROGRAM_LOAD, SET_TRANSFORM_PROGRAM and
+ * SET_TRANSFORM_PROGRAM_START into the push buffer with no XDK call -- the
+ * push-buffer walk (hle_d3d8_vertex.c) mirrors the program memory and hands
+ * the started program here. Turok: Evolution loads ~57 programs a frame that
+ * way, its characters among them; drawn under whatever the API last selected,
+ * they came out as slabs of their own texture sheets.
+ *
+ * It runs through one g_programs entry of its own, keeping the declaration of
+ * the shader the API selected, until the API selects another. Host programs
+ * are shared by content with LoadVertexShaderProgram's (g_slot_programs). */
+static int g_pushed_entry = -1;
+static DWORD g_pushed_uncached;          /* the current one, when the cache is full */
+static unsigned long g_pushed_starts, g_pushed_failed;
+
+void hle_d3d8_pb_program_started(const DWORD *microcode, int count)
+{
+    struct shadow_program *p;
+    uint32_t hash;
+    DWORD host = 0;
+    int i;
+
+    if (!g_shadow || count <= 0 || count > SHADOW_PROGRAM_SLOTS)
+        return;
+    hash = microcode_hash(microcode, count);
+    i = slot_program_find(hash, count, microcode);
+    if (i >= 0) {
+        host = g_slot_programs[i].host;
+    } else if (FAILED(host_vsh_create_shader(microcode, count, &host))) {
+        if (g_pushed_failed++ < 3)
+            fprintf(stderr, "[HLE-D3D8] a program the title started itself (%d instructions) "
+                    "could not be made; its draws keep the selected one\n", count);
+        return;
+    } else if (g_slot_program_count < SLOT_PROGRAM_CACHE) {
+        SlotProgram *sp = &g_slot_programs[g_slot_program_count++];
+        sp->hash = hash;
+        sp->count = count;
+        sp->host = host;
+    } else {
+        if (g_pushed_uncached)
+            host_vsh_delete_shader(g_pushed_uncached);
+        g_pushed_uncached = host;
+    }
+    if (g_pushed_entry < 0) {
+        if (g_program_count >= SHADOW_MAX_PROGRAMS)
+            return;
+        g_pushed_entry = g_program_count++;
+        memset(&g_programs[g_pushed_entry], 0, sizeof g_programs[g_pushed_entry]);
+    }
+    p = &g_programs[g_pushed_entry];
+    if (g_shadow_vs_slot != g_pushed_entry) {
+        /* Entered from an API selection: take its declaration along. */
+        if (g_shadow_vs_slot >= 0)
+            *p = g_programs[g_shadow_vs_slot];
+        else
+            memset(p, 0, sizeof *p);
+    }
+    p->guest = 0xFFFFFFFEu;              /* no handle names it */
+    p->host = host;
+    p->kind = SHADER_HOST_PROGRAM;
+    p->from_slot = 1;                    /* the host program is not this entry's */
+    if (p->has_declaration && g_shadow_vs_is_program)
+        shadow_read_declaration(g_pushed_entry, g_shadow_vs);
+    g_shadow_vs_is_program = 1;
+    g_shadow_vs_slot = g_pushed_entry;
+    g_shadow_vs_kind = SHADER_HOST_PROGRAM;
+    host_SetVertexShader(g_shadow, host);
+    if (g_pushed_starts++ == 0)
+        fprintf(stderr, "[HLE-D3D8] the title starts vertex programs it loads itself "
+                "(%d instructions first); drawn with those\n", count);
+    if (shadow_trace_on())
+        fprintf(stderr, "[TRACE swap %lu] pushed vertex program, %d instructions, host 0x%08lX\n",
+                g_shadow_swaps, count, (unsigned long)host);
+}
+
 /* ---------------------------------------------------------------- drawing */
 
 /* The Xbox primitive types (XPT_*) and xbox_primitive_to_host() are in
@@ -1869,7 +1958,12 @@ static void ram_dump_at_swap(void)
             snprintf(path, sizeof path, "%s_%lu.bin", prefix, g_shadow_swaps);
             f = fopen(path, "wb");
             if (f) {
-                fwrite(HLE_PTR(0), 1, g_xbox_total_ram, f);
+                /* RECOMP_RAM_DUMP_BASE=0x80000000: the contiguous window
+                 * instead, where textures and vertex buffers are addressed by
+                 * their physical offset. */
+                const char *b = getenv("RECOMP_RAM_DUMP_BASE");
+                uint32_t base = b ? (uint32_t)strtoul(b, NULL, 0) : 0u;
+                fwrite(HLE_PTR(base), 1, g_xbox_total_ram, f);
                 fclose(f);
                 fprintf(stderr, "[RAM-DUMP] swap %lu: %lu bytes to %s\n", g_shadow_swaps,
                         (unsigned long)g_xbox_total_ram, path);
@@ -5775,6 +5869,8 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
     if (!g_shadow || !verts || !stride || !count)
         return;
     hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
+    if (!hle_d3d8_pb_walking())
+        hle_d3d8_apply_pending_textures();
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
@@ -5833,6 +5929,8 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
     if (!g_shadow || !idx || !verts || !stride || !count)
         return;
     hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
+    if (!hle_d3d8_pb_walking())
+        hle_d3d8_apply_pending_textures();
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
