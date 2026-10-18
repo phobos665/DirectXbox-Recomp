@@ -196,6 +196,13 @@ typedef struct RecompSettings {
     int  fullscreen;            /* 0 or 1: borderless, on the window's monitor */
     int  vrr;                   /* 0 or 1: present for variable refresh when fullscreen */
     int  frame_interp;          /* 1 (off) to 4: frames shown for each the game draws */
+    /* Mouse look (src/input/input_bindings.c): the mouse moves controller
+     * 1's right stick, on top of whatever is bound to it. Per title, unlike
+     * the bindings, because a camera on the mouse is right for one game and
+     * a surprise in the next. */
+    int  mouse_look;            /* 0 or 1 */
+    int  mouse_sensitivity;     /* 1..20 */
+    int  mouse_deadzone;        /* 0..90: percent of a push every movement starts at */
     char game_dir[512];         /* empty means beside the executable */
 
     /* System Link (src/kernel/xbox_net_udp.c). */
@@ -209,6 +216,12 @@ typedef struct RecompSettings {
 /* The port a System Link host listens on when nobody chooses one. The same
  * number as XBOX_NET_DEFAULT_PORT, which the runtime falls back to. */
 #define RECOMP_SYSLINK_DEFAULT_PORT 27610
+
+/* Mouse look's defaults, which the runtime falls back to as well when the
+ * file has no line. At 5 a full push is about 4,000 mouse counts a second;
+ * 20% is just past the dead zone most pads are read with. */
+#define RECOMP_MOUSE_SENSITIVITY_DEFAULT 5
+#define RECOMP_MOUSE_DEADZONE_DEFAULT    20
 
 void recomp_settings_defaults(RecompSettings *s);
 

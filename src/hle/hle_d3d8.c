@@ -75,6 +75,7 @@
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
 #include "rhi.h"                         /* rhi_set_wait_hooks */
+#include "input_bindings.h"              /* the mouse, for mouse look and mouse: bindings */
 #include "../kernel/xbox_memory_layout.h"  /* the guest lock */
 
 void hle_d3d8_push_constants_sync(void);   /* hle_d3d8_vertex.c */
@@ -319,9 +320,161 @@ static int  g_shadow_fullscreen;
  * kept by the host shell's window, below. */
 static void shadow_set_fullscreen(HWND hwnd, int on);
 
+/* ---- the mouse
+ *
+ * Its buttons go to the bindings as they arrive (mouse: sources). With
+ * mouse look on (recomp_mouse_look) the window also takes the pointer while
+ * it is in front: hidden, held inside the client area, and its motion read
+ * as raw input, which keeps coming at the edge of the screen and has no
+ * pointer acceleration in it. Switching away gives the pointer back; a
+ * click in the window, or switching back to it, takes it again. The click
+ * that takes it is not passed on, so it does not also fire. All of this
+ * runs on the window's own thread. */
+static int  g_mouse_look = -1;          /* -1 not asked yet */
+static int  g_mouse_captured;
+static UINT g_mouse_down;               /* buttons this window saw go down */
+
+static int shadow_mouse_look(void)
+{
+    if (g_mouse_look < 0) {
+        const char *bg = getenv("RECOMP_WINDOW_BACKGROUND");
+
+        /* Never for a background run: it must not take anything from the
+         * person at the desk, the pointer least of all. */
+        g_mouse_look = recomp_mouse_look() && !(bg && *bg && strcmp(bg, "0") != 0);
+    }
+    return g_mouse_look;
+}
+
+static void shadow_mouse_clip(HWND hwnd)
+{
+    RECT r;
+    POINT a, b;
+
+    GetClientRect(hwnd, &r);
+    a.x = r.left;  a.y = r.top;
+    b.x = r.right; b.y = r.bottom;
+    ClientToScreen(hwnd, &a);
+    ClientToScreen(hwnd, &b);
+    r.left = a.x;  r.top = a.y;
+    r.right = b.x; r.bottom = b.y;
+    ClipCursor(&r);
+}
+
+static void shadow_mouse_capture(HWND hwnd, int on)
+{
+    if (on && !shadow_mouse_look())
+        return;
+    if (on == g_mouse_captured) {
+        if (on)
+            shadow_mouse_clip(hwnd);        /* the window moved or changed size */
+        return;
+    }
+    g_mouse_captured = on;
+    if (on) {
+        RAWINPUTDEVICE rid;
+
+        rid.usUsagePage = 0x01;             /* generic desktop */
+        rid.usUsage     = 0x02;             /* mouse */
+        rid.dwFlags     = 0;                /* only while this window is in front */
+        rid.hwndTarget  = hwnd;
+        if (!RegisterRawInputDevices(&rid, 1, sizeof rid))
+            fprintf(stderr, "[HLE-D3D8] mouse look: no raw input (%lu)\n", GetLastError());
+        shadow_mouse_clip(hwnd);
+        SetCursor(NULL);
+    } else {
+        ClipCursor(NULL);
+        recomp_mouse_release();
+        g_mouse_down = 0;
+    }
+}
+
+/* One button, from its window message: 1 when the message was this. */
+static int shadow_mouse_button(HWND hwnd, UINT msg, WPARAM wp)
+{
+    int button, down;
+
+    switch (msg) {
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP: button = RECOMP_MOUSE_LEFT;   break;
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP: button = RECOMP_MOUSE_RIGHT;  break;
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP: button = RECOMP_MOUSE_MIDDLE; break;
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+        button = GET_XBUTTON_WPARAM(wp) == XBUTTON2 ? RECOMP_MOUSE_X2 : RECOMP_MOUSE_X1;
+        break;
+    default:
+        return 0;
+    }
+    down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+           msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN;
+    if (down && shadow_mouse_look() && !g_mouse_captured) {
+        shadow_mouse_capture(hwnd, 1);
+        return 1;
+    }
+    recomp_mouse_button(button, down);
+    /* Held outside the window, a button's release would go to whatever is
+     * under the pointer and the game would see it held for good. */
+    if (down) {
+        if (!g_mouse_down)
+            SetCapture(hwnd);
+        g_mouse_down |= 1u << button;
+    } else {
+        g_mouse_down &= ~(1u << button);
+        if (!g_mouse_down)
+            ReleaseCapture();
+    }
+    return 1;
+}
+
+static void shadow_mouse_raw(LPARAM lp)
+{
+    RAWINPUT ri;
+    UINT size = sizeof ri;
+
+    if (!g_mouse_captured)
+        return;
+    if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) ==
+            (UINT)-1 || ri.header.dwType != RIM_TYPEMOUSE)
+        return;
+    /* Absolute reports come from a tablet or a remote desktop session, and
+     * are positions rather than movement; mouse look has nothing to do with
+     * them. */
+    if (ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)
+        return;
+    if (ri.data.mouse.lLastX || ri.data.mouse.lLastY)
+        recomp_mouse_move((float)ri.data.mouse.lLastX, (float)ri.data.mouse.lLastY);
+}
+
 static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (shadow_mouse_button(hwnd, msg, wp))
+        return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP ? TRUE : 0;
     switch (msg) {
+    case WM_INPUT:
+        shadow_mouse_raw(lp);
+        break;                          /* DefWindowProc cleans up after it */
+    case WM_ACTIVATE:
+        /* Switched to by keyboard: take the pointer now. Clicked to the
+         * front: on the click, if it lands in the window (shadow_mouse_button)
+         * -- one on the title bar is someone moving the window. */
+        if (LOWORD(wp) == WA_INACTIVE)
+            shadow_mouse_capture(hwnd, 0);
+        else if (LOWORD(wp) == WA_ACTIVE && !HIWORD(wp))   /* not minimised */
+            shadow_mouse_capture(hwnd, 1);
+        break;
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        /* Something else took the mouse (a system dialog, the window menu):
+         * nothing still counts as held. */
+        if (g_mouse_down) {
+            g_mouse_down = 0;
+            recomp_mouse_release();
+        }
+        break;
+    case WM_SIZE:
+    case WM_MOVE:
+        if (g_mouse_captured)
+            shadow_mouse_clip(hwnd);
+        break;
     case WM_SYSKEYDOWN:
         /* Alt+Enter, the usual Windows key for it: fullscreen and back. */
         if (wp == VK_RETURN && (lp & (1 << 29)) && !(lp & (1 << 30))) {
@@ -334,8 +487,9 @@ static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             return 0;                   /* no beep for Alt+Enter */
         break;
     case WM_SETCURSOR:
-        /* The game has no pointer; over a fullscreen picture it is in the way. */
-        if (g_shadow_fullscreen && LOWORD(lp) == HTCLIENT) {
+        /* The game has no pointer; over a fullscreen picture it is in the
+         * way, and with mouse look the pointer is not a pointer at all. */
+        if ((g_shadow_fullscreen || g_mouse_captured) && LOWORD(lp) == HTCLIENT) {
             SetCursor(NULL);
             return TRUE;
         }
@@ -565,6 +719,29 @@ static void shadow_host_fullscreen(void *user, int on)
     xbox_D3D8SetFullscreen(on ? TRUE : FALSE);
 }
 
+/* The mouse, for mouse look and mouse: bindings. The shell reports motion
+ * only while the window holds the pointer, which it does only with mouse
+ * look on (shadow_window), and every button up when the window loses the
+ * focus. */
+static void shadow_host_mouse_motion(void *user, float dx, float dy)
+{
+    (void)user;
+    recomp_mouse_move(dx, dy);
+}
+
+static void shadow_host_mouse_button(void *user, int button, int down)
+{
+    (void)user;
+    switch (button) {
+    case 1: recomp_mouse_button(RECOMP_MOUSE_LEFT, down);   break;
+    case 2: recomp_mouse_button(RECOMP_MOUSE_MIDDLE, down); break;
+    case 3: recomp_mouse_button(RECOMP_MOUSE_RIGHT, down);  break;
+    case 4: recomp_mouse_button(RECOMP_MOUSE_X1, down);     break;
+    case 5: recomp_mouse_button(RECOMP_MOUSE_X2, down);     break;
+    default: break;
+    }
+}
+
 static HWND shadow_window(UINT width, UINT height)
 {
     host_window_callbacks cb;
@@ -575,6 +752,8 @@ static HWND shadow_window(UINT width, UINT height)
     cb.on_key = shadow_host_key;
     cb.on_resize = shadow_host_resize;
     cb.on_fullscreen = shadow_host_fullscreen;
+    cb.on_mouse_motion = shadow_host_mouse_motion;
+    cb.on_mouse_button = shadow_host_mouse_button;
     /* The title's own name, out of its XBE certificate (UTF-8). */
     g_shadow_host = host_window_open((int)width, (int)height, xbox_XbeTitleName(), &cb);
     if (!g_shadow_host) {
@@ -593,6 +772,10 @@ static HWND shadow_window(UINT width, UINT height)
      * staying out of the way (the shell refuses it then as well). */
     if (!host_window_background() && recomp_config_bool("RECOMP_FULLSCREEN", "fullscreen", 0))
         host_window_set_fullscreen(g_shadow_host, 1);
+    /* Mouse look: the window holds the pointer while it is in front. Not
+     * for a background run, which must not take it from anyone. */
+    if (!host_window_background() && recomp_mouse_look())
+        host_window_set_relative_mouse(g_shadow_host, 1);
     return (HWND)target;
 }
 
