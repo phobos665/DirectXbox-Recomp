@@ -400,14 +400,23 @@ static uint32_t tcp_frame(uint8_t *f, uint16_t sport, uint16_t dport, uint32_t s
     return ip_frame(f, k_mac, 6, XBOX_NAT_CONSOLE, LOOPBACK, 7, 0, 0, t, 20 + dl);
 }
 
-/* The next TCP segment for the console, skipping anything else. */
-static uint32_t next_tcp(XboxNat *n, uint8_t *r, unsigned ms)
+/* The next IPv4 packet of `proto` for the console, skipping anything else:
+ * a relayed connection the test has finished with can still be closing (a
+ * FIN, an ACK) when the next check starts. */
+static uint32_t next_ip(XboxNat *n, uint8_t *r, uint8_t proto, unsigned ms)
 {
     uint32_t len;
     while ((len = next_frame_ms(n, r, ms)) != 0)
-        if (len >= 54 && r[14 + 9] == 6)
+        if (len >= 34 && get16(r + 12) == 0x0800 && r[14 + 9] == proto)
             return len;
     return 0;
+}
+
+/* The next TCP segment for the console, skipping anything else. */
+static uint32_t next_tcp(XboxNat *n, uint8_t *r, unsigned ms)
+{
+    uint32_t len = next_ip(n, r, 6, ms);
+    return len >= 54 ? len : 0;
 }
 
 static void test_tcp_refused(XboxNat *n)
@@ -474,7 +483,7 @@ static void test_icmp(XboxNat *n)
     e[0] = 8; e[1] = 0; put16(e + 2, 0); put16(e + 2, fold(sum16(e, sizeof e, 0)));
     xbox_net_nat_send(n, f, ip_frame(f, k_mac, 1, XBOX_NAT_CONSOLE, XBOX_NAT_GATEWAY, 6, 0, 0,
                                      e, sizeof e));
-    len = next_frame(n, r);
+    len = next_ip(n, r, 1, 1000);
     CHECK(len == 14 + 20 + 16 && r[34] == 0 && fold(sum16(r + 34, 16, 0)) == 0,
           "no echo reply from the router");
 }
