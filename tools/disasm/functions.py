@@ -487,11 +487,39 @@ class FunctionDetector:
                 code_ranges.add(addr)
 
         call_targets = self.engine.get_call_targets()
-        realigned = unaligned = 0
+        realigned = unaligned = inside_code = 0
+        # Function heads found by their prologue, for the check below.
+        heads = sorted(a for a, (_, how) in self._candidates.items()
+                       if how == "prologue")
+        reach_cache: Dict[int, Set[int]] = {}
         for target in call_targets:
             section = self.image.get_section_at_va(target)
             if not (section and section.executable):
                 continue
+            # A "call" read out of data can name an address in the middle of
+            # an instruction of a real function. Taking that as a function
+            # start cuts the real one short there, and its lifted body then
+            # ends without its epilogue on every path past the cut: Rainbow
+            # Six 3's XNet connect (0x003A8C6B, title update 0x501) lost its
+            # pops and `ret 0xC` to a "call" at 0x003B4D96 -- bytes of a
+            # table -- aimed at 0x003A8CDA, the second byte of a `je`. Each
+            # call left 36 bytes on the guest stack, the logon's saved
+            # registers came back wrong, and the title closed its own logon
+            # task. So: a target strictly inside an instruction that a
+            # prologue-found function reaches by its own control flow is not
+            # a function start.
+            if target not in self.engine.instructions:
+                cov = self.engine.instruction_covering(target)
+                if cov is not None and heads:
+                    i = bisect.bisect_right(heads, cov.address) - 1
+                    head = heads[i] if i >= 0 else None
+                    if head is not None and cov.address - head < 0x4000:
+                        if head not in reach_cache:
+                            reach_cache[head] = self.engine.recursive_descent(
+                                [head], [(head, head + 0x4000)])
+                        if cov.address in reach_cache[head]:
+                            inside_code += 1
+                            continue
             # A direct call to an executable address is the strongest evidence
             # of a function start there is -- stronger than a prologue match,
             # which is a guess about bytes. It used to be discarded whenever the
@@ -530,6 +558,9 @@ class FunctionDetector:
         if realigned or unaligned:
             print(f"  Realigned {realigned} call targets the sweep stepped over"
                   f" ({unaligned} rejected: bytes do not decode as a function)")
+        if inside_code:
+            print(f"  {inside_code} call target(s) rejected: inside an instruction"
+                  f" of a function's own code")
 
     def _pass_indirect_call_slots(self) -> None:
         """
