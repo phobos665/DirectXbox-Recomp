@@ -678,7 +678,7 @@ static void describe(Controller *c, char *out, size_t n)
 static struct {
     int ready;
     int on;
-    int sensitivity;        /* 1..20 */
+    int sensitivity;        /* RECOMP_MOUSE_SENSITIVITY_MIN..MAX */
     int deadzone;           /* percent of a full push any movement starts at */
 } g_look;
 
@@ -691,10 +691,11 @@ static void look_settings(void)
     g_look.on = recomp_config_bool("RECOMP_MOUSE_LOOK", "mouse_look", 0);
     v = recomp_config_int("RECOMP_MOUSE_SENSITIVITY", "mouse_sensitivity",
                           RECOMP_MOUSE_SENSITIVITY_DEFAULT);
-    g_look.sensitivity = v < 1 ? 1 : (v > 20 ? 20 : v);
+    g_look.sensitivity = v < RECOMP_MOUSE_SENSITIVITY_MIN ? RECOMP_MOUSE_SENSITIVITY_MIN
+                       : v > RECOMP_MOUSE_SENSITIVITY_MAX ? RECOMP_MOUSE_SENSITIVITY_MAX : v;
     v = recomp_config_int("RECOMP_MOUSE_DEADZONE", "mouse_deadzone",
                           RECOMP_MOUSE_DEADZONE_DEFAULT);
-    g_look.deadzone = v < 0 ? 0 : (v > 90 ? 90 : v);
+    g_look.deadzone = v < 0 ? 0 : (v > RECOMP_MOUSE_DEADZONE_MAX ? RECOMP_MOUSE_DEADZONE_MAX : v);
     g_look.ready = 1;
 }
 
@@ -967,9 +968,9 @@ static unsigned long long now_us(void)
  * next. Several guest threads may read the pad at once; the worst a race
  * here does is take one period's counts twice or not at all. */
 #define LOOK_PERIOD_US 12000ull
-/* Counts a second for a full push at sensitivity 1: at 5, the default, a
- * full push is 4,000 a second -- a quick flick on an 800 dpi mouse. */
-#define LOOK_FULL_SCALE 20000.0f
+/* Counts a second for a full push at sensitivity 1, so a full push at
+ * sensitivity s is this over s (recomp_config.h has the default). */
+#define LOOK_FULL_SCALE 100000.0f
 
 static unsigned long long g_look_at;
 static float g_look_speed[2];               /* the period before, counts a second */

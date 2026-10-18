@@ -201,8 +201,9 @@ typedef struct RecompSettings {
      * the bindings, because a camera on the mouse is right for one game and
      * a surprise in the next. */
     int  mouse_look;            /* 0 or 1 */
-    int  mouse_sensitivity;     /* 1..20 */
-    int  mouse_deadzone;        /* 0..90: percent of a push every movement starts at */
+    int  mouse_sensitivity;     /* RECOMP_MOUSE_SENSITIVITY_MIN..MAX */
+    int  mouse_deadzone;        /* 0..RECOMP_MOUSE_DEADZONE_MAX: percent of a push
+                                 * every movement starts at */
     char game_dir[512];         /* empty means beside the executable */
 
     /* System Link (src/kernel/xbox_net_udp.c). */
@@ -217,11 +218,21 @@ typedef struct RecompSettings {
  * number as XBOX_NET_DEFAULT_PORT, which the runtime falls back to. */
 #define RECOMP_SYSLINK_DEFAULT_PORT 27610
 
-/* Mouse look's defaults, which the runtime falls back to as well when the
- * file has no line. At 5 a full push is about 4,000 mouse counts a second;
- * 20% is just past the dead zone most pads are read with. */
-#define RECOMP_MOUSE_SENSITIVITY_DEFAULT 5
+/* Mouse look's defaults and ranges: the one place they are decided. The
+ * launcher's rows, the settings file and the runtime all read these, so a
+ * better default found by playing is a change here and nowhere else.
+ *
+ * Sensitivity: a full push of the stick at 100,000 / sensitivity mouse
+ * counts a second, so 25 is a full push at 4,000 -- a quick flick on an
+ * 800 dpi mouse -- and each step is 4% of the default.
+ * Deadzone: the percent of a push any movement starts at, so a slow one
+ * gets past the title's own dead zone. 20% is just past the one most pads
+ * are read with (XInput's 7849 of 32767 is 24%, measured radially). */
+#define RECOMP_MOUSE_SENSITIVITY_DEFAULT 25
+#define RECOMP_MOUSE_SENSITIVITY_MIN     1
+#define RECOMP_MOUSE_SENSITIVITY_MAX     100
 #define RECOMP_MOUSE_DEADZONE_DEFAULT    20
+#define RECOMP_MOUSE_DEADZONE_MAX        90
 
 void recomp_settings_defaults(RecompSettings *s);
 
