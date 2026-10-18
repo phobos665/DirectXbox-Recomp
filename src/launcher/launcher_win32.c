@@ -188,9 +188,20 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         InvalidateRect(h, NULL, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
-        launcher_click(LOWORD(lp), HIWORD(lp));
+        if (!launcher_mouse_button(LMOUSE_LEFT))
+            launcher_click(LOWORD(lp), HIWORD(lp));
         InvalidateRect(h, NULL, FALSE);
         return 0;
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN:
+        /* Only ever a binding being captured: the launcher has no other use
+         * for them. */
+        launcher_mouse_button(msg == WM_RBUTTONDOWN ? LMOUSE_RIGHT
+                              : msg == WM_MBUTTONDOWN ? LMOUSE_MIDDLE
+                              : GET_XBUTTON_WPARAM(wp) == XBUTTON2 ? LMOUSE_X2 : LMOUSE_X1);
+        InvalidateRect(h, NULL, FALSE);
+        return msg == WM_XBUTTONDOWN ? TRUE : 0;
     case WM_MOUSEMOVE:
         launcher_hover(LOWORD(lp), HIWORD(lp));
         InvalidateRect(h, NULL, FALSE);
