@@ -377,9 +377,10 @@ int recomp_settings_read(const char *path, RecompSettings *s)
         if ((v = from_table("mouse_look")) != NULL)
             s->mouse_look = !off_word(v);
         if ((v = from_table("mouse_sensitivity")) != NULL)
-            s->mouse_sensitivity = clamp_int(atoi(v), 1, 20);
+            s->mouse_sensitivity = clamp_int(atoi(v), RECOMP_MOUSE_SENSITIVITY_MIN,
+                                             RECOMP_MOUSE_SENSITIVITY_MAX);
         if ((v = from_table("mouse_deadzone")) != NULL)
-            s->mouse_deadzone = clamp_int(atoi(v), 0, 90);
+            s->mouse_deadzone = clamp_int(atoi(v), 0, RECOMP_MOUSE_DEADZONE_MAX);
         if ((v = from_table("game_dir")) != NULL)
             snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
         if ((v = from_table("syslink")) != NULL)
@@ -530,13 +531,13 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# another window takes it back.                  [RECOMP_MOUSE_LOOK]\n"
         "mouse_look = %d\n"
         "#\n"
-        "# How far a movement pushes the stick, 1 to 20.\n"
-        "#                                        [RECOMP_MOUSE_SENSITIVITY]\n"
+        "# How far a movement pushes the stick, %d to %d; %d is the default, a\n"
+        "# full push at %d mouse counts a second.  [RECOMP_MOUSE_SENSITIVITY]\n"
         "mouse_sensitivity = %d\n"
         "#\n"
         "# Where on the stick any movement starts, in percent of a full push,\n"
-        "# so a slow movement gets past the game's own dead zone. 0 to 90.\n"
-        "#                                           [RECOMP_MOUSE_DEADZONE]\n"
+        "# so a slow movement gets past the game's own dead zone. 0 to %d;\n"
+        "# %d is the default.                         [RECOMP_MOUSE_DEADZONE]\n"
         "mouse_deadzone = %d\n"
         "\n"
         "# Where the game's files are, if they are not beside the executable.\n"
@@ -545,8 +546,13 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         s->widescreen_2d[0] ? s->widescreen_2d : "auto",
         s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay,
         s->fullscreen, s->vrr, s->frame_interp < 1 ? 1 : s->frame_interp,
-        s->mouse_look ? 1 : 0, clamp_int(s->mouse_sensitivity, 1, 20),
-        clamp_int(s->mouse_deadzone, 0, 90));
+        s->mouse_look ? 1 : 0,
+        RECOMP_MOUSE_SENSITIVITY_MIN, RECOMP_MOUSE_SENSITIVITY_MAX,
+        RECOMP_MOUSE_SENSITIVITY_DEFAULT, 100000 / RECOMP_MOUSE_SENSITIVITY_DEFAULT,
+        clamp_int(s->mouse_sensitivity, RECOMP_MOUSE_SENSITIVITY_MIN,
+                  RECOMP_MOUSE_SENSITIVITY_MAX),
+        RECOMP_MOUSE_DEADZONE_MAX, RECOMP_MOUSE_DEADZONE_DEFAULT,
+        clamp_int(s->mouse_deadzone, 0, RECOMP_MOUSE_DEADZONE_MAX));
 
     if (s->game_dir[0])
         fprintf(f, "game_dir = %s\n", s->game_dir);

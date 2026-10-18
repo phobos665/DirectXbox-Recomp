@@ -81,7 +81,7 @@ int main(void)
     fclose(f);
     set_env("RECOMP_INPUT_CONFIG", path);
     set_env("RECOMP_MOUSE_LOOK", "1");
-    set_env("RECOMP_MOUSE_SENSITIVITY", "5");
+    set_env("RECOMP_MOUSE_SENSITIVITY", "25");
     set_env("RECOMP_MOUSE_DEADZONE", "20");
 
     check(recomp_mouse_look() == 1, "mouse look is on for a controller that reads something");

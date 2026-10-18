@@ -156,11 +156,27 @@ A stick says how fast to turn, so the push is proportional to the mouse's
 speed: the counts since the last look over the time since, worked out again
 at most every 12 ms whatever the title's polling rate, averaged with the
 period before (a 125 Hz mouse lands one report in some periods and two in
-others), and kept on the stick. `mouse_sensitivity` (1-20, default 5: a full
-push at about 4,000 counts a second) scales it. `mouse_deadzone` (percent,
-default 20) is where any movement starts, so a slow one gets past the
-title's own dead zone; it is in the settings file only
-(`RECOMP_MOUSE_DEADZONE`).
+others), and kept on the stick. Two settings shape it, both rows on the
+launcher's Input tab, lines in the title's settings file and environment
+variables:
+
+| setting | range | default | what it does |
+|---|---|---|---|
+| `mouse_sensitivity` (`RECOMP_MOUSE_SENSITIVITY`) | 1-100 | 25 | a full push at 100,000 / sensitivity counts a second, so 25 is 4,000 -- a quick flick on an 800 dpi mouse; each step is 4% of the default |
+| `mouse_deadzone` (`RECOMP_MOUSE_DEADZONE`) | 0-90 % | 20 | where on the stick the slightest movement starts, so a slow one gets past the title's own dead zone. Too low and slow movements do nothing; too high and the view creeps or jumps |
+
+**Tuning them.** The defaults and ranges are `RECOMP_MOUSE_*` in
+`src/config/recomp_config.h` and nowhere else: the launcher's rows, the
+settings file's comments and the runtime all read them, so a better default
+found by playing is a one-line change there. A setting already written to a
+title's file keeps its value, so a new default reaches a player who has
+never moved the row, and one who has keeps theirs. In the launcher, A or
+Enter on either row puts it back to the default. To try values without the
+launcher, set the environment variables, which beat the file; the
+`[INPUT] mouse look:` line at start-up says which values a run got.
+Players' pads differ from title to title in the dead zone they apply, so a
+deadzone that suits one title may not suit the next -- which is part of why
+these are per title.
 
 With it on, the window takes the pointer while it is in front: hidden and
 kept inside it. On Windows the motion is raw input (`WM_INPUT`), which keeps
