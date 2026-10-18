@@ -1,77 +1,84 @@
 # Xbox Live (Insignia) with a recompiled game
 
-[Insignia](https://insignia.live/) is a closed-source revival of the original
-Xbox Live, which Microsoft shut down in 2010. This guide is for players and
-for toolkit developers. The technical record is `docs/technical/xbox-live.md`.
+[Insignia](https://insignia.live/) is a revival of the original Xbox Live,
+which Microsoft shut down in 2010. A recompiled game carries its own Xbox
+Live client (XOnline and XNet, lifted with the game), so it can sign in to
+Insignia the way a console does, as long as it is given what a console has:
+a network connection, the console's identity, and the accounts on its disk.
 
-## 1. Summary and status
+This guide covers what a player has to do, step by step. How it works
+inside, and what it took, is in `docs/technical/xbox-live.md`. Each game
+project has its own page for the steps specific to that game; Rainbow Six 3's
+is `docs/xbox-live.md` in its repository.
 
-A recompiled game contains its own Xbox Live client (XOnline, lifted with
-the game). The runtime gives it what a console would: a network card with a
-cable, a router, the console's identity, and the accounts on its disk. With
-these, Rainbow Six 3 on macOS sends a Kerberos sign-in request and Insignia
-answers with a ticket: it accepts the console's identity, registration and
-machine account. **The game does not yet process that answer, so nobody
-can sign in yet.** That is the open problem.
+## Status
 
-| Piece | State |
+Checked end to end on macOS with Rainbow Six 3: it signs in, Insignia says a
+title update is required, the recompiled dashboard updater downloads and
+installs it, and the updated game signs in and plays online.
+
+| | |
 | --- | --- |
-| Network card on Windows and macOS/POSIX | done |
-| Router in the runtime (`syslink = nat`) | done; `tests/net_nat` |
-| Console identity from the player's backup | done; `tests/console_id` |
-| EEPROM block reads answer the real EEPROM | done |
-| Accounts copied onto the disk image | done |
-| Xbox Live block in hard-drive copies undone | Rainbow Six 3 only (`scripts/live_unpatch.py`) |
-| DNS lookup, Kerberos request, Insignia's reply | works |
-| Game processes the reply | **open** |
-| Ticket for the service, security gateway, matchmaking | not reached |
+| Sign-in (Kerberos, security gateway, logon) | works |
+| Title updates from Insignia | works, through the recompiled 5960 dashboard updater |
+| Friends, matchmaking, playing online | works (Rainbow Six 3) |
+| macOS | checked |
+| Windows, Linux | written, not yet run with Xbox Live |
+| Other titles | not yet tried; each may need its own steps (a Live block, a title update build) |
 
-## 2. For players
+## What you need
 
-### What you need
-
-- **Your own original Xbox, softmodded** (a save-game exploit that runs
-  homebrew such as the EvoX dashboard), to back up its identity.
-- **An Insignia subscription code** from insignia.live, and an email address.
-- **Your own game files**, built with this toolkit.
+- **Your own original Xbox, softmodded** (running homebrew such as the EvoX
+  dashboard), to register it with Insignia and back up its identity. The
+  recompiled game signs in **as your console**: it uses your console's
+  EEPROM, HDD key and accounts.
+- **An Insignia account** for that console (free; see insignia.live).
 - **FTP** to copy files off the console (EvoX, UnleashX and XBMC serve it).
+- **The game's files**, built with this toolkit.
 
 Terms used below:
 
 - **EEPROM**: a 256-byte chip holding the console's serial number, Ethernet
-  address and **online key** (the secret Xbox Live knows the console by).
+  address and **online key**, the secret Xbox Live knows the console by.
 - **HDD key**: a per-console key that signs data on the hard disk. Insignia
   refuses a console whose HDD key is all zeros.
 - **Machine account / user account**: the console's own account
-  (`SN.<serial>`) and your gamertag's. Both live on the hard disk.
+  (`SN.<serial>`) and your gamertag. Both live in the first sectors of the
+  console's hard disk.
 
-### Step 1: register and sign up, on the real console
+These files identify your console. **Never share or commit them.** Anyone with
+them can sign in as your console.
 
-Do this once, on the console itself.
+## Step 1: sign up on the real console
+
+Once, on the console itself:
 
 1. If your modded BIOS blocks Xbox Live, run Insignia's **xblunblock** first.
    It patches memory only, so it is gone at power-off.
 2. Run the **Insignia Setup Assistant** to register the console.
-3. In the dashboard's Xbox Live section, create the account with your
-   subscription code and the same email.
+3. Sign in once from the dashboard's Xbox Live section, so the console has
+   your gamertag on it.
 
-### Step 2: back up the console
+## Step 2: back up the console
 
-1. Run `E:\backups\eeprom\evoxdash.xbe` and choose **Backup eeprom** in
-   its menu. It writes `eeprom.bin`, `hddinfo.txt` and `disk.bin` (the
-   drive's first 512 KB, which holds the accounts).
-2. Back up **after** Step 1. Rename any older EvoX backup folder first, or
-   EvoX may not write a new one.
-3. Copy the files off over FTP.
+1. Run EvoX's EEPROM backup (`evoxdash.xbe`, menu **Backup eeprom**). It
+   writes `eeprom.bin`, `hddinfo.txt` and `disk.bin` (the first 512 KB of the
+   drive, which holds the accounts).
+2. Back up **after** Step 1. EvoX may keep an older backup instead of writing
+   a new one: rename any older backup folder first.
+3. Copy the three files off the console over FTP.
+4. For title updates (Step 5): also copy the console's **whole C: drive**
+   (`C:\`, about 100 MB): the dashboard, its `xodash\` folder with the online
+   updater, and its fonts and sounds.
 
-### Step 3: put the files in `xboxbackup/`
+## Step 3: put the files where the game finds them
 
-Create a folder `xboxbackup/` beside the game folder:
+Make a folder called `xboxbackup/` beside the game folder:
 
 ```text
-Rainbow-six-three-recomp/
-  game/            your game files
-  xboxbackup/      your console's identity (never commit or share)
+<game project>/
+  game/            the game's files
+  xboxbackup/      your console's identity
     eeprom.bin
     hddinfo.txt
     disk.bin
@@ -79,146 +86,201 @@ Rainbow-six-three-recomp/
 
 | File | Needed | What it gives |
 | --- | --- | --- |
-| `eeprom.bin` | yes | serial, Ethernet address, online key (checksums checked) |
-| `hddinfo.txt` | for the HDD key | its `XboxHDKey` line, the drive's serial and model |
-| `disk.bin` | for accounts | the machine and user accounts |
-| `bios.bin` | optional | not read today; for a future HDD-key tool |
+| `eeprom.bin` | yes | serial, Ethernet address, online key (its checksums are checked) |
+| `hddinfo.txt` | for the HDD key | its `XboxHDKey` line, and the drive's serial and model |
+| `disk.bin` | for the accounts | the machine account and your user account |
 
-Make it private (`chmod 700 xboxbackup`); the game project's `.gitignore`
-already excludes it. Alternatives: `console_dir = <folder>`
-(`RECOMP_CONSOLE_DIR`), or `console/` in the per-user settings folder.
-`console_dir = off` disables the identity.
+Make it private (`chmod 700 xboxbackup`). Game projects made from the
+toolkit's template keep it out of git.
 
-### Step 4: check the HDD key
+Elsewhere is fine too: set `console_dir = <folder>` (or `RECOMP_CONSOLE_DIR`),
+or use `console/` in the per-user settings folder. `console_dir = off` turns
+the identity off.
 
-The runtime takes the first HDD key it finds from: `RECOMP_XBOX_HD_KEY`,
-then `hd_key = <32 hex digits>` in `keys.ini` (per-user settings folder),
-then the `XboxHDKey` line of `hddinfo.txt`, then `hd_key.txt`.
+**The HDD key.** The runtime takes the first it finds, in this order:
+`RECOMP_XBOX_HD_KEY`, then `hd_key = <32 hex digits>` in `keys.ini` (per-user
+settings folder), then the `XboxHDKey` line of `hddinfo.txt`, then
+`hd_key.txt`. **EvoX's `hddkey.bin` is the drive's lock password, not the
+HDD key.**
 
-**EvoX's `hddkey.bin` is the drive's lock password, not the HDD key.** To
-cross-check, Ryzee119's xbox_eeprom_online (runs entirely in your browser)
-shows the key from `eeprom.bin`. Paste keys nowhere else.
+**The accounts** are copied from `disk.bin` onto the game's virtual disk the
+first time it runs. If you sign up again later, set
+`console_accounts = replace` for one run to take the new ones.
 
-### Step 5: run with the router on
+## Step 4: connect the game to the internet
 
-Set `syslink = nat` in the title's settings file (macOS:
-`~/Library/Application Support/xboxrecomp/titles/<title id>.conf`), or
-`RECOMP_SYSLINK=nat`. The DNS servers default to Insignia's (46.101.64.175)
-then 1.1.1.1; `net_dns` changes them. Then use the game's Xbox Live menu.
+Turn on the runtime's built-in router. Either set it in the game's settings
+file (macOS: `~/Library/Application Support/xboxrecomp/titles/<title id>.conf`):
 
-### What the log lines mean
+```ini
+syslink = nat
+```
+
+or set `RECOMP_SYSLINK=nat`. The game is given an address behind the router
+(10.0.2.15) and Insignia's DNS server (46.101.64.175, then 1.1.1.1;
+`net_dns` changes them). Then use the game's Xbox Live menu and sign in.
+
+Nothing needs to be opened on your home router to sign in. Hosting games
+works best with UDP port 3074 forwarded to this PC, as on a console.
+
+## Step 5: title updates
+
+Many games need an update before Insignia lets them sign in. The game then
+says **"A required update is available for the Xbox Live service"**. On a
+console, choosing OK runs the dashboard's online updater, which downloads the
+update and installs it on the hard disk (`E:\TDATA\<title id>\$u`); the game
+then runs the updated executable from there.
+
+The recompiled game does the same, with three more programs in the chain: the
+recompiled updater, and, after it, a build of the game made from the updated
+executable. The game's own page says how to build that one.
+
+### 5a. Build the online updater (once)
+
+The updater is the 5960 dashboard's `update.xbe`, recompiled. Its project is
+`titles/xodash-update` in the toolkit; its files come from your console's C:
+drive (Step 2).
+
+1. Make its game folder, `games/xodash-update/`, from your copy of C:
+   - the contents of `C:\xodash\` (`update.xbe`, `media\`, `audio\`, ...),
+     with `update.xbe` renamed to `default.xbe`;
+   - everything at the root of `C:\` beside them (`xboxdash.xbe`, `fonts\`,
+     `xodash\`, the `.xtf` fonts, `xboxdashdata.*`). On a disk that ignores
+     case, `C:\Audio` and `xodash\audio` are one folder: merge them.
+2. Make its XDK symbols, as for any title:
+   `.venv/bin/python -m tools.xdk_symbols games/xodash-update/default.xbe --cli <XbSymbolDatabaseCLI>`
+3. Link the folder into the project, lift and build:
+
+   ```bash
+   ln -s ../../games/xodash-update titles/xodash-update/game
+   .venv/bin/python scripts/recompile.py games/xodash-update/default.xbe \
+       --work-dir games/_pipeline/xodash-update --project titles/xodash-update
+   cmake -S titles/xodash-update -B titles/xodash-update/build/Release -G Ninja -DCMAKE_BUILD_TYPE=Release
+   cmake --build titles/xodash-update/build/Release --target xodash_update_recomp --parallel
+   ```
+
+### 5b. The settings that join the programs up
+
+| Setting | Environment | What it does |
+| --- | --- | --- |
+| `hdd_dir = <folder>` | `RECOMP_HDD_DIR` | One E: drive for every program, as on a console. The game writes its saves there, and the updater installs the update there. **Copy the game's existing `game/UDATA` and `game/TDATA` into it first**, or the game starts without its saves. |
+| `launch_map = <entries>` | `RECOMP_LAUNCH_MAP` | Which recompiled program to start when one launches another. `;`-separated `<name or title id>=<executable>`, optionally `\|<game folder>`. |
+| `disc_overlay = <folder>` | `RECOMP_DISC_OVERLAY` | Files that stand in for the disc's (see below). |
+| `system_dir = <folder>` | `RECOMP_SYSTEM_DIR` | The C: drive. The updater sets it to its own folder; you need not. |
+
+A launch map for a game whose title ID is `55530013`:
+
+```text
+update.xbe=<toolkit>/titles/xodash-update/build/Release/xodash_update_recomp|<game project>/game;55530013=<the update build of the game>|<game project>/game
+```
+
+The game folder after `|` is the updater's D: drive: on a console the updater
+runs from the game's disc and reads the disc's files to patch them.
+
+**`disc_overlay`, for a hard-drive copy.** An update is a set of patches
+against the disc's original files, each checked afterwards. A copy of a game
+made to run from a console's hard disk has its `default.xbe` patched (the
+original kept as `default.bak`), and often leaves out files the disc has. Put
+the originals in a folder and point `disc_overlay` at it:
+
+- `default.xbe`: a copy of the game's `default.bak`;
+- any file the update patches that your copy is missing (the game's page
+  says which).
+
+A disc ripped whole needs no overlay.
+
+### 5c. Run it
+
+Start the game with `syslink`, `hdd_dir`, `launch_map` and `disc_overlay`
+set. Sign in, choose **OK** on "A required update is available", then **Yes**
+in the updater. It downloads and installs the update ("Xbox Live is updating
+your system") and starts the game again, now updated.
+
+## What the log says
 
 | Line | Meaning |
 | --- | --- |
-| `[XBOX] console identity from <dir> (beside the game folder): eeprom.bin, Ethernet address XX:XX:XX:..., HDD key from hddinfo.txt` | identity loaded; only the maker prefix is printed |
-| `[XBOX] Xbox Live accounts copied from disk.bin onto the disk (sectors 8-15): 1 machine account, 1 user account` | accounts imported (first run only) |
-| `[NET] internet through this PC: the console is 10.0.2.15 behind the router at 10.0.2.2, DNS 46.101.64.175 then 1.1.1.1` | the game took its address |
+| `[XBOX] console identity from <folder>: eeprom.bin, Ethernet address XX:XX:XX:..., HDD key from hddinfo.txt` | identity loaded (only the maker's part of the address is printed) |
+| `[XBOX] Xbox Live accounts copied from disk.bin onto the disk ...` | accounts brought in (first run only) |
+| `[NET] internet through this PC: the console is 10.0.2.15 behind the router at 10.0.2.2, ...` | the game has its network address |
 | `[NET] DNS: AS.XBOXLIVE.COM, asked of 46.101.64.175` | sign-in has started |
-| `[NET] UDP from the console's port 3074 leaves this PC from port <n> (its own was taken)` | something else on this PC holds 3074 |
+| `[NET] UDP from the console's port 3074 leaves this PC from port <n> (its own was taken)` | something else on this PC holds 3074 (another copy of a game?) |
+| `[PATH] E: (\Device\Harddisk0\Partition1) is <folder> (hdd_dir)` | the shared E: drive is in use |
+| `[KERNEL] HalReturnToFirmware: launching '<path>' ... as <executable>` | one program handing over to the next (`launch_map`) |
+| `[KERNEL] HalReturnToFirmware: '<path>' ... has no recompiled image in launch_map` | the game asked for a program that is not recompiled or not mapped; it exits |
 
-### Troubleshooting
+No log line contains a key or an account secret.
 
-| Symptom | Cause | Fix |
+## Troubleshooting
+
+| Symptom | Likely cause | What to do |
 | --- | --- | --- |
-| "Cannot connect to Xbox Live" at once, no `[NET] DNS` lines | a hard-drive copy whose `default.xbe` has the Live block | lift a copy with it undone (Rainbow Six 3: `scripts/recompile.sh` does it); keep `default.bak` |
-| `accounts: none in .../disk.bin` | backup made before sign-up | sign up, rename the old EvoX backup folder, back up again |
-| Gamertag missing in game | same | same, then `console_accounts = replace` once |
+| "Cannot connect to Xbox Live" at once, and no `[NET] DNS` line | a hard-drive copy whose `default.xbe` blocks Xbox Live | lift a copy with the block undone (the game's page says how); keep `default.bak` |
+| no `[NET]` lines at all | the router is off | Step 4 |
+| `accounts: none in .../disk.bin`, or no gamertag in the game | backup made before signing up | sign up, rename the old backup folder, back up again; `console_accounts = replace` once |
 | `fails its checksums` | not an EEPROM dump, or damaged | back up again |
-| `no HDD key` or `HDD key is all zeros` | key not found, or `hddkey.bin` used | Step 4 |
-| Two copies cannot see each other in System Link | both load one identity | `console_dir = off` on one |
+| `no HDD key` or `HDD key is all zeros` | key not found, or `hddkey.bin` used | see "The HDD key" in Step 3 |
+| "A required update is available" | the game needs a title update | Step 5 |
+| the game closes on OK at "required update" | no `launch_map` entry for `update.xbe` | Step 5b |
+| "To use the Xbox Live Dashboard, your system must be updated" in the updater | the updater cannot see the dashboard on C: | Step 5a: `xboxdash.xbe` and `xodash\` must be in its game folder |
+| "Unable to continue due to technical difficulties" in the updater | it cannot reach the game's files on the shared E: | `hdd_dir` set for both programs, with the game's `TDATA` copied in |
+| the update fails part-way | a file the update patches is not the disc's original | `disc_overlay` (Step 5b) |
+| two copies cannot see each other in System Link | both load one identity | `console_dir = off` on one |
 
-### Playing fair
+## Playing fair
 
 Insignia's Terms of Use forbid probing, fuzzing, overloading or unauthorised
-access. Behave as an ordinary client and keep logs and captures private.
+access. The recompiled game behaves as an ordinary client; keep it that way,
+and keep logs and packet captures (`RECOMP_NET_PCAP`) private, since they hold
+your sign-in traffic.
 
-## 3. What was built
+## How it fits together
 
-| Component | File | Switches |
+| Piece | File | Settings |
 | --- | --- | --- |
-| Network card on POSIX: register access trapped by the fault handler (arm64 decoder), guest memory through a backdoor; with the card on, `PhyGetLinkState` reports a cable | `src/kernel/xbox_nic.c` | `syslink` (`RECOMP_SYSLINK`) |
-| Router: DHCP (console 10.0.2.15, router 10.0.2.2), ARP for the router, UDP out keeping the console's port when free, IP fragments both ways, ICMP echo to the router, TCP refused with a log line | `src/kernel/xbox_net_nat.c` | `syslink = nat`, `net_dns`, `RECOMP_NET_LOG`, `RECOMP_NET_PCAP=<file>`, `RECOMP_NET_FRESH_PORTS` |
-| Console identity: finds and validates the backup, resolves the HDD key, handles a symlinked game folder | `src/kernel/xbox_console_id.c` | `console_dir`, `RECOMP_XBOX_HD_KEY`, `keys.ini` |
-| EEPROM block reads (`XC_MAX_ALL` 0xFFFF, `XC_MAX_OS` 0xFF, `XC_MAX_FACTORY` 0x1FF) answer the player's EEPROM with the runtime's user settings laid over it | `src/kernel/kernel_xbox.c` (`console_eeprom`) | none |
-| Account import: sectors 8-15 of `disk.bin` onto `Partition0.img` in the save folder, once, when the image has no account | `xbox_console_import_accounts` | `console_accounts = import / replace / off` |
-| Live-block undo for one title | `Rainbow-six-three-recomp/scripts/live_unpatch.py` | run by `scripts/recompile.sh` |
+| Network card on Windows and POSIX | `src/kernel/xbox_nic.c` | `syslink` |
+| Router: DHCP, ARP, DNS servers, UDP (3074 kept as 3074), IP fragments, ICMP echo, TCP relayed over this PC's sockets | `src/kernel/xbox_net_nat.c` | `syslink = nat`, `net_dns`, `RECOMP_NET_LOG`, `RECOMP_NET_PCAP` |
+| Console identity: EEPROM, HDD key, drive serial and model | `src/kernel/xbox_console_id.c` | `console_dir`, `RECOMP_XBOX_HD_KEY`, `keys.ini` |
+| EEPROM reads, single settings and whole sections | `src/kernel/kernel_xbox.c` | none |
+| Accounts onto the virtual disk | `xbox_console_import_accounts` | `console_accounts = import / replace / off` |
+| One program launching another | `src/kernel/kernel_bridge.c` (`HalReturnToFirmware`) | `launch_map` |
+| Shared E:, the C: drive, the disc overlay | `src/kernel/kernel_path.c` | `hdd_dir`, `system_dir`, `disc_overlay` |
+| The online updater | `titles/xodash-update` | |
 
-On the disk: sector 8 is an index, sector 9 the machine account (domain
-`insignia.live`), the user account later (12 in the one backup seen).
+Diagnostics: `RECOMP_NET_PCAP=<file>` writes every network frame for
+Wireshark (private: it holds sign-in traffic); `RECOMP_XC_TRACE=1` logs each
+kernel crypto call and EEPROM query (caller, lengths, short fingerprints,
+never data).
 
-**Diagnostics.**
+## Lessons learned
 
-- `RECOMP_NET_PCAP=<file>`: every frame, for Wireshark. Holds sign-in
-  traffic: keep private.
-- `RECOMP_XC_TRACE=1`: each kernel crypto call, EEPROM query and
-  `PhyGetLinkState` (caller, lengths, results, short fingerprints; never
-  data). `RECOMP_XC_TRACE_BUDGET` caps it (default 3000 lines).
-
-No log line contains a secret.
-
-## 4. Lessons learned
-
-1. **Hard-drive copies block Live.** "HDD-ready" copies patch `default.xbe`
-   (original kept as `default.bak`): allowed media set to any, a media-check
-   `jge` to `jmp` at 0x000A05FA, and at 0x0038C6FD `test al,1; jnz` replaced
-   by four `nop`s. That last one makes `XOnlineLogon` fail with 0x80151000
-   (believed to be `XONLINE_E_LOGON_NO_NETWORK_CONNECTION`) without sending
-   a packet. "No traffic at all" points here first.
-2. **Single settings were not enough.** XNet reads the whole EEPROM in one
-   block at start-up; those reads returned zeros while each single query
-   answered correctly.
+1. **Hard-drive copies can block Xbox Live.** "HDD-ready" copies patch
+   `default.xbe` (original kept as `default.bak`). In Rainbow Six 3 the logon's
+   link test is replaced by four `nop`s, so it fails without sending a packet.
+   No network traffic at all points here first.
+2. **XNet reads the whole EEPROM at once.** Answering single settings was not
+   enough: the block reads returned zeros.
 3. **`hddkey.bin` is not the HDD key.** It is the drive's lock password.
-4. **The 500-byte HMAC checks are the cache partitions' signatures** (keyed
-   by the HDD key), not the accounts'. A start-up "HDD key does not verify"
-   check built on the wrong reading was removed.
-5. **A backup from before sign-up has no user account**, and EvoX may keep
+4. **A backup from before sign-up has no user account**, and EvoX may keep
    the old backup unless its folder is renamed.
-6. **No TCP needed.** Xbox Live tunnels TCP inside UDP 3074.
+5. **Title updates need TCP.** Sign-in and play tunnel everything through UDP
+   3074, but the updater downloads the update over plain HTTP.
+6. **Errors have to be NT's exact ones.** XNet's "would block" status, a
+   missing folder versus a missing file, an empty folder's first search: the
+   game and the updater branch on each, and a near miss sent them down their
+   failure paths.
+7. **One console is several programs.** The game, the updater and the
+   updated game share an E: drive, and the updater's D: is the game's disc.
 
-## 5. Proposed automation
+## Next steps
 
-Effort: S = days, M = one to two weeks, L = longer. Nothing here may ship a
-player's keys or any Microsoft key; items marked **local** handle secrets and
-must never send data off the PC.
-
-### Must
-
-| Item | What it does | Effort | Where |
-| --- | --- | --- | --- |
-| Live-patch detector and undoer | For every title, compare `default.xbe` with `default.bak`, or match known byte signatures per title; lift a copy with the Live block undone; report it. Replaces per-project scripts. Never edits the game's files. | M | `scripts/recompile.py` stage, signatures in `tools/xbe_parser/` |
-| Backup importer (**local**) | Accept an EvoX, UnleashX or XBMC backup folder, or pull it from the console over FTP; copy only `eeprom.bin`, `hddinfo.txt` and the first 512 KB of `disk.bin`; check checksums; set private permissions. | M | `tools/console_import/`, called by the launcher |
-| Doctor | One command that checks every prerequisite and prints a checklist: identity found, checksums, HDD key source, accounts present, Live patch status, `syslink = nat`, DNS reachable. Built on the runtime's own C code so it agrees with it. | S | `--live-check` flag in the runtime |
-| Launcher "Xbox Live" tab | Pick the backup folder; show identity status without secrets, accounts found (counts only), HDD key source, Live patch status, network mode `nat`, DNS; a **Test connection** button that only resolves a name and checks reachability. | M | `src/launcher/launcher.c`, new tab beside SYSTEM LINK |
-
-### Should
-
-| Item | What it does | Effort | Where |
-| --- | --- | --- | --- |
-| HDD-key resolver (**local**) | Decrypt the HDD key from `eeprom.bin` with the EEPROM key read from the player's own `bios.bin`. Ships no keys. | M | `xbox_console_id.c` |
-| Account refresh and memory-card import | A "refresh accounts" action (`replace` once); import accounts from a memory unit dump. | S/M | `xbox_console_id.c`, launcher |
-| Local Xombie profile | A development profile pointing DNS at a local [Xombie](https://github.com/xombieonline/xombie) (AGPL) server, so sign-in can be tested without touching Insignia. | M | `net_dns` profile, `docs/technical/` |
-| Bug-report bundle | Pack the log and XC trace with serials and addresses scrubbed; include a pcap only by explicit choice, preferably from Xombie. | S | `scripts/` |
-
-### Could
-
-| Item | What it does | Effort | Where |
-| --- | --- | --- | --- |
-| UPnP for UDP 3074 | Ask the home router to forward 3074, as Insignia's guide advises for hosting. | S | reuse `src/net/net_upnp.c` |
-| Dashboard recompilation | Register and sign up from inside the launcher, without the real console. | L | a new title project |
-
-## 6. Open questions and next steps
-
-1. **Why the reply is not processed.** No decryption crypto follows the
-   ticket. Check, in order: the reply reaches the game whole (pcap,
-   fragments); `RECOMP_XC_TRACE` around it; the kernel's crypto exports
-   against known answers; the BIOS-derived kernel keys, zeros today.
-2. **Compare against a local Xombie**, step by step.
-3. **Ask the Insignia team** (Discord) whether a recompiled client is
-   welcome before wider testing.
-4. **Other titles**: which carry a Live block, and where. OutRun 2 and
-   MechAssault are next.
-5. **One console, two clients**: can the real console and a recompiled build
-   share one identity safely?
+| Item | What it would do |
+| --- | --- |
+| Launcher "Xbox Live" tab | pick the backup folder, show what was found (never the secrets), set `syslink`, `hdd_dir` and `launch_map` |
+| Backup importer (local only) | take an EvoX, UnleashX or XBMC backup, check it, copy only what is needed, private permissions |
+| Doctor | one command that checks every step above and prints a checklist |
+| Live-block detector | for any title, compare `default.xbe` with `default.bak` and lift with the block undone |
+| Not mapped, so go back | when a game launches a program with no recompiled version, return to the game instead of exiting |
 
 Sources: Tristan Miller, *Reversing the Original Xbox Live Protocols*
 (DEF CON 30); feudalnate/Original-Xbox-LIVE-Account; xboxdevwiki.
