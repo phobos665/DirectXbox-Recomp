@@ -48,6 +48,9 @@
  * received frames go in on the next timer tick.
  */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE     /* dladdr, Dl_info */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

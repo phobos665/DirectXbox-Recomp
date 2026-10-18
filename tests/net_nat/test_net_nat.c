@@ -114,6 +114,24 @@ static uint32_t next_frame(XboxNat *n, uint8_t *out)
     return 0;
 }
 
+/* The next frame for the console within `ms`. The router answers some
+ * things only after this PC's own network has: a TCP SYN is answered once
+ * this PC's connect has succeeded or failed, and a refused connect to
+ * 127.0.0.1 takes about two seconds on Windows, which retries the SYN. */
+static uint32_t next_frame_ms(XboxNat *n, uint8_t *out, unsigned ms)
+{
+    unsigned waited;
+    for (waited = 0; waited <= ms; waited += 5) {
+        uint32_t len = xbox_net_nat_peek(n, out, XBOX_NET_FRAME_MAX);
+        if (len) {
+            xbox_net_nat_pop(n);
+            return len;
+        }
+        pause_ms(5);
+    }
+    return 0;
+}
+
 static int udp_checksum_ok(const uint8_t *ip, const uint8_t *u, uint32_t ulen)
 {
     uint32_t s = sum16(u, ulen, 0);
@@ -325,17 +343,132 @@ static void test_udp(XboxNat *n)
 
 /* ---- TCP and ICMP ---- */
 
-static void test_tcp_icmp(XboxNat *n)
+#ifdef _WIN32
+#define close_sock closesocket
+#else
+#define close_sock close
+#endif
+
+static uint16_t tcp_port_of(sock_t s)
 {
-    uint8_t f[XBOX_NET_FRAME_MAX], r[XBOX_NET_FRAME_MAX], t[20], e[16];
+    struct sockaddr_in a;
+    socklen_t al = sizeof a;
+    if (getsockname(s, (struct sockaddr *)&a, &al) != 0)
+        return 0;
+    return ntohs(a.sin_port);
+}
+
+/* A TCP socket on 127.0.0.1, listening when `listen_too`; else the port is
+ * bound and released, so nothing is there to answer. */
+static sock_t tcp_local(uint16_t *port, int listen_too)
+{
+    struct sockaddr_in a;
+    sock_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(LOOPBACK);
+    a.sin_port = 0;
+    bind(s, (const struct sockaddr *)&a, (int)sizeof a);
+    if (listen_too)
+        listen(s, 1);
+    *port = tcp_port_of(s);
+    return s;
+}
+
+static int wait_readable(sock_t s, unsigned ms)
+{
+    fd_set rd;
+    struct timeval tv;
+    FD_ZERO(&rd);
+    FD_SET(s, &rd);
+    tv.tv_sec = (long)(ms / 1000u);
+    tv.tv_usec = (long)(ms % 1000u) * 1000L;
+    return select((int)s + 1, &rd, NULL, NULL, &tv) > 0;
+}
+
+/* A segment from the console: 20-byte header, its window open. */
+static uint32_t tcp_frame(uint8_t *f, uint16_t sport, uint16_t dport, uint32_t seq,
+                          uint32_t ack, uint8_t flags, const char *data)
+{
+    uint8_t t[64];
+    uint32_t dl = data ? (uint32_t)strlen(data) : 0;
+    memset(t, 0, 20);
+    put16(t, sport); put16(t + 2, dport); put32(t + 4, seq); put32(t + 8, ack);
+    t[12] = 0x50; t[13] = flags; put16(t + 14, 16384);
+    if (dl)
+        memcpy(t + 20, data, dl);
+    return ip_frame(f, k_mac, 6, XBOX_NAT_CONSOLE, LOOPBACK, 7, 0, 0, t, 20 + dl);
+}
+
+/* The next TCP segment for the console, skipping anything else. */
+static uint32_t next_tcp(XboxNat *n, uint8_t *r, unsigned ms)
+{
+    uint32_t len;
+    while ((len = next_frame_ms(n, r, ms)) != 0)
+        if (len >= 54 && r[14 + 9] == 6)
+            return len;
+    return 0;
+}
+
+static void test_tcp_refused(XboxNat *n)
+{
+    uint8_t f[XBOX_NET_FRAME_MAX], r[XBOX_NET_FRAME_MAX];
+    uint16_t port;
     uint32_t len;
 
-    memset(t, 0, sizeof t);
-    put16(t, 1025); put16(t + 2, 80); put32(t + 4, 1000); t[12] = 0x50; t[13] = 0x02;
-    xbox_net_nat_send(n, f, ip_frame(f, k_mac, 6, XBOX_NAT_CONSOLE, LOOPBACK, 5, 0, 0, t, 20));
-    len = next_frame(n, r);
-    CHECK(len >= 54 && r[14 + 9] == 6 && (r[34 + 13] & 0x04), "no TCP reset for a SYN");
-    CHECK(len >= 54 && get32(r + 34 + 8) == 1001, "the reset does not ack the SYN");
+    close_sock(tcp_local(&port, 0));
+    xbox_net_nat_send(n, f, tcp_frame(f, 1025, port, 1000, 0, 0x02, NULL));
+    len = next_tcp(n, r, 5000);
+    CHECK(len && (r[34 + 13] & 0x04), "no TCP reset for a SYN to a closed port");
+    CHECK(len && get32(r + 34 + 8) == 1001, "the reset does not ack the SYN");
+}
+
+/* The router ends the console's connection and carries it over a socket of
+ * this PC's: handshake, then bytes each way. */
+static void test_tcp_relay(XboxNat *n)
+{
+    uint8_t f[XBOX_NET_FRAME_MAX], r[XBOX_NET_FRAME_MAX];
+    uint16_t port;
+    uint32_t len, iss = 0;
+    sock_t srv = tcp_local(&port, 1), peer;
+    char buf[16];
+    int got = 0, i;
+
+    xbox_net_nat_send(n, f, tcp_frame(f, 1026, port, 5000, 0, 0x02, NULL));
+    len = next_tcp(n, r, 5000);
+    CHECK(len && r[34 + 13] == 0x12, "no SYN-ACK once this PC has connected");
+    CHECK(len && get32(r + 34 + 8) == 5001, "the SYN-ACK does not ack the SYN");
+    if (len)
+        iss = get32(r + 34 + 4);
+
+    xbox_net_nat_send(n, f, tcp_frame(f, 1026, port, 5001, iss + 1, 0x10, NULL));
+    xbox_net_nat_send(n, f, tcp_frame(f, 1026, port, 5001, iss + 1, 0x18, "ping"));
+    peer = wait_readable(srv, 5000) ? accept(srv, NULL, NULL) : (sock_t)-1;
+    CHECK(peer != (sock_t)-1, "the relay did not reach the listening socket");
+    if (peer != (sock_t)-1) {
+        memset(buf, 0, sizeof buf);
+        if (wait_readable(peer, 5000))
+            recv(peer, buf, (int)sizeof buf - 1, 0);
+        CHECK(strcmp(buf, "ping") == 0, "this PC's socket did not get the console's bytes (\"%s\")", buf);
+        send(peer, "pong", 4, 0);
+        for (i = 0; i < 8 && !got; i++) {
+            len = next_tcp(n, r, 5000);
+            if (!len)
+                break;
+            if (len >= 58 && get32(r + 34 + 4) == iss + 1 && memcmp(r + 54, "pong", 4) == 0)
+                got = 1;
+        }
+        CHECK(got, "the console did not get this PC's bytes");
+        close_sock(peer);
+    }
+    xbox_net_nat_send(n, f, tcp_frame(f, 1026, port, 5005, iss + 5, 0x04, NULL));
+    close_sock(srv);
+}
+
+static void test_icmp(XboxNat *n)
+{
+    uint8_t f[XBOX_NET_FRAME_MAX], r[XBOX_NET_FRAME_MAX], e[16];
+    uint32_t len;
 
     memset(e, 0xAB, sizeof e);
     e[0] = 8; e[1] = 0; put16(e + 2, 0); put16(e + 2, fold(sum16(e, sizeof e, 0)));
@@ -364,7 +497,9 @@ int main(void)
     }
     test_dhcp_and_arp(n);
     test_udp(n);
-    test_tcp_icmp(n);
+    test_tcp_refused(n);
+    test_tcp_relay(n);
+    test_icmp(n);
     xbox_net_nat_close(n);
 
     if (failures) {
