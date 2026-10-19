@@ -5632,6 +5632,34 @@ HLE_EXPORT(D3DDevice_EnableOverlay)
     }
 }
 
+HLE_ORIGINAL(D3DDevice_GetDisplayFieldStatus);
+
+/* void D3DDevice_GetDisplayFieldStatus(D3DFIELD_STATUS *pFieldStatus)
+ *
+ * { Field, VBlankCount }, Field being D3DFIELD_ODD (1), _EVEN (2) or
+ * _PROGRESSIVE (3). The XDK's body writes the vblank count and, in an
+ * interlaced mode, a field from a device flag that its interrupt handler
+ * sets from the TV encoder -- which nothing here emulates, so the flag never
+ * changed and the field was odd for ever. Pro Evolution Soccer 5's XMV
+ * player starts its clock (and calls SynchPlayback) only on a field that is
+ * not odd, so its intro movie never began: the decoder queued two sound
+ * packets and waited on them for good, after the logos.
+ *
+ * The body still runs, for the count and for a progressive mode; an
+ * interlaced field is then taken from the count, so it alternates every
+ * vblank as the console's does. */
+HLE_EXPORT(D3DDevice_GetDisplayFieldStatus)
+{
+    uint32_t status = HLE_ARG(0);
+
+    HLE_CALL_ORIGINAL(D3DDevice_GetDisplayFieldStatus);
+    if (status) {
+        uint32_t field = HLE_MEM32(status);
+        if (field == 1u || field == 2u)
+            HLE_MEM32(status) = (HLE_MEM32(status + 4u) & 1u) ? 1u : 2u;
+    }
+}
+
 #ifdef _WIN32
 /* A picture the title decoded itself, put on the overlay plane.
  *
