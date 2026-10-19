@@ -1336,11 +1336,14 @@ static void shadow_read_declaration(int slot, uint32_t handle);
 void hle_d3d8_push_arrays_off(void);
 
 
+static int g_pushed_active;              /* below, with the pushed programs */
+
 static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
 {
     int i;
 
     hle_d3d8_push_arrays_off();
+    g_pushed_active = 0;                 /* the API's choice from here on */
     if (shadow_trace_on())
         fprintf(stderr, "[TRACE swap %lu] vertex shader 0x%08X (slot %u)\n",
                 g_shadow_swaps, handle, address);
@@ -1395,6 +1398,40 @@ static int g_pushed_entry = -1;
 static DWORD g_pushed_uncached;          /* the current one, when the cache is full */
 static unsigned long g_pushed_starts, g_pushed_failed;
 
+/* Around one of the walk's draws: the program the title started, if it has
+ * started one since the API last selected a shader. The selection is put
+ * back afterwards, on both sides. */
+typedef struct {
+    int used, is_program, kind, slot;
+} PushedProgramSave;
+
+static void pushed_program_begin(PushedProgramSave *s)
+{
+    s->used = g_shadow && g_pushed_active && g_pushed_entry >= 0;
+    if (!s->used)
+        return;
+    s->is_program = g_shadow_vs_is_program;
+    s->kind = g_shadow_vs_kind;
+    s->slot = g_shadow_vs_slot;
+    g_shadow_vs_is_program = 1;
+    g_shadow_vs_kind = SHADER_HOST_PROGRAM;
+    g_shadow_vs_slot = g_pushed_entry;
+    host_SetVertexShader(g_shadow, g_programs[g_pushed_entry].host);
+}
+
+static void pushed_program_end(const PushedProgramSave *s)
+{
+    if (!s->used)
+        return;
+    g_shadow_vs_is_program = s->is_program;
+    g_shadow_vs_kind = s->kind;
+    g_shadow_vs_slot = s->slot;
+    if (s->kind == SHADER_HOST_PROGRAM && s->slot >= 0)
+        host_SetVertexShader(g_shadow, g_programs[s->slot].host);
+    else if (!s->is_program)
+        host_SetVertexShader(g_shadow, g_shadow_vs);
+}
+
 void hle_d3d8_pb_program_started(const DWORD *microcode, int count)
 {
     struct shadow_program *p;
@@ -1429,24 +1466,19 @@ void hle_d3d8_pb_program_started(const DWORD *microcode, int count)
         g_pushed_entry = g_program_count++;
         memset(&g_programs[g_pushed_entry], 0, sizeof g_programs[g_pushed_entry]);
     }
+    /* Only the walk's own draws run it (pushed_program_begin): the title's
+     * API draws keep the shader the API selected, as the XDK's lazy state
+     * puts that back when it next draws. Made current for everything, the
+     * front end's 2D -- drawn through the API, with a fixed-function FVF --
+     * ran under it with no vertex layout, and 79,000 draws in a session were
+     * skipped as "program without layout": a main menu with no menu. */
     p = &g_programs[g_pushed_entry];
-    if (g_shadow_vs_slot != g_pushed_entry) {
-        /* Entered from an API selection: take its declaration along. */
-        if (g_shadow_vs_slot >= 0)
-            *p = g_programs[g_shadow_vs_slot];
-        else
-            memset(p, 0, sizeof *p);
-    }
+    memset(p, 0, sizeof *p);
     p->guest = 0xFFFFFFFEu;              /* no handle names it */
     p->host = host;
     p->kind = SHADER_HOST_PROGRAM;
     p->from_slot = 1;                    /* the host program is not this entry's */
-    if (p->has_declaration && g_shadow_vs_is_program)
-        shadow_read_declaration(g_pushed_entry, g_shadow_vs);
-    g_shadow_vs_is_program = 1;
-    g_shadow_vs_slot = g_pushed_entry;
-    g_shadow_vs_kind = SHADER_HOST_PROGRAM;
-    host_SetVertexShader(g_shadow, host);
+    g_pushed_active = 1;
     if (g_pushed_starts++ == 0)
         fprintf(stderr, "[HLE-D3D8] the title starts vertex programs it loads itself "
                 "(%d instructions first); drawn with those\n", count);
@@ -4139,8 +4171,25 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
  * the immediate-mode path already uses, and its own declaration put back.
  * 1 when drawn; 0 when no host program is selected (the caller then falls
  * back to the declaration path). `idx` NULL for a non-indexed draw. */
+static int draw_registers(uint32_t xpt, uint32_t nverts, const float (*verts)[16][4],
+                          const uint16_t *idx, uint32_t nidx);
+
+/* Only the walk draws this way, so a program the title started itself
+ * applies (pushed_program_begin). */
 int hle_d3d8_draw_registers(uint32_t xpt, uint32_t nverts, const float (*verts)[16][4],
                             const uint16_t *idx, uint32_t nidx)
+{
+    PushedProgramSave s;
+    int drawn;
+
+    pushed_program_begin(&s);
+    drawn = draw_registers(xpt, nverts, verts, idx, nidx);
+    pushed_program_end(&s);
+    return drawn;
+}
+
+static int draw_registers(uint32_t xpt, uint32_t nverts, const float (*verts)[16][4],
+                          const uint16_t *idx, uint32_t nidx)
 {
     struct shadow_program *p, saved;
     D3D8VshInput in[16];
@@ -4304,7 +4353,11 @@ void hle_d3d8_pb_inline_method(uint32_t method, uint32_t value)
         } else if (g_pbi_group) {
             g_pbi_groups++;
             if (g_inline_nverts) {
+                PushedProgramSave s;
+
+                pushed_program_begin(&s);   /* the title's own group */
                 inline_draw();
+                pushed_program_end(&s);
                 g_pbi_drawn++;
             }
             g_inline_on = 0;
