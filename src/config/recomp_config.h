@@ -223,15 +223,16 @@ typedef struct RecompSettings {
  * better default found by playing is a change here and nowhere else.
  *
  * Sensitivity: a full push of the stick at 100,000 / sensitivity mouse
- * counts a second, so 25 is a full push at 4,000 -- a quick flick on an
- * 800 dpi mouse -- and each step is 4% of the default.
+ * counts a second, so 80 is a full push at 1,250 -- an unhurried turn on an
+ * 800 dpi mouse -- and each step is 1.25% of the default.
  * Deadzone: the percent of a push any movement starts at, so a slow one
- * gets past the title's own dead zone. 20% is just past the one most pads
- * are read with (XInput's 7849 of 32767 is 24%, measured radially). */
-#define RECOMP_MOUSE_SENSITIVITY_DEFAULT 25
+ * gets past the title's own dead zone. 5% by default; raise it for a title
+ * whose own dead zone swallows slow movements.
+ * Both chosen by playing (Oct 2026; they were 25 and 20). */
+#define RECOMP_MOUSE_SENSITIVITY_DEFAULT 80
 #define RECOMP_MOUSE_SENSITIVITY_MIN     1
 #define RECOMP_MOUSE_SENSITIVITY_MAX     100
-#define RECOMP_MOUSE_DEADZONE_DEFAULT    20
+#define RECOMP_MOUSE_DEADZONE_DEFAULT    5
 #define RECOMP_MOUSE_DEADZONE_MAX        90
 
 void recomp_settings_defaults(RecompSettings *s);

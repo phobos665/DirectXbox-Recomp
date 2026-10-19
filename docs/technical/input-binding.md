@@ -162,8 +162,8 @@ variables:
 
 | setting | range | default | what it does |
 |---|---|---|---|
-| `mouse_sensitivity` (`RECOMP_MOUSE_SENSITIVITY`) | 1-100 | 25 | a full push at 100,000 / sensitivity counts a second, so 25 is 4,000 -- a quick flick on an 800 dpi mouse; each step is 4% of the default |
-| `mouse_deadzone` (`RECOMP_MOUSE_DEADZONE`) | 0-90 % | 20 | where on the stick the slightest movement starts, so a slow one gets past the title's own dead zone. Too low and slow movements do nothing; too high and the view creeps or jumps |
+| `mouse_sensitivity` (`RECOMP_MOUSE_SENSITIVITY`) | 1-100 | 80 | a full push at 100,000 / sensitivity counts a second, so 80 is 1,250 -- an unhurried turn on an 800 dpi mouse; each step is 1.25% of the default |
+| `mouse_deadzone` (`RECOMP_MOUSE_DEADZONE`) | 0-90 % | 5 | where on the stick the slightest movement starts, so a slow one gets past the title's own dead zone. Too low and slow movements do nothing; too high and the view creeps or jumps |
 
 **Tuning them.** The defaults and ranges are `RECOMP_MOUSE_*` in
 `src/config/recomp_config.h` and nowhere else: the launcher's rows, the
