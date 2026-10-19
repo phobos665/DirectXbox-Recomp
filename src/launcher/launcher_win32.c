@@ -206,6 +206,27 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         launcher_hover(LOWORD(lp), HIWORD(lp));
         InvalidateRect(h, NULL, FALSE);
         return 0;
+    case WM_MOUSEWHEEL: {
+        /* WHEEL_DELTA (120) a notch, positive away from the user, which is
+         * up the list. A touchpad sends fractions of a notch, kept until
+         * they add up to one. The position is in screen coordinates,
+         * signed (a second monitor to the left is negative). */
+        static int part;
+        POINT pt;
+        int rows;
+
+        part += GET_WHEEL_DELTA_WPARAM(wp);
+        rows = part / WHEEL_DELTA;
+        part -= rows * WHEEL_DELTA;
+        pt.x = (short)LOWORD(lp);
+        pt.y = (short)HIWORD(lp);
+        ScreenToClient(h, &pt);
+        if (rows) {
+            launcher_wheel(-rows, pt.x, pt.y);
+            InvalidateRect(h, NULL, FALSE);
+        }
+        return 0;
+    }
     case WM_TIMER:
         launcher_tick();
         InvalidateRect(h, NULL, FALSE);

@@ -47,6 +47,9 @@ void launcher_click(int x, int y);      /* the left button, in window units */
  * being captured: it means nothing else, and the click is not sent. */
 int  launcher_mouse_button(int button);
 void launcher_hover(int x, int y);
+/* The wheel turned: rows > 0 scrolls the list down, by whole rows, with the
+ * pointer at (x, y) in window units. */
+void launcher_wheel(int rows, int x, int y);
 void launcher_tick(void);               /* sixty times a second: pad, glow */
 void launcher_resize(int w, int h);     /* the client area, in window units */
 void launcher_draw(void);               /* into the theme's back buffer */

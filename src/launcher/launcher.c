@@ -1724,6 +1724,29 @@ void launcher_hover(int mx, int my)
         g_sel = i;
 }
 
+/* The wheel scrolls the one list that is longer than the window, the Input
+ * tab's, a row a notch. The selection stays on its row while that row is
+ * still in view, and the row under the pointer is then lit as a move would
+ * light it. The other tabs fit, so the wheel has nothing to do there. */
+void launcher_wheel(int rows, int mx, int my)
+{
+    int last = BIND_TOTAL_ROWS - BIND_ROWS_VISIBLE, top, k;
+
+    if (!rows || g_tab != TAB_INPUT || g_capturing)
+        return;
+    if (last < 0)
+        last = 0;
+    k = g_bind_top + g_sel;
+    top = g_bind_top + rows;
+    if (top < 0) top = 0;
+    if (top > last) top = last;
+    if (k < top) k = top;
+    if (k >= top + BIND_ROWS_VISIBLE) k = top + BIND_ROWS_VISIBLE - 1;
+    g_bind_top = top;
+    g_sel = k - top;
+    launcher_hover(mx, my);
+}
+
 void launcher_tick(void)
 {
     int dx, dy, a, b, t;
