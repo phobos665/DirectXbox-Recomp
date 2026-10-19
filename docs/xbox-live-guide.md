@@ -135,7 +135,7 @@ disc's.
 The recompiled game does the same with three programs: the game built from
 the disc, the recompiled updater, and a second build of the game made from
 the updated executable. A game project with a build script (Rainbow Six 3's
-`scripts/build.sh`) does all of the below for you; this is what it does.
+`scripts/build.py`) does all of the below for you; this is what it does.
 
 ### 5a. The online updater
 
