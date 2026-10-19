@@ -2192,7 +2192,7 @@ static void shadow_dump_frame(void)
 {
     ram_dump_at_swap();
     static const char *prefix;
-    static int configured, every = 300, written, keep_last;
+    static int configured, every = 300, written, keep_last, max_files = 24;
     static unsigned long min_draws, last_dump, from_swap;
     static char ring[24][512];
     static char asked_prefix[8];
@@ -2221,6 +2221,12 @@ static void shadow_dump_frame(void)
          * frames, as <prefix>_s<swap>.bmp. Without it a fast title fills the
          * 24 files in its first few hundred swaps: Outrun 2's matrix frames
          * all showed the intro logos while it was 90 seconds into a race. */
+        /* RECOMP_HLE_D3D8_DUMP_MAX=<n>: more than 24 files, for a run of
+         * consecutive frames long enough to catch a draw that drops out of
+         * one frame in many (flicker). */
+        e = getenv("RECOMP_HLE_D3D8_DUMP_MAX");
+        if (e && atoi(e) > 0)
+            max_files = atoi(e);
         e = getenv("RECOMP_HLE_D3D8_DUMP_KEEP_LAST");
         if (e && atoi(e) > 0)
             keep_last = atoi(e) > 24 ? 24 : atoi(e);
@@ -2237,7 +2243,7 @@ static void shadow_dump_frame(void)
     if (!asked) {
         if (!prefix || !*prefix || g_shadow_swaps < from_swap)
             return;
-        if (written >= 24 && !keep_last)
+        if (written >= max_files && !keep_last)
             return;
         if (min_draws) {
             if (g_frame_draws < min_draws ||

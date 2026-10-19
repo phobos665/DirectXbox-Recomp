@@ -57,6 +57,23 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
 void hle_d3d8_shadow_set_first_vertex(uint32_t first);
 void hle_d3d8_apply_pending_textures(void);   /* hle_d3d8_texture.c */
 void hle_d3d8_apply_pending_constants(void);  /* below */
+void hle_d3d8_texture_queue_reach(uint32_t addr);         /* hle_d3d8_texture.c */
+void hle_d3d8_texture_queue_flush(void);
+int  hle_d3d8_texture_queue_span(uint32_t lo, uint32_t hi);
+static uint32_t push_position(void);
+static int pb_on(void);
+int  hle_d3d8_pb_inline_on(void);
+
+/* Textures the XDK flushes at CDevice_SetStateVB bound by the walk, when it
+ * reaches them, rather than at the call (hle_d3d8_texture_queue_span).
+ * RECOMP_HLE_D3D8_TEX_BY_WALK=0 binds them at the call. */
+static int textures_by_walk(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_TEX_BY_WALK", 1);
+    return on && pb_on() && hle_d3d8_pb_inline_on();
+}
 
 #define CONTIG_BASE 0x80000000u
 #define CONTIG_SIZE (64u * 1024u * 1024u)    /* kernel.h XBOX_CONTIG_SIZE */
@@ -939,6 +956,8 @@ void hle_d3d8_push_constants_sync(void)
             goto resync;
         count = (w >> 18) & 0x7FFu;
         method = w & 0x1FFCu;
+        if (inl)
+            hle_d3d8_texture_queue_reach(va);
         if (pb_trace()) {
             uint32_t k;
             for (k = 0; k < count && k < 64u && guest_readable(va + 4u + 4u * k, 4u); k++)
@@ -1032,6 +1051,7 @@ void hle_d3d8_push_constants_sync(void)
     }
     pb_flush();
     flush_simple_states();
+    hle_d3d8_texture_queue_flush();
     g_pb_scan = put;
     walking = 0;
     return;
@@ -1039,6 +1059,7 @@ resync:
     walking = 0;
     pb_flush();
     flush_simple_states();
+    hle_d3d8_texture_queue_flush();
     g_pb_resyncs++;
     {
         static int said;
@@ -1192,14 +1213,22 @@ HLE_EXPORT(CDevice_SetStateVB)
     static int seen;
     uint32_t base = HLE_ARG(0);
 
+    uint32_t before, after;
+
     first_call(&seen, "CDevice_SetStateVB", base);
     if (original_missing(hle_original_CDevice_SetStateVB, "CDevice_SetStateVB"))
         HLE_RETURN(0u);
+    before = push_position();
     HLE_CALL_ORIGINAL(CDevice_SetStateVB);
+    after = push_position();
     g_base_vertex = base;
     g_base_vertex_seen = 1;
-    /* The XDK's lazy state goes out here, textures among it. */
-    hle_d3d8_apply_pending_textures();
+    /* The XDK's lazy state goes out here, textures among it: into the push
+     * buffer, where the walk binds them in the buffer's order
+     * (hle_d3d8_texture_queue_span), else at once. */
+    if (!(textures_by_walk() && before && after != before &&
+          hle_d3d8_texture_queue_span(before, after)))
+        hle_d3d8_apply_pending_textures();
     hle_d3d8_apply_pending_constants();
 }
 

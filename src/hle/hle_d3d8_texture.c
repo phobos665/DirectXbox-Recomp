@@ -1819,12 +1819,89 @@ static int lazy_textures_on(void)
     return on;
 }
 
+/* Binds the XDK flushed into the push buffer (CDevice_SetStateVB), held with
+ * the span it wrote until the walk reaches it.
+ *
+ * Made when SetStateVB was called, they overtook what the buffer held before
+ * that span and the walk had not drawn yet: a draw the title pushed itself,
+ * reached by a later walk, ran with the next object's textures. The XDK only
+ * writes a stage it thinks has changed, so the walk cannot always put the
+ * bind right from the methods alone. Turok: Evolution's terrain swapped two
+ * meshes' textures for one frame in forty or so -- a patch of bare ground or
+ * a missing water surface flickering in. */
+#define TEX_QUEUE 32u
+static struct { uint32_t lo, hi, mask, tex[MAX_STAGES]; } g_tex_q[TEX_QUEUE];
+static uint32_t g_tex_n;
+static unsigned long g_tex_by_walk;
+
+static void tex_queue_apply(uint32_t i)
+{
+    uint32_t stage;
+
+    for (stage = 0; stage < MAX_STAGES; stage++)
+        if (g_tex_q[i].mask & (1u << stage))
+            shadow_set_texture(stage, g_tex_q[i].tex[stage]);
+}
+
+/* Everything still held: the walk ended, or an API call is about to draw. */
+void hle_d3d8_texture_queue_flush(void)
+{
+    uint32_t i;
+
+    for (i = 0; i < g_tex_n; i++)
+        tex_queue_apply(i);
+    g_tex_n = 0;
+}
+
+/* The walk has reached addr: the binds held for a span holding it are made
+ * now, with every one held before them. A range that wrapped round the
+ * buffer has hi below lo. */
+void hle_d3d8_texture_queue_reach(uint32_t addr)
+{
+    uint32_t i, k;
+
+    for (i = 0; i < g_tex_n; i++) {
+        uint32_t lo = g_tex_q[i].lo, hi = g_tex_q[i].hi;
+        if (lo <= hi ? (addr >= lo && addr < hi) : (addr >= lo || addr < hi))
+            break;
+    }
+    if (i == g_tex_n)
+        return;
+    for (k = 0; k <= i; k++)
+        tex_queue_apply(k);
+    g_tex_n -= i + 1u;
+    memmove(&g_tex_q[0], &g_tex_q[i + 1u], g_tex_n * sizeof g_tex_q[0]);
+}
+
+/* SetStateVB wrote [lo, hi): the binds SetTexture recorded go with that span,
+ * for the walk. 0 when they cannot be held, and are to be made at once. */
+int hle_d3d8_texture_queue_span(uint32_t lo, uint32_t hi)
+{
+    uint32_t stage;
+
+    if (!g_pending_mask)
+        return 1;
+    if (g_tex_n >= TEX_QUEUE)
+        return 0;
+    g_tex_q[g_tex_n].lo = lo;
+    g_tex_q[g_tex_n].hi = hi;
+    g_tex_q[g_tex_n].mask = g_pending_mask;
+    for (stage = 0; stage < MAX_STAGES; stage++)
+        g_tex_q[g_tex_n].tex[stage] = g_pending_texture[stage];
+    g_tex_n++;
+    g_tex_by_walk++;
+    g_pending_mask = 0;
+    return 1;
+}
+
 /* The binds SetTexture recorded, made now: an API call is about to draw, or
- * the XDK has flushed its state. */
+ * the XDK has flushed its state. Any held for the walk go first: they were
+ * recorded before these. */
 void hle_d3d8_apply_pending_textures(void)
 {
     uint32_t stage;
 
+    hle_d3d8_texture_queue_flush();
     if (!g_pending_mask)
         return;
     for (stage = 0; stage < MAX_STAGES; stage++)
