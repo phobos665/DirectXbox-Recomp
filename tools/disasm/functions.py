@@ -1259,8 +1259,16 @@ class FunctionDetector:
         tests. A call does not count as running into it -- the call may never
         return (a throw helper, an exit) and the compiler puts the next
         function straight after it.
+
+        Nor does anything in front of nop or int3 padding when `addr` is laid
+        out as a function start (_is_padded_entry): what the sweep decoded
+        there may be data. BLiNX's 0x0011F7E0 follows a switch's byte index
+        table (0x91..0xA5, which decode as xchg, popfd, sahf, movsd) and four
+        nops; refused, the function was never lifted and the first call to it
+        crashed the title.
         """
         a = addr
+        padded = False
         for _ in range(32):
             prev = None
             for back in range(1, 16):
@@ -1275,8 +1283,9 @@ class FunctionDetector:
                 return False
             if self._is_filler(prev):
                 a = prev.address
+                padded = True
                 continue
-            return True
+            return not (padded and self._is_padded_entry(addr))
         return False
 
     def _is_padded_entry(self, addr: int) -> bool:

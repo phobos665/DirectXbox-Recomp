@@ -26,18 +26,18 @@ BASE = 0x00010000
 TAIL = b"\x83\xc3\x10" + b"\x3b\xf8" + b"\x7c\xf0" + b"\x5f\x5b\xc3"
 
 
-def _detector(before):
+def _detector(before, body=TAIL):
     """
     BASE+0x00  the installer: mov dword [esi], BASE+0x40; ret
     BASE+0x40 - len(before)   `before`
-    BASE+0x40  TAIL, which returns: the returning-body probe accepts it
+    BASE+0x40  `body`, which returns: the returning-body probe accepts it
     """
     code = bytearray(b"\xcc" * 0x100)
     target = BASE + 0x40
     code[0x00:0x06] = b"\xc7\x06" + target.to_bytes(4, "little")
     code[0x06] = 0xc3
     code[0x40 - len(before):0x40] = before
-    code[0x40:0x40 + len(TAIL)] = TAIL
+    code[0x40:0x40 + len(body)] = body
     code = bytes(code)
     sec = _Section(BASE, code)
     sec.data = code
@@ -66,6 +66,23 @@ def test_a_target_code_runs_into_is_not():
 
 def test_nor_across_alignment_filler():
     det, sec, target = _detector(b"\xc3\x47\x8d\x49\x00")  # inc edi; lea ecx,[ecx+0]
+    det._pass_imm_ref_targets([sec])
+    assert target not in det._candidates, det._candidates
+
+
+def test_a_padded_entry_after_data_is_found():
+    # BLiNX: a switch's byte index table, which decodes as one-byte
+    # instructions that never end, then nops up to an aligned function.
+    entry = b"\x8b\x44\x24\x04" + b"\x83\xc0\x10" + b"\xc3"  # mov eax,[esp+4]; add eax,16; ret
+    det, sec, target = _detector(b"\xc3" + b"\x9d\x9d\x9e\x9e" + b"\x90" * 4, entry)
+    det._pass_imm_ref_targets([sec])
+    assert target in det._candidates, det._candidates
+
+
+def test_but_not_a_loop_head_whose_body_is_no_function():
+    # The same padding in front of TAIL, which pops what it never pushed: the
+    # middle of a function, as in Turok, and still refused.
+    det, sec, target = _detector(b"\xc3" + b"\x9d\x9d\x9e\x9e" + b"\x90" * 4)
     det._pass_imm_ref_targets([sec])
     assert target not in det._candidates, det._candidates
 
