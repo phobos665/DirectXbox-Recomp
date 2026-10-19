@@ -65,6 +65,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "platform/host_main.h"   /* host_exe_path: where F11 writes */
 #include "hle.h"
 #include "recomp_config.h"
 
@@ -2008,6 +2009,22 @@ unsigned long hle_d3d8_screen_changes(void)
 /* Set by the key that asks for the frame on screen; see overlay_frame. */
 static int g_dump_requested;
 
+/* `name` in the executable's own folder: where F11's picture and capture go.
+ * They were relative names, so they landed in the folder the game was started
+ * from -- / for a game opened from Finder, which cannot be written, and the
+ * key appeared to do nothing. Falls back to the bare name. */
+void hle_d3d8_beside_exe(char *out, size_t bytes, const char *name)
+{
+    char dir[1024];
+
+    if (host_exe_path(dir, sizeof dir)) {
+        host_path_dirname(dir);
+        snprintf(out, bytes, "%s/%s", dir, name);
+    } else {
+        snprintf(out, bytes, "%s", name);
+    }
+}
+
 static void shadow_dump_next_frame(void)
 {
     g_dump_requested = 1;
@@ -2196,7 +2213,7 @@ static void shadow_dump_frame(void)
     static int configured, every = 300, written, keep_last, max_files = 24;
     static unsigned long min_draws, last_dump, from_swap;
     static char ring[24][512];
-    static char asked_prefix[8];
+    static char asked_prefix[1024];
     int asked;
     char path[512];
 
@@ -2238,7 +2255,7 @@ static void shadow_dump_frame(void)
     asked = g_dump_requested;
     g_dump_requested = 0;
     if (asked && (!prefix || !*prefix)) {
-        snprintf(asked_prefix, sizeof asked_prefix, "frame");
+        hle_d3d8_beside_exe(asked_prefix, sizeof asked_prefix, "frame");
         prefix = asked_prefix;
     }
     if (!asked) {
