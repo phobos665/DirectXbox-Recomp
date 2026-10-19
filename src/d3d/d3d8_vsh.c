@@ -1629,6 +1629,36 @@ static int hor_plus_all_targets(void)
     return all;
 }
 
+/* The Hor+ factor a draw's projection register gets as the constants reach
+ * the host: 1 off the screen, once a title has claimed the factor, and when
+ * RECOMP_HOR_PLUS_TARGETS=all has already applied it at upload. */
+static float hor_plus_for_draw(BOOL to_screen)
+{
+    if (!to_screen || hor_plus_all_targets() || g_hor_plus_claimed)
+        return 1.0f;
+    return hor_plus_factor();
+}
+
+/* Widen the projection register of a constant file about to reach the host. */
+static void hor_plus_widen(NV2AVSConstants *k, float factor)
+{
+    int reg = d3d8_vsh_hor_plus_reg(), i;
+
+    if (factor == 1.0f || reg < 0 || reg >= NV2A_VS_MAX_CONSTANTS)
+        return;
+    for (i = 0; i < 4; i++)
+        k->c[reg][i] *= factor;
+}
+
+const float *d3d8_vsh_constants_for_draw(int to_screen)
+{
+    static NV2AVSConstants copy;
+
+    memcpy(&copy, &g_vsh_constants, sizeof copy);
+    hor_plus_widen(&copy, hor_plus_for_draw(to_screen != 0));
+    return &copy.c[0][0];
+}
+
 float xbox_D3D8ClaimHorPlus(void)
 {
     float factor;
@@ -1968,8 +1998,8 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
         float zoom = camera_zoom();
         BOOL screen = d3d8_target_is_screen();
         BOOL want = zoom != 1.0f && screen;
-        float hp = hor_plus_all_targets() || g_hor_plus_claimed ? 1.0f : hor_plus_factor();
-        BOOL widen = hp != 1.0f && screen;
+        float hp = hor_plus_for_draw(screen);
+        BOOL widen = hp != 1.0f;
 
         if (want != zoomed || widen != widened)
             g_vsh_constants_dirty = TRUE;
@@ -1977,14 +2007,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
             mapped = rhi_buffer_map(g_vsh_cb, RHI_MAP_WRITE_DISCARD);
             if (mapped) {
                 memcpy(mapped, &g_vsh_constants, sizeof(g_vsh_constants));
-                if (widen) {
-                    int reg = d3d8_vsh_hor_plus_reg(), k;
-                    float (*c)[4] = ((NV2AVSConstants *)mapped)->c;
-
-                    if (reg >= 0 && reg < NV2A_VS_MAX_CONSTANTS)
-                        for (k = 0; k < 4; k++)
-                            c[reg][k] *= hp;
-                }
+                hor_plus_widen((NV2AVSConstants *)mapped, hp);
                 if (want) {
                     int reg = d3d8_vsh_hor_plus_reg(), k;
                     float (*c)[4] = ((NV2AVSConstants *)mapped)->c;
