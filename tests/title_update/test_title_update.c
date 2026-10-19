@@ -11,6 +11,13 @@
 
 #include "kernel.h"
 
+/* The module looks for executables by name, with Windows' .exe. */
+#ifdef _WIN32
+#define X ".exe"
+#else
+#define X ""
+#endif
+
 /* ---- stubs ------------------------------------------------------------ */
 
 static const char *s_exe = "/play/rs3_recomp";
@@ -126,15 +133,15 @@ int main(void)
     /* The updater, from updater/ beside the game's executable, with the
      * game's folder as its D:. */
     reset();
-    s_files[0] = "/play/updater/xodash_update_recomp";
+    s_files[0] = "/play/updater/xodash_update_recomp" X;
     CHECK(xbox_launch_default("\\Device\\CdRom0;update.xbe", 0x55530013u, out, sizeof out),
           "updater in updater/ not found");
-    CHECK(strcmp(out, "/play/updater/xodash_update_recomp|/repo/game") == 0, "got %s", out);
+    CHECK(strcmp(out, "/play/updater/xodash_update_recomp" X "|/repo/game") == 0, "got %s", out);
 
     /* Beside the executable wins over updater/. */
-    s_files[1] = "/play/xodash_update_recomp";
+    s_files[1] = "/play/xodash_update_recomp" X;
     CHECK(xbox_launch_default("D:\\UPDATE.XBE", 0x55530013u, out, sizeof out), "beside");
-    CHECK(strcmp(out, "/play/xodash_update_recomp|/repo/game") == 0, "got %s", out);
+    CHECK(strcmp(out, "/play/xodash_update_recomp" X "|/repo/game") == 0, "got %s", out);
 
     /* The updater setting wins over both. */
     s_settings[0][0] = "updater"; s_settings[0][1] = "/elsewhere/upd";
@@ -147,7 +154,7 @@ int main(void)
           "found an updater that is not there: %s", out);
 
     /* Another XBE is not the updater. */
-    s_files[0] = "/play/xodash_update_recomp";
+    s_files[0] = "/play/xodash_update_recomp" X;
     CHECK(!xbox_launch_default("\\Device\\CdRom0;downloader.xbe", 0x55530013u, out, sizeof out),
           "downloader.xbe taken for the updater: %s", out);
 
@@ -205,9 +212,9 @@ int main(void)
                                0x55530013u, out, sizeof out), "mapped $u with no build: %s", out);
 
     /* And with it beside: started, with the game folder and the XBE. */
-    s_files[1] = "/play/rs3_tu501_recomp";
+    s_files[1] = "/play/rs3_tu501_recomp" X;
     xbox_title_update_handoff(0x55530013u, "/repo/game", "rs3_tu501_recomp");
-    CHECK(strcmp(s_launched, "/play/rs3_tu501_recomp") == 0, "launched %s", s_launched);
+    CHECK(strcmp(s_launched, "/play/rs3_tu501_recomp" X) == 0, "launched %s", s_launched);
     v = getenv("RECOMP_TITLE_UPDATE_XBE");
     CHECK(v && strcmp(v, s_files[0]) == 0, "update XBE %s", v ? v : "(none)");
     v = getenv("RECOMP_GAME_DIR");
@@ -217,7 +224,7 @@ int main(void)
      * $u does not. */
     CHECK(xbox_launch_default("\\Device\\Harddisk0\\Partition1\\TDATA\\55530013\\$u\\default.xbe",
                               0x55530013u, out, sizeof out), "$u not mapped");
-    CHECK(strcmp(out, "/play/rs3_tu501_recomp|/repo/game") == 0, "got %s", out);
+    CHECK(strcmp(out, "/play/rs3_tu501_recomp" X "|/repo/game") == 0, "got %s", out);
     CHECK(!xbox_launch_default("\\Device\\Harddisk0\\Partition1\\TDATA\\4D530004\\$u\\default.xbe",
                                0x4D530004u, out, sizeof out), "another title's $u mapped: %s", out);
 

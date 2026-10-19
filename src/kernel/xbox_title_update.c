@@ -47,7 +47,10 @@
 static void tu_setenv(const char *name, const char *value)
 {
 #ifdef _WIN32
-    SetEnvironmentVariableA(name, value);   /* what CreateProcess passes on */
+    /* Both: the process's block is what CreateProcess passes on, the CRT's
+     * copy is what getenv (and recomp_config_lookup) reads in this one. */
+    _putenv_s(name, value ? value : "");    /* "" removes it */
+    SetEnvironmentVariableA(name, value);
 #else
     if (value)
         setenv(name, value, 1);
