@@ -81,6 +81,7 @@
 void hle_d3d8_push_constants_sync(void);   /* hle_d3d8_vertex.c */
 int  hle_d3d8_pb_walking(void);             /* hle_d3d8_vertex.c */
 void hle_d3d8_apply_pending_textures(void); /* hle_d3d8_texture.c */
+void hle_d3d8_apply_pending_constants(void); /* hle_d3d8_vertex.c */
 void hle_d3d8_push_skip(void);
 int  hle_d3d8_pb_inline_on(void);
 
@@ -6105,8 +6106,10 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
     if (!g_shadow || !verts || !stride || !count)
         return;
     hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
-    if (!hle_d3d8_pb_walking())
+    if (!hle_d3d8_pb_walking()) {
         hle_d3d8_apply_pending_textures();
+        hle_d3d8_apply_pending_constants();
+    }
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
@@ -6165,8 +6168,10 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
     if (!g_shadow || !idx || !verts || !stride || !count)
         return;
     hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
-    if (!hle_d3d8_pb_walking())
+    if (!hle_d3d8_pb_walking()) {
         hle_d3d8_apply_pending_textures();
+        hle_d3d8_apply_pending_constants();
+    }
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {

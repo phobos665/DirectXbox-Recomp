@@ -56,6 +56,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
                                   const void *verts, uint32_t stride, int from_buffer);
 void hle_d3d8_shadow_set_first_vertex(uint32_t first);
 void hle_d3d8_apply_pending_textures(void);   /* hle_d3d8_texture.c */
+void hle_d3d8_apply_pending_constants(void);  /* below */
 
 #define CONTIG_BASE 0x80000000u
 #define CONTIG_SIZE (64u * 1024u * 1024u)    /* kernel.h XBOX_CONTIG_SIZE */
@@ -452,6 +453,7 @@ static int pb_array_method(uint32_t method)
  * itself reads, they broke TimeSplitters 2's front end. */
 int hle_d3d8_state_store_simple(uint32_t method, uint32_t value);
 int  hle_d3d8_title_ltcg(void);
+int  hle_d3d8_simple_states_by_walk(void);   /* below */
 /* ...and the title's own clears: SET_ZSTENCIL_CLEAR_VALUE (0x1D8C),
  * SET_COLOR_CLEAR_VALUE (0x1D90), CLEAR_SURFACE (0x1D94, which clears) and
  * SET_CLEAR_RECT_HORIZONTAL / _VERTICAL (0x1D98, 0x1D9C). */
@@ -819,6 +821,58 @@ int hle_d3d8_pb_walking(void)
     return walking;
 }
 
+/* Simple render states SetRenderState_Simple wrote into the push buffer, for
+ * the walk to store when it reaches them (hle_d3d8_simple_states_by_walk).
+ * Only these: the same methods also carry the XDK's own transient changes,
+ * which must not reach the state array (above). Whatever a walk did not meet
+ * -- a resync, a span it never read -- is stored when the walk ends, which is
+ * still after everything pushed before it. */
+#define SIMPLE_QUEUE 64u
+static struct { uint32_t lo, hi, method, value; } g_simple_q[SIMPLE_QUEUE];
+static uint32_t g_simple_n;
+static unsigned long g_simple_by_walk;
+
+int hle_d3d8_queue_simple_state(uint32_t lo, uint32_t hi, uint32_t method, uint32_t value)
+{
+    if (!hle_d3d8_simple_states_by_walk() || g_simple_n >= SIMPLE_QUEUE)
+        return 0;
+    g_simple_q[g_simple_n].lo = lo;
+    g_simple_q[g_simple_n].hi = hi;
+    g_simple_q[g_simple_n].method = method;
+    g_simple_q[g_simple_n].value = value;
+    g_simple_n++;
+    g_simple_by_walk++;
+    return 1;
+}
+
+/* A simple-state method the walk met at addr: stored if an API call put it
+ * there. A range that wrapped round the buffer has hi below lo. */
+static void walk_simple_state(uint32_t addr, uint32_t method)
+{
+    uint32_t i;
+
+    for (i = 0; i < g_simple_n; i++) {
+        uint32_t lo = g_simple_q[i].lo, hi = g_simple_q[i].hi;
+        int in = lo <= hi ? (addr >= lo && addr < hi) : (addr >= lo || addr < hi);
+
+        if (!in || g_simple_q[i].method != method)
+            continue;
+        (void)hle_d3d8_state_store_simple(method, g_simple_q[i].value);
+        g_simple_n--;
+        memmove(&g_simple_q[i], &g_simple_q[i + 1], (g_simple_n - i) * sizeof g_simple_q[0]);
+        return;
+    }
+}
+
+static void flush_simple_states(void)
+{
+    uint32_t i;
+
+    for (i = 0; i < g_simple_n; i++)
+        (void)hle_d3d8_state_store_simple(g_simple_q[i].method, g_simple_q[i].value);
+    g_simple_n = 0;
+}
+
 void hle_d3d8_push_constants_sync(void)
 {
     uint32_t device, put, va, ret = 0, words = 0;
@@ -943,6 +997,8 @@ void hle_d3d8_push_constants_sync(void)
                 if (inl && ((m >= PB_SIMPLE_FIRST && m < PB_SIMPLE_END) || m == PB_SWATH)) {
                     if (!g_w_nodraw && hle_d3d8_title_ltcg())
                         (void)hle_d3d8_state_store_simple(m, v);
+                    else
+                        walk_simple_state(va + 4u + 4u * i, m);
                 } else if (inl && m >= PB_CLEAR_FIRST && m < PB_CLEAR_END) {
                     g_clear_reg[(m - PB_CLEAR_FIRST) / 4u] = v;
                     if (pb_surface_trace())
@@ -975,12 +1031,14 @@ void hle_d3d8_push_constants_sync(void)
         words += count;
     }
     pb_flush();
+    flush_simple_states();
     g_pb_scan = put;
     walking = 0;
     return;
 resync:
     walking = 0;
     pb_flush();
+    flush_simple_states();
     g_pb_resyncs++;
     {
         static int said;
@@ -1142,6 +1200,7 @@ HLE_EXPORT(CDevice_SetStateVB)
     g_base_vertex_seen = 1;
     /* The XDK's lazy state goes out here, textures among it. */
     hle_d3d8_apply_pending_textures();
+    hle_d3d8_apply_pending_constants();
 }
 
 void hle_d3d8_push_skip(void);
@@ -1365,7 +1424,140 @@ static void forward_constants(uint32_t reg, uint32_t data, uint32_t count)
         count = MAX_CONSTANT_REGISTERS - reg;
     if (!guest_readable(data, (uint64_t)count * 16u))
         return;
+    if (pb_trace()) {
+        const float *f = (const float *)HLE_PTR(data);
+        fprintf(stderr, "[PB swap %lu] API constants c%u..c%u = %g %g %g %g ...\n",
+                hle_d3d8_shadow_swaps(), reg, reg + count - 1u, f[0], f[1], f[2], f[3]);
+    }
     host_vsh_set_constant((int)reg, (const float *)HLE_PTR(data), (int)count);
+}
+
+/* Constants an API setter recorded without writing them into the push buffer.
+ *
+ * Some XDK builds keep a constant set through the API in the device and write
+ * it to the push buffer only when the XDK next draws, as SetTexture does.
+ * Until then the title's own pushed draws run with what the registers held.
+ * Turok: Evolution (4627) sets the next character's transform (c96..c99)
+ * through the API while a tree trunk it pushed itself, with its own pushed
+ * transform, is still to be drawn; applied at once, the trunk was drawn with
+ * Turok's transform and stood out of his back in the opening cutscene.
+ *
+ * So a setter that writes its constants into the push buffer leaves them to
+ * the walk, which applies them in the buffer's order (api_constants). One
+ * whose body leaves the push buffer where it was (nothing written: the build
+ * keeps it for later) has its values held here and applied at the next draw
+ * an API call makes or at CDevice_SetStateVB -- the points
+ * hle_d3d8_apply_pending_textures marks too.
+ * RECOMP_HLE_D3D8_LAZY_CONSTANTS=0 applies every one at once, as before. */
+static float    g_pending_c[MAX_CONSTANT_REGISTERS][4];
+static uint8_t  g_pending_c_mark[MAX_CONSTANT_REGISTERS];
+static int      g_pending_c_any;
+static unsigned long g_constants_deferred, g_constants_immediate, g_constants_by_walk;
+
+static uint32_t push_position(void)
+{
+    uint32_t device = hle_var_D3D_g_pDevice ? HLE_MEM32(hle_var_D3D_g_pDevice) : 0u;
+
+    return device && guest_readable(device, 4u) ? HLE_MEM32(device) : 0u;
+}
+
+/* Where the XDK's next push-buffer write goes, 0 when unknown: a setter that
+ * moves it wrote its state into the buffer, for the walk to apply in order. */
+uint32_t hle_d3d8_push_position(void)
+{
+    return push_position();
+}
+
+/* Simple render states (SetRenderState_Simple: alpha test, blend enable and
+ * the other states with one NV2A method each) stored into the title's state
+ * array by the walk, in the push buffer's order, rather than at call time.
+ * The call writes its method into the buffer; stored at once, it overtook a
+ * draw the title had reserved space for earlier in the buffer and filled in
+ * afterwards. Turok: Evolution turns alpha test and blending off for its next
+ * object while the last grass clump it pushed itself is still queued: drawn
+ * with them off, the clump's transparent texels came out as black slabs
+ * beside the path. RECOMP_HLE_D3D8_RS_BY_WALK=0 stores at call time. */
+int hle_d3d8_simple_states_by_walk(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_RS_BY_WALK", 1);
+    return on && pb_on() && hle_d3d8_pb_inline_on();
+}
+
+static int lazy_constants_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_LAZY_CONSTANTS", 1);
+    return on;
+}
+
+/* After a setter's own body: at once, or held, by whether the body wrote. */
+static void api_constants(uint32_t reg, uint32_t data, uint32_t count, uint32_t push_before)
+{
+    uint32_t i;
+
+    if (!lazy_constants_on() || !push_before) {
+        g_constants_immediate++;
+        forward_constants(reg, data, count);
+        return;
+    }
+    if (push_position() != push_before) {
+        /* The body wrote them into the push buffer, where the walk applies
+         * them in the buffer's order, which is the GPU's. Applied here, at
+         * call time, they overtook what the title had already reserved
+         * space for earlier in the buffer and filled in after this call:
+         * Turok: Evolution's tree trunk took the next character's transform
+         * and stood out of Turok's back in the opening cutscene. */
+        if (pb_on()) {
+            g_constants_by_walk++;
+            if (pb_trace())
+                fprintf(stderr, "[PB swap %lu] API constants c%u..c%u written to the push "
+                        "buffer at 0x%08X: applied by the walk\n", hle_d3d8_shadow_swaps(),
+                        reg, reg + count - 1u, push_before);
+            return;
+        }
+        g_constants_immediate++;
+        forward_constants(reg, data, count);
+        return;
+    }
+    if (!hle_d3d8_shadow_device() || !data || !count || reg >= MAX_CONSTANT_REGISTERS)
+        return;
+    if (count > MAX_CONSTANT_REGISTERS - reg)
+        count = MAX_CONSTANT_REGISTERS - reg;
+    if (!guest_readable(data, (uint64_t)count * 16u))
+        return;
+    if (pb_trace()) {
+        const float *f = (const float *)HLE_PTR(data);
+        fprintf(stderr, "[PB swap %lu] API constants c%u..c%u held for the next API draw = "
+                "%g %g %g %g ...\n", hle_d3d8_shadow_swaps(), reg, reg + count - 1u,
+                f[0], f[1], f[2], f[3]);
+    }
+    memcpy(g_pending_c[reg], HLE_PTR(data), (size_t)count * 16u);
+    for (i = 0; i < count; i++)
+        g_pending_c_mark[reg + i] = 1;
+    g_pending_c_any = 1;
+    if (g_constants_deferred++ == 0)
+        fprintf(stderr, "[HLE-D3D8] this XDK holds API vertex shader constants until it "
+                "next draws; so does the host (RECOMP_HLE_D3D8_LAZY_CONSTANTS=0 to apply "
+                "them at once)\n");
+}
+
+void hle_d3d8_apply_pending_constants(void)
+{
+    uint32_t r, first;
+
+    if (!g_pending_c_any)
+        return;
+    for (r = 0; r < MAX_CONSTANT_REGISTERS; r++) {
+        if (!g_pending_c_mark[r])
+            continue;
+        for (first = r; r < MAX_CONSTANT_REGISTERS && g_pending_c_mark[r]; r++)
+            g_pending_c_mark[r] = 0;
+        host_vsh_set_constant((int)first, g_pending_c[first], (int)(r - first));
+    }
+    g_pending_c_any = 0;
 }
 
 /* void __fastcall D3DDevice_SetVertexShaderConstant1(int Register,
@@ -1373,6 +1565,7 @@ static void forward_constants(uint32_t reg, uint32_t data, uint32_t count)
 HLE_EXPORT(D3DDevice_SetVertexShaderConstant1)
 {
     static int seen;
+    uint32_t before;
     uint32_t reg = g_ecx;
     uint32_t data = g_edx;
 
@@ -1380,8 +1573,9 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant1)
     if (original_missing(hle_original_D3DDevice_SetVertexShaderConstant1,
                          "D3DDevice_SetVertexShaderConstant1"))
         HLE_RETURN(0u);
+    before = push_position();
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstant1);
-    forward_constants(reg, data, 1u);
+    api_constants(reg, data, 1u, before);
 }
 
 /* void __fastcall D3DDevice_SetVertexShaderConstant1Fast(int Register,
@@ -1396,6 +1590,7 @@ HLE_ORIGINAL(D3DDevice_SetVertexShaderConstant1Fast);
 HLE_EXPORT(D3DDevice_SetVertexShaderConstant1Fast)
 {
     static int seen;
+    uint32_t before;
     uint32_t reg = g_ecx;
     uint32_t data = g_edx;
 
@@ -1403,8 +1598,9 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant1Fast)
     if (original_missing(hle_original_D3DDevice_SetVertexShaderConstant1Fast,
                          "D3DDevice_SetVertexShaderConstant1Fast"))
         HLE_RETURN(0u);
+    before = push_position();
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstant1Fast);
-    forward_constants(reg, data, 1u);
+    api_constants(reg, data, 1u, before);
 }
 
 /* void __fastcall D3DDevice_SetVertexShaderConstant4(int Register,
@@ -1412,6 +1608,7 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant1Fast)
 HLE_EXPORT(D3DDevice_SetVertexShaderConstant4)
 {
     static int seen;
+    uint32_t before;
     uint32_t reg = g_ecx;
     uint32_t data = g_edx;
 
@@ -1419,8 +1616,9 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant4)
     if (original_missing(hle_original_D3DDevice_SetVertexShaderConstant4,
                          "D3DDevice_SetVertexShaderConstant4"))
         HLE_RETURN(0u);
+    before = push_position();
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstant4);
-    forward_constants(reg, data, 4u);
+    api_constants(reg, data, 4u, before);
 }
 
 /* void __fastcall D3DDevice_SetVertexShaderConstantNotInline(int Register,
@@ -1433,6 +1631,7 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant4)
 HLE_EXPORT(D3DDevice_SetVertexShaderConstantNotInline)
 {
     static int seen;
+    uint32_t before;
     uint32_t reg = g_ecx;
     uint32_t data = g_edx, floats = HLE_ARG(0);
 
@@ -1440,16 +1639,18 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstantNotInline)
     if (original_missing(hle_original_D3DDevice_SetVertexShaderConstantNotInline,
                          "D3DDevice_SetVertexShaderConstantNotInline"))
         HLE_RETURN(0u);
+    before = push_position();
     g_in_notinline++;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstantNotInline);
     g_in_notinline--;
-    forward_constants(reg, data, floats / 4u);
+    api_constants(reg, data, floats / 4u, before);
 }
 
 /* The same, the XDK's faster variant.                                        */
 HLE_EXPORT(D3DDevice_SetVertexShaderConstantNotInlineFast)
 {
     static int seen;
+    uint32_t before;
     uint32_t reg = g_ecx;
     uint32_t data = g_edx, floats = HLE_ARG(0);
 
@@ -1457,9 +1658,10 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstantNotInlineFast)
     if (original_missing(hle_original_D3DDevice_SetVertexShaderConstantNotInlineFast,
                          "D3DDevice_SetVertexShaderConstantNotInlineFast"))
         HLE_RETURN(0u);
+    before = push_position();
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstantNotInlineFast);
     if (!g_in_notinline)
-        forward_constants(reg, data, floats / 4u);
+        api_constants(reg, data, floats / 4u, before);
 }
 
 /* void __stdcall D3DDevice_SetVertexShaderConstant(INT Register,
@@ -1491,6 +1693,7 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstantNotInlineFast)
 HLE_EXPORT(D3DDevice_SetVertexShaderConstant)
 {
     static int seen;
+    uint32_t before;
     uint32_t reg   = HLE_ARG(0) + XBOX_VSH_CONSTANT_BIAS;
     uint32_t data  = HLE_ARG(1);
     uint32_t count = HLE_ARG(2);
@@ -1509,8 +1712,9 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant)
     if (original_missing(hle_original_D3DDevice_SetVertexShaderConstant,
                          "D3DDevice_SetVertexShaderConstant"))
         HLE_RETURN(0u);
+    before = push_position();
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstant);
-    forward_constants(reg, data, count);
+    api_constants(reg, data, count, before);
 }
 
 /* Walk what a replaced call's own body just wrote, without drawing it. For
