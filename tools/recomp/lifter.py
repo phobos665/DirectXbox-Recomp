@@ -2399,12 +2399,8 @@ class Lifter:
     def _lift_imul(self, insn, ops):
         nops = len(ops)
         if nops == 1:
-            # One operand: edx:eax = eax * ops[0]
-            src = _fmt_operand_read(ops[0])
-            return [
-                f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-            ]
+            # One operand, at the operand's width (_one_operand_multiply).
+            return self._one_operand_multiply(ops[0], signed=True)
         elif nops == 2:
             # Two operand: dst = dst * src
             dst = _fmt_operand_read(ops[0])
@@ -2417,15 +2413,50 @@ class Lifter:
             return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
         return ["/* imul: unexpected form */"]
 
+    def _one_operand_multiply(self, op, signed):
+        """mul/imul with one operand, at that operand's width.
+
+        x86 multiplies AL by a byte into AX, AX by a word into DX:AX, and EAX
+        by a dword into EDX:EAX. Every form used to be lifted as the dword
+        one, so `imul bl` overwrote all of eax and edx -- the same mistake
+        div had (below). Pro Evolution Soccer 5's libpng computes a row's
+        pixel depth with `imul bl` while edx holds the image height, and the
+        height that reached png_set_IHDR was the product's high half: 0. D3DX
+        then allocated an empty image and an empty row table, libpng wrote
+        each row through whatever that table's memory held, and the rows
+        landed on the heap's own free lists.
+        """
+        src = _fmt_operand_read(op)
+        width = _operand_width(op) or 4
+        if width == 1:
+            if signed:
+                expr = f"(uint32_t)((int32_t)(int8_t)LO8(eax) * (int32_t)(int8_t){src})"
+            else:
+                expr = f"(uint32_t)LO8(eax) * (uint32_t)(uint8_t){src}"
+            return [f"SET_LO16(eax, {expr});"]
+        if width == 2:
+            if signed:
+                prod = f"(uint32_t)((int32_t)(int16_t)LO16(eax) * (int32_t)(int16_t){src})"
+            else:
+                prod = f"(uint32_t)LO16(eax) * (uint32_t)(uint16_t){src}"
+            return [f"{{ uint32_t _r = {prod};",
+                    "  SET_LO16(eax, _r); SET_LO16(edx, _r >> 16); }"]
+        if signed:
+            return [
+                f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
+                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
+            ]
+        return [
+            f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
+            f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
+        ]
+
     def _lift_muldiv(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
         src = _fmt_operand_read(ops[0])
         if m == "mul":
-            return [
-                f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-            ]
+            return self._one_operand_multiply(ops[0], signed=False)
         # div/idiv at the operand's width. x86 divides AX by a byte (quotient
         # in AL, remainder in AH), DX:AX by a word, and EDX:EAX by a dword;
         # every form used to be lifted as the dword one, so `div cl` divided
