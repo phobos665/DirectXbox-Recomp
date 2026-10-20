@@ -3067,11 +3067,16 @@ static int cpu_frame_present(void)
     return g_cpu_frame_live;
 }
 
+/* When the title last finished a frame (frame_end_shadow). */
+static DWORD g_last_frame_end;
+
 static void frame_end_shadow(void)
 {
     if (g_shadow) {
         DWORD now = GetTickCount();
         DWORD thread = GetCurrentThreadId();
+
+        g_last_frame_end = now;
 
         /* Which guest threads swap, against the one that created the device.
          * Capped, in case they alternate. */
@@ -5660,7 +5665,6 @@ HLE_EXPORT(D3DDevice_GetDisplayFieldStatus)
     }
 }
 
-#ifdef _WIN32
 /* A picture the title decoded itself, put on the overlay plane.
  *
  * The plane's picture came only from hle_xmv.c, which decodes XMV movies on
@@ -5738,7 +5742,6 @@ static void overlay_from_surface(uint32_t surface)
     }
     d3d8_movie_set_frame(bgra, w, h);
 }
-#endif
 
 /* void D3DDevice_UpdateOverlay(D3DSurface *pSurface, const RECT *SrcRect,
  *     const RECT *DstRect, BOOL EnableColorKey, D3DCOLOR ColorKey)          */
@@ -5749,15 +5752,34 @@ HLE_EXPORT(D3DDevice_UpdateOverlay)
     first_call(&seen, "D3DDevice_UpdateOverlay", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_UpdateOverlay, "D3DDevice_UpdateOverlay"))
         HLE_RETURN(0u);
-#ifdef _WIN32
     /* Before the body: it pops the arguments. */
     overlay_from_surface(HLE_ARG(0));
-#endif
     HLE_CALL_ORIGINAL(D3DDevice_UpdateOverlay);
     /* A title that never calls EnableOverlay still means the plane to show
      * when it updates it; the XDK turns it on at the first update. */
     g_overlay_enabled = 1;
     g_overlay_updated = HLE_ARG(0) != 0;
+
+    /* The overlay is a plane the scan-out shows whether or not the title
+     * flips, and a movie player may only ever update it: Pro Evolution
+     * Soccer 5's intro calls UpdateOverlay for each decoded frame and no
+     * Swap at all, so the host, which shows the movie when a frame ends,
+     * showed nothing and the intro was black with its sound playing. With
+     * no frame ended for a while, the update is shown on its own. A title
+     * that swaps as well (Future Perfect) never gets here. */
+    if (g_shadow && g_overlay_updated &&
+        GetTickCount() - g_last_frame_end > 100u) {
+        static int said;
+        if (!said++) {
+            fprintf(stderr, "[HLE-D3D8] overlay: the title updates the video overlay "
+                    "without swapping; each update is shown on its own (guest "
+                    "thread %lu, device on %lu)\n", (unsigned long)GetCurrentThreadId(),
+                    (unsigned long)g_shadow_create_thread);
+            fflush(stderr);
+        }
+        d3d8_movie_draw();
+        host_Swap(g_shadow, 0);
+    }
 }
 
 /* void D3DDevice_SetRenderTargetFast(D3DSurface *pRenderTarget,
