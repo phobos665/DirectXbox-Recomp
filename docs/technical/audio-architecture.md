@@ -106,6 +106,9 @@ The boundary is in the wrong place for a toolkit that wants every title.
    Halo's 3936 keeps a pointer where the rate should be, so its buffers are not
    modelled at all (`settings_in_layout`); Tony Hawk's 2X (3947) needs its own
    check. Under LTCG a replaced function may not exist as a function at all.
+   (Since Oct 2026 a title whose DirectSound predates 4134 starts on the APU
+   path unless `RECOMP_AUDIO`/`audio` says otherwise, `audio_path.c`: Tony
+   Hawk's Pro Skater 3, 4039, has every buffer heard there and none natively.)
 2. **Each replacement has to reproduce semantics nobody wrote down.** The
    hardware's behaviour is reconstructed from what titles were seen to need:
    Pause modes, Max Payne's repeated `SetFrequency`, Dino Crisis 3's volume
