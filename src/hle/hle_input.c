@@ -182,6 +182,21 @@ static int is_gamepad(uint32_t type)
            type == hle_var_g_DeviceType_Gamepad;
 }
 
+/* RECOMP_INPUT_LOG=1: the device enumeration a title asks for, which is
+ * where a pad that is never opened goes missing. The first calls for each
+ * device type, then any that reported something, with the caller. */
+static void enumeration_log(const char *what, uint32_t type, uint32_t a, uint32_t b)
+{
+    static unsigned said;
+
+    if (!input_log_wanted() || (said >= 24u && !a && !b) || said >= 200u)
+        return;
+    said++;
+    fprintf(stderr, "[INPUT] %s(type 0x%08X%s) -> 0x%X / 0x%X, from 0x%08X\n", what,
+            type, is_gamepad(type) ? ", gamepad" : "", a, b, HLE_MEM32(g_esp));
+    fflush(stderr);
+}
+
 /* DWORD XGetDevices(PXPP_DEVICE_TYPE type) -- bitmask of connected ports. */
 HLE_EXPORT(XGetDevices)
 {
@@ -193,6 +208,7 @@ HLE_EXPORT(XGetDevices)
         mask = recomp_input_get_devices(&g_model);
     }
     unlock();
+    enumeration_log("XGetDevices", type, mask, 0u);
     HLE_RETURN(mask);
 }
 
@@ -211,6 +227,7 @@ HLE_EXPORT(XGetDeviceChanges)
     unlock();
     if (ins_va) HLE_MEM32(ins_va) = insertions;
     if (rem_va) HLE_MEM32(rem_va) = removals;
+    enumeration_log("XGetDeviceChanges", type, insertions, removals);
     HLE_RETURN(changed ? 1u : 0u);
 }
 
@@ -218,12 +235,25 @@ HLE_EXPORT(XGetDeviceChanges)
 HLE_EXPORT(XInputOpen)
 {
     uint32_t type = HLE_ARG(0), port = HLE_ARG(1), slot = HLE_ARG(2), handle = 0u;
-    static int said;
+    static int said, said_missing;
 
     lock();
+    /* A title need not ask what is connected before it opens a port: Tony
+     * Hawk's Pro Skater 3 (XDK 4039) enumerates only memory units and opens
+     * pads straight away, so with the connected ports refreshed only by the
+     * two enumeration calls above every open failed and its menus never read
+     * the pad. The console's USB attaches a pad whether or not anyone asked. */
+    if (is_gamepad(type))
+        refresh_connected();
     if (is_gamepad(type) && slot == 0u)
         handle = recomp_input_open(&g_model, port);
     unlock();
+    if (!handle && input_log_wanted() && said_missing < 8) {
+        said_missing++;
+        fprintf(stderr, "[INPUT] XInputOpen(type 0x%08X, port %u, slot %u) -> no pad, "
+                        "from 0x%08X\n", type, port + 1u, slot, HLE_MEM32(g_esp));
+        fflush(stderr);
+    }
     if (handle && !said) {
         said = 1;
         fprintf(stderr, "[INPUT] XInputOpen port %u (%s) -> handle 0x%08X\n",

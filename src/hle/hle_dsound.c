@@ -194,7 +194,7 @@ static void unlock(void) { LeaveCriticalSection(&g_lock); }
  * instead of every 0.34 s, and the movie, paced by that cursor, froze where
  * it wrapped. The build comes from the XBE's own library table, which the
  * loader copies to 0x00010000 with the rest of the image header. */
-static uint32_t dsound_build(void)
+uint32_t hle_dsound_library_build(void)
 {
     static uint32_t build = 0xFFFFFFFFu;
     uint32_t n, table, i;
@@ -222,6 +222,8 @@ static uint32_t dsound_build(void)
             build, BUF_DATA + (build >= 5455u ? 4u : 0u));
     return build;
 }
+
+static uint32_t dsound_build(void) { return hle_dsound_library_build(); }
 
 static uint32_t buf_shift(void)
 {
