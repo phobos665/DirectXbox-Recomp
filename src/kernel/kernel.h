@@ -561,6 +561,10 @@ void xbox_path_init(const char* game_dir, const char* save_dir);
  * before xbox_path_init has run. */
 int xbox_path_save_dir_utf8(char *out, size_t n);
 
+/* The game folder xbox_path_init was given, as UTF-8, the same way. The
+ * console's own identity is looked for beside it (xbox_console_id.c). */
+int xbox_path_game_dir_utf8(char *out, size_t n);
+
 /*
  * Character type of a translated host path. The Win32 file APIs take wide
  * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on
@@ -602,6 +606,36 @@ const char *xbox_mods_dir(int i);
 typedef void (*xbox_mods_walk_fn)(const char *rel, const char *host_path,
                                   unsigned long long size, void *ctx);
 int xbox_mods_walk(int mod, const char *sub, xbox_mods_walk_fn fn, void *ctx);
+
+/* "\Device\Harddisk0\PartitionN\" (1-5, trailing separator): a volume's
+ * root directory (kernel_path.c). */
+int xbox_path_is_volume_root(const char *xbox_path);
+
+/* The disc overlay folder (disc_overlay, else a disc_overlay folder beside
+ * the executable holding a default.xbe), or NULL (kernel_path.c). */
+const char *xbox_path_disc_overlay(void);
+
+/* Title updates (xbox_title_update.c). The installed update's XBE,
+ * E:\TDATA\<id>\$u\default.xbe, as a host path when it exists; E: is hdd_dir,
+ * else game_dir. Before the memory layout has run, set the title first
+ * (recomp_config_set_title) so its settings are the ones read. */
+int xbox_title_update_xbe(uint32_t title_id, const char *game_dir, char *out, size_t n);
+
+/* The disc's build, after xbox_path_init: when the title's update is
+ * installed and its build (update_exe, a file name beside this executable,
+ * or title_update_exe) exists, start that in this one's place, as a console
+ * starts $u\default.xbe. Returns only when it does not. */
+void xbox_title_update_handoff(uint32_t title_id, const char *game_dir, const char *update_exe);
+
+/* A launch with no launch_map entry: the dashboard's update.xbe is the
+ * recompiled updater beside this executable (or updater), this title's
+ * $u\default.xbe its update's build, and a title the executable that
+ * launched this one. "exe|game folder" in out. */
+int xbox_launch_default(const char *xbox_path, uint32_t title_id, char *out, size_t n);
+
+/* Before a hand-off: how the launched image finds its way back here, and
+ * the settings it must share (hdd_dir, console_dir, syslink, disc_overlay). */
+void xbox_launch_note_return(void);
 
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)

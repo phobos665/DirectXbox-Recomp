@@ -176,6 +176,23 @@ static void test_widescreen_resolution(void)
     }
 }
 
+/* What the guest is told: 16:9 only for a title with a mode of its own.
+ * A Hor+ title is told 4:3, so it draws its whole frame for the runtime to
+ * widen, instead of fitting a 4:3 picture into a 16:9 one itself. */
+static void test_guest_flag(void)
+{
+    check_int(recomp_widescreen_guest_flag_from(0, RECOMP_WIDE_NATIVE), 0,
+              "guest flag: off");
+    check_int(recomp_widescreen_guest_flag_from(1, RECOMP_WIDE_NATIVE), 1,
+              "guest flag: on, title with a 16:9 mode");
+    check_int(recomp_widescreen_guest_flag_from(1, RECOMP_WIDE_UNKNOWN), 1,
+              "guest flag: on, title nobody described (resolved as native)");
+    check_int(recomp_widescreen_guest_flag_from(1, RECOMP_WIDE_HOR_PLUS), 0,
+              "guest flag: on, Hor+ title is told 4:3");
+    check_int(recomp_widescreen_guest_flag_from(0, RECOMP_WIDE_HOR_PLUS), 0,
+              "guest flag: off, Hor+ title");
+}
+
 /* The settings files already out there, written by the launcher that had
  * two switches: `widescreen` 0 or 1, `hor_plus` 0 or 0.75, the register
  * always 60. Each must mean what it meant, on every kind of title, both
@@ -250,6 +267,51 @@ static void test_older_files(void)
         check_int(s.hor_plus_register, 160, "a register set by hand is kept either way");
     }
     remove(path);
+}
+
+/* The window the game opens: the presented shape at the guest's height,
+ * and never bigger than the screen. */
+static void test_window_size(void)
+{
+    int w, h;
+
+    recomp_window_size(640, 480, 0, &w, &h);
+    check_int(w, 640, "4:3: the guest's own width");
+    check_int(h, 480, "4:3: the guest's own height");
+    recomp_window_size(640, 480, 1, &w, &h);
+    check_int(w, 854, "16:9 at 480 rows: 854, never narrower than 16:9");
+    check_int(h, 480, "16:9: the height is kept");
+    recomp_window_size(1280, 720, 1, &w, &h);
+    check_int(w, 1280, "16:9 at 720 rows is exact");
+    recomp_window_size(720, 480, 0, &w, &h);
+    check_int(w, 720, "widescreen off leaves a guest's own shape alone");
+    recomp_window_size(720, 480, 1, &w, &h);
+    check_int(w, 854, "a 720x480 guest in widescreen is 16:9 too");
+    recomp_window_size(0, 0, 1, &w, &h);
+    check_int(w, 854, "no guest size: 640x480, at 16:9");
+    check_int(h, 480, "no guest size: 480 rows");
+
+    w = 854; h = 480;
+    recomp_window_fit(1920, 1040, &w, &h);
+    check_int(w, 854, "fits already: unchanged");
+    check_int(h, 480, "fits already: unchanged height");
+    recomp_window_fit(0, 0, &w, &h);
+    check_int(w, 854, "no limit: unchanged");
+
+    w = 1280; h = 720;
+    recomp_window_fit(1000, 2000, &w, &h);
+    check_int(w, 1000, "too wide: the width is the limit");
+    check_int(h, 562, "too wide: the shape is kept");
+
+    w = 1280; h = 720;
+    recomp_window_fit(2000, 600, &w, &h);
+    check_int(h, 600, "too tall: the height is the limit");
+    check_int(w, 1066, "too tall: the shape is kept");
+
+    w = 1280; h = 720;
+    recomp_window_fit(1000, 500, &w, &h);
+    check(w <= 1000 && h <= 500, "too wide and too tall: inside both");
+    check_int(h, 500, "too wide and too tall: the tighter limit wins");
 }
 
 int main(void)
@@ -433,7 +495,9 @@ int main(void)
               "lookups survive a settings read");
 
     test_widescreen_resolution();
+    test_guest_flag();
     test_older_files();
+    test_window_size();
 
     /* The same resolution as the runtime asks for it: from the settings
      * of this process -- the file above says widescreen = 1 and

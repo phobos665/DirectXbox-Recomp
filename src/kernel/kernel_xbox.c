@@ -13,6 +13,7 @@
 #include "xbox_memory_layout.h"   /* xbox_EnvSwitch */
 #include "recomp_config.h"
 #include "xbox_nic.h"
+#include "xbox_console_id.h"
 #include <string.h>
 /* getenv: without <stdlib.h> its pointer is truncated to int. */
 #include <stdlib.h>
@@ -39,7 +40,7 @@ XBOX_HARDWARE_INFO xbox_HardwareInfo = {
 XBOX_KRNL_VERSION xbox_KrnlVersion = {
     .Major = 1,
     .Minor = 0,
-    .Build = 5849,
+    .Build = 5838,   /* the last retail kernel; kernel_bridge.c says why */
     .Qfe   = 1
 };
 
@@ -205,6 +206,54 @@ uint32_t xbox_kernel_console_av_standard(void)
     return console_av_region();
 }
 
+/* The block reads: a whole section of the EEPROM at once, rather than one
+ * setting. XNet reads all of it (XC_MAX_ALL) when it starts and derives the
+ * console's network identity from it, so answering zeros there gave it a
+ * console with no serial and no online key while every single-setting query
+ * named the real one. */
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#endif
+#define XC_MAX_FACTORY 0x1FF
+#define XC_MAX_ALL     0xFFFF
+
+/* The EEPROM as this console holds it: the player's own when there is one
+ * (xbox_console_id.c), else the made-up console's factory section. Either
+ * way the user settings this runtime answers one by one (language, video,
+ * audio, parental, misc, DVD region: 0x90-0xBF) are laid over it and its
+ * checksum redone, so a block read and the single reads agree. */
+static void console_eeprom(uint8_t ee[256])
+{
+    const XboxConsoleId *id = xbox_ConsoleId();
+    static const struct { ULONG index; uint32_t off; } user[] = {
+        { XC_LANGUAGE, 0x90 }, { XC_VIDEO, 0x94 }, { XC_AUDIO, 0x98 },
+        { XC_P_CONTROL_GAMES, 0x9C }, { XC_P_CONTROL_MOVIES, 0xA4 },
+        { XC_MISC, 0xB8 }, { XC_DVD_REGION, 0xBC },
+    };
+    ULONG v, type, got;
+    size_t i;
+
+    if (id) {
+        memcpy(ee, id->eeprom, 256);
+    } else {
+        memset(ee, 0, 256);
+        xbox_ExQueryNonVolatileSetting(XC_FACTORY_SERIAL_NUMBER, &type, ee + 0x34, 12, &got);
+        xbox_ExQueryNonVolatileSetting(XC_FACTORY_ETHERNET_ADDR, &type, ee + 0x40, 6, &got);
+        xbox_ExQueryNonVolatileSetting(XC_FACTORY_ONLINE_KEY, &type, ee + 0x48, 16, &got);
+        xbox_ExQueryNonVolatileSetting(XC_FACTORY_AV_REGION, &type, &v, 4, &got);
+        memcpy(ee + 0x58, &v, 4);
+        v = xbox_eeprom_checksum(ee + 0x34, 0x2C);
+        memcpy(ee + 0x30, &v, 4);
+    }
+    for (i = 0; i < sizeof user / sizeof user[0]; i++) {
+        v = 0;
+        xbox_ExQueryNonVolatileSetting(user[i].index, &type, &v, 4, &got);
+        memcpy(ee + user[i].off, &v, 4);
+    }
+    v = xbox_eeprom_checksum(ee + 0x64, 0x5C);
+    memcpy(ee + 0x60, &v, 4);
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -213,6 +262,21 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
+
+    if (ValueIndex == XC_MAX_ALL || ValueIndex == XC_MAX_OS ||
+        ValueIndex == XC_MAX_FACTORY) {
+        uint8_t ee[256];
+        uint32_t off = ValueIndex == XC_MAX_ALL ? 0 : ValueIndex == XC_MAX_OS ? 0x60 : 0x30;
+        uint32_t len = ValueIndex == XC_MAX_ALL ? 256 : ValueIndex == XC_MAX_OS ? 0x60 : 0x30;
+
+        if (ResultLength) *ResultLength = len;
+        if (Type) *Type = 3;                      /* REG_BINARY */
+        if (ValueLength < len)
+            return STATUS_BUFFER_TOO_SMALL;
+        console_eeprom(ee);
+        memcpy(Value, ee + off, len);
+        return STATUS_SUCCESS;
+    }
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
@@ -234,14 +298,16 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
          * 16:9 and HDTV code paths that have never run here.
          *
          * RECOMP_WIDESCREEN turns the widescreen bit on, and a title with
-         * a 16:9 mode of its own then uses it. The host's output shape
+         * a 16:9 mode of its own then uses it. Not for a title declared
+         * HOR_PLUS, whose camera the runtime widens: it is told 4:3 and
+         * keeps drawing its whole frame (recomp_widescreen_guest_flag). The host's output shape
          * reads the same variable (src/d3d/d3d8_display.c): a title told
          * it is widescreen while the host presents 4:3 looks worse than
          * one told the truth, so the two must not disagree. */
         if (ValueLength >= sizeof(ULONG)) {
             ULONG flags = 0;
 
-            if (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0))
+            if (recomp_widescreen_guest_flag())
                 flags |= XC_VIDEO_FLAGS_WIDESCREEN;
             if (xbox_kernel_console_pal60())
                 flags |= XC_VIDEO_FLAGS_60Hz;
@@ -336,9 +402,11 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     case XC_FACTORY_SERIAL_NUMBER:
         /* Twelve ASCII digits, no terminator. Real consoles encode the plant
-         * and week here; nothing reads it but the dashboard. */
+         * and week here. The player's own console's when there is one
+         * (xbox_console_id.c): Xbox Live names the machine account after it. */
         if (ValueLength >= 12) {
-            memcpy(Value, "100000000000", 12);
+            const XboxConsoleId *id = xbox_ConsoleId();
+            memcpy(Value, id ? id->serial : "100000000000", 12);
             if (Type) *Type = 3;              /* REG_BINARY */
             if (ResultLength) *ResultLength = 12;
         }
@@ -360,10 +428,15 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     }
 
     case XC_FACTORY_ONLINE_KEY:
-        /* Sixteen bytes, per-console, and only Xbox Live uses it. Zeroed
-         * deliberately: there is nothing to authenticate against. */
+        /* Sixteen bytes, per-console, and only Xbox Live uses it: the
+         * machine account is created with it. The player's own console's
+         * when there is one, else zeros. */
         if (ValueLength >= 16) {
-            memset(Value, 0, 16);
+            const XboxConsoleId *id = xbox_ConsoleId();
+            if (id)
+                memcpy(Value, id->online_key, 16);
+            else
+                memset(Value, 0, 16);
             if (Type) *Type = 3;
             if (ResultLength) *ResultLength = 16;
         }
@@ -411,11 +484,15 @@ ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
      * retries for 25 to 100 s before XNet gave up. With no link XNet marks
      * the address "troubleshoot" at once and the title moves on, as a
      * console with nothing plugged in does. Off by default, because a title
-     * with a System Link menu says "no cable" rather than searching. */
+     * with a System Link menu says "no cable" rather than searching.
+     *
+     * With the network card on (System Link, xbox_nic.c) there is a cable,
+     * whatever the variable says: a title that turns the link off for the
+     * no-card case, as Rainbow Six 3 does, still finds it. */
     static int link = -1;
     (void)Verify;
     if (link < 0)
-        link = xbox_EnvSwitch("RECOMP_ETHERNET_LINK", 1);
+        link = xbox_NicCardOn() || xbox_EnvSwitch("RECOMP_ETHERNET_LINK", 1);
     /* Link up, 100 Mbps, full duplex */
     return link ? 0x01 : 0x00; /* XNET_ETHERNET_LINK_ACTIVE or nothing */
 }

@@ -171,6 +171,14 @@ void d3d8_vsh_interp_registers(int *projection, int *affine_first, int *affine_c
 const float *d3d8_vsh_constants(void);
 
 /**
+ * The constants as a draw uploads them: d3d8_vsh_constants with Hor+ applied
+ * to the projection register, which only a draw to the screen gets
+ * (to_screen != 0) -- a title's shadow map or other render-to-texture pass is
+ * projected unwidened. A copy, valid until the next call.
+ */
+const float *d3d8_vsh_constants_for_draw(int to_screen);
+
+/**
  * Check if a shader handle refers to a programmable vertex shader
  * (as opposed to an FVF code).
  *
@@ -260,6 +268,11 @@ int  d3d8_vsh_bound_uses_projection(void);
 /* ... and whether that projection, as uploaded right now, is orthographic:
  * a constant w row. A HUD drawn through the 3D programs looks like this. */
 int  d3d8_vsh_bound_projection_is_ortho(void);
+/* The Hor+ factor a draw in hand gets: 1 off the screen (d3d8_target_is_screen),
+ * once a title has claimed the factor, or with Hor+ off. The fixed-function
+ * path scales its projection by it, so a title that mixes programs with
+ * fixed-function draws is widened in both (d3d8_shaders.c). */
+float d3d8_vsh_hor_plus_for_draw(void);
 
 /* Of the 4-register groups from c[first] (count registers), which the
  * bound program reads: bit g for c[first+4g..first+4g+3]. A program that

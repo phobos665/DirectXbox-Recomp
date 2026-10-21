@@ -123,11 +123,18 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
 static int      g_title_narrow;
 static int      g_title_said, g_last_wide = -1;
 static unsigned g_frames;
+/* What the title last said, kept apart from the frame-by-frame answer so the
+ * automatic one (xbox_D3D8SetWideFramesAuto) can narrow a frame further but
+ * never widen one the title called 4:3. Turok: Evolution needs both: its front
+ * end is a 3D stage built for 4:3, which only the title can recognise, and
+ * its movies are frames with no 3D at all. */
+static int      g_title_says_narrow;
 
 void xbox_D3D8SetWideFrames(BOOL wide)
 {
     g_title_said = 1;
-    g_title_narrow = wide ? 0 : 1;
+    g_title_says_narrow = wide ? 0 : 1;
+    g_title_narrow = g_title_says_narrow;
 }
 
 int d3d8_display_wide_now(void)
@@ -164,7 +171,7 @@ void d3d8_display_frame_done(void)
      * cost is one frame at each change. */
     if (g_auto_wide) {
         g_title_said = 1;
-        g_title_narrow = g_frame_drew_3d ? 0 : 1;
+        g_title_narrow = g_frame_drew_3d && !g_title_says_narrow ? 0 : 1;
     }
     g_frame_drew_3d = 0;
 }
@@ -192,6 +199,19 @@ void d3d8_display_output_shape(UINT scene_w, UINT scene_h,
         if (shape_w) *shape_w = scene_w;
         if (shape_h) *shape_h = scene_h;
     }
+}
+
+/* The widescreen setting, not d3d8_display_wide_now: a window lasts the
+ * whole run, and the screens a title calls 4:3 are shown in it between
+ * bars. */
+void xbox_D3D8DefaultWindowSize(UINT guest_w, UINT guest_h, UINT *width, UINT *height)
+{
+    int w, h;
+
+    recomp_window_size((int)guest_w, (int)guest_h, d3d8_display_policy()->widescreen,
+                       &w, &h);
+    if (width)  *width = (UINT)w;
+    if (height) *height = (UINT)h;
 }
 
 D3D8DisplayFit d3d8_display_fit(UINT shape_w, UINT shape_h, UINT bb_w, UINT bb_h)

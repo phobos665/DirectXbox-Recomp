@@ -301,6 +301,9 @@ void recomp_settings_defaults(RecompSettings *s)
     s->fullscreen        = 0;
     s->vrr               = 1;
     s->frame_interp      = 1;
+    s->mouse_look        = 0;
+    s->mouse_sensitivity = RECOMP_MOUSE_SENSITIVITY_DEFAULT;
+    s->mouse_deadzone    = RECOMP_MOUSE_DEADZONE_DEFAULT;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
     snprintf(s->syslink, sizeof s->syslink, "off");
     s->syslink_port      = RECOMP_SYSLINK_DEFAULT_PORT;
@@ -371,6 +374,13 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->vrr = !off_word(v);
         if ((v = from_table("frame_interp")) != NULL)
             s->frame_interp = clamp_int(atoi(v), 1, 4);
+        if ((v = from_table("mouse_look")) != NULL)
+            s->mouse_look = !off_word(v);
+        if ((v = from_table("mouse_sensitivity")) != NULL)
+            s->mouse_sensitivity = clamp_int(atoi(v), RECOMP_MOUSE_SENSITIVITY_MIN,
+                                             RECOMP_MOUSE_SENSITIVITY_MAX);
+        if ((v = from_table("mouse_deadzone")) != NULL)
+            s->mouse_deadzone = clamp_int(atoi(v), 0, RECOMP_MOUSE_DEADZONE_MAX);
         if ((v = from_table("game_dir")) != NULL)
             snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
         if ((v = from_table("syslink")) != NULL)
@@ -515,12 +525,34 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# variable refresh. 1 is off.                   [RECOMP_FRAME_INTERP]\n"
         "frame_interp = %d\n"
         "\n"
+        "# Mouse look: moving the mouse moves controller 1's right stick, as\n"
+        "# well as anything bound to it, while the game's window has the\n"
+        "# pointer. Click in the window to give it the pointer; switching to\n"
+        "# another window takes it back.                  [RECOMP_MOUSE_LOOK]\n"
+        "mouse_look = %d\n"
+        "#\n"
+        "# How far a movement pushes the stick, %d to %d; %d is the default, a\n"
+        "# full push at %d mouse counts a second.  [RECOMP_MOUSE_SENSITIVITY]\n"
+        "mouse_sensitivity = %d\n"
+        "#\n"
+        "# Where on the stick any movement starts, in percent of a full push,\n"
+        "# so a slow movement gets past the game's own dead zone. 0 to %d;\n"
+        "# %d is the default.                         [RECOMP_MOUSE_DEADZONE]\n"
+        "mouse_deadzone = %d\n"
+        "\n"
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
         s->resolution_scale, s->widescreen, hor_plus, reg,
         s->widescreen_2d[0] ? s->widescreen_2d : "auto",
         s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay,
-        s->fullscreen, s->vrr, s->frame_interp < 1 ? 1 : s->frame_interp);
+        s->fullscreen, s->vrr, s->frame_interp < 1 ? 1 : s->frame_interp,
+        s->mouse_look ? 1 : 0,
+        RECOMP_MOUSE_SENSITIVITY_MIN, RECOMP_MOUSE_SENSITIVITY_MAX,
+        RECOMP_MOUSE_SENSITIVITY_DEFAULT, 100000 / RECOMP_MOUSE_SENSITIVITY_DEFAULT,
+        clamp_int(s->mouse_sensitivity, RECOMP_MOUSE_SENSITIVITY_MIN,
+                  RECOMP_MOUSE_SENSITIVITY_MAX),
+        RECOMP_MOUSE_DEADZONE_MAX, RECOMP_MOUSE_DEADZONE_DEFAULT,
+        clamp_int(s->mouse_deadzone, 0, RECOMP_MOUSE_DEADZONE_MAX));
 
     if (s->game_dir[0])
         fprintf(f, "game_dir = %s\n", s->game_dir);
@@ -833,6 +865,43 @@ void recomp_widescreen_resolve_from(int on, const char *hor_plus, const char *re
     }
 }
 
+/* -------------------------------------------------------------- window */
+
+void recomp_window_size(int guest_w, int guest_h, int widescreen, int *w, int *h)
+{
+    if (guest_w <= 0 || guest_h <= 0) {
+        guest_w = 640;
+        guest_h = 480;
+    }
+    /* Rounded up, so the window is never narrower than 16:9: 480 rows give
+     * 854, the usual 16:9 width for them, with the presented picture one
+     * column short of it rather than a row short of 853. 720 is exact. */
+    if (widescreen)
+        guest_w = (int)(((long long)guest_h * 16 + 8) / 9);
+    if (w) *w = guest_w;
+    if (h) *h = guest_h;
+}
+
+void recomp_window_fit(int max_w, int max_h, int *w, int *h)
+{
+    long long cw, ch;
+
+    if (!w || !h || *w <= 0 || *h <= 0)
+        return;
+    cw = *w;
+    ch = *h;
+    if (max_w > 0 && cw > max_w) {
+        ch = ch * max_w / cw;
+        cw = max_w;
+    }
+    if (max_h > 0 && ch > max_h) {
+        cw = cw * max_h / ch;
+        ch = max_h;
+    }
+    *w = cw > 0 ? (int)cw : 1;
+    *h = ch > 0 ? (int)ch : 1;
+}
+
 void recomp_widescreen_resolve(RecompWidescreen *out)
 {
     recomp_widescreen_resolve_from(
@@ -840,4 +909,15 @@ void recomp_widescreen_resolve(RecompWidescreen *out)
         recomp_config_lookup("RECOMP_HOR_PLUS", "hor_plus"),
         recomp_config_lookup("RECOMP_HOR_PLUS_REG", "hor_plus_register"),
         g_wide_mode, g_wide_register, out);
+}
+
+int recomp_widescreen_guest_flag_from(int on, RecompWideMode mode)
+{
+    return on && mode != RECOMP_WIDE_HOR_PLUS;
+}
+
+int recomp_widescreen_guest_flag(void)
+{
+    return recomp_widescreen_guest_flag_from(
+        recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0), g_wide_mode);
 }

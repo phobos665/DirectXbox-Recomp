@@ -13,8 +13,10 @@
  */
 
 #include "kernel.h"
+#include "xbox_console_id.h"
 #include "xbox_watchpoint.h"
 #include "recomp_config.h"   /* recomp_config_title_id: per-title cache */
+#include "platform/host_main.h"   /* host_exe_path: the default disc overlay */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +64,159 @@ static int match_prefix(const char* path, const char* prefix)
     return i;
 }
 
+/* The hard disk's data partition (E:, \Device\Harddisk0\Partition1) is
+ * one drive on a console, shared by every title and the dashboard: a title
+ * writes TDATA\<its id> and UDATA\<its id>, and the dashboard's online
+ * updater opens TDATA\<that id> to install the title's update there. Here
+ * it is each title's own game folder, unless hdd_dir names one folder for
+ * them all:
+ *
+ *   hdd_dir = <folder>                                    [RECOMP_HDD_DIR]
+ *
+ * A title handing off to another image (launch_map) passes it along, so
+ * both see the same E:. NULL when it is not set. */
+static const char *hdd_dir_setting(void)
+{
+    static int looked;
+    static const char *dir;
+    if (!looked) {
+        const char *v = recomp_config_lookup("RECOMP_HDD_DIR", "hdd_dir");
+        looked = 1;
+        dir = (v && *v) ? v : NULL;
+        if (dir)
+            fprintf(stderr, "  [PATH] E: (\\Device\\Harddisk0\\Partition1) is %s (hdd_dir)\n", dir);
+    }
+    return dir;
+}
+
+#define PARTITION1_PREFIX "\\Device\\Harddisk0\\Partition1\\"
+
+/* C: (\Device\Harddisk0\Partition2, the system partition) and Y:, which
+ * the dashboard and its online updater read their own files through: fonts,
+ * sounds, the dashboard XBEs. They go to the game folder, unless system_dir
+ * names the folder that holds the console's C: drive:
+ *
+ *   system_dir = <folder>                              [RECOMP_SYSTEM_DIR]
+ *
+ * That is what lets the updater's D: be the title it updates (it reads the
+ * disc's files to patch them) while its own files come from C:. */
+static const char *system_dir_setting(void)
+{
+    static int looked;
+    static const char *dir;
+    if (!looked) {
+        const char *v = recomp_config_lookup("RECOMP_SYSTEM_DIR", "system_dir");
+        looked = 1;
+        dir = (v && *v) ? v : NULL;
+        if (dir)
+            fprintf(stderr, "  [PATH] C: and Y: are %s (system_dir)\n", dir);
+    }
+    return dir;
+}
+
+/* Files that stand in for the disc's, path for path:
+ *
+ *   disc_overlay = <folder>                          [RECOMP_DISC_OVERLAY]
+ *
+ * A file at <folder>/<path> is what D:\<path> reads as; anything not there
+ * is the game folder's as usual. It is for putting a disc back as it was
+ * shipped. A copy made to run from a console's hard drive has its
+ * default.xbe patched (allowed media, the media check, often a Live block)
+ * and keeps the disc's as default.bak, and leaves out files the disc has.
+ * A title update is a set of deltas against the disc's files, each checked
+ * by hash, so the online updater patching the hard-drive copy's XBE made a
+ * file 7 bytes off the update's and gave up with ERROR_INVALID_DATA. The
+ * title's build may keep one in a disc_overlay folder beside its executable,
+ * which is the default when it holds a default.xbe; the updater the title
+ * launches inherits it (xbox_launch_note_return). Read through D: only;
+ * nothing is written there. */
+const char *xbox_path_disc_overlay(void)
+{
+    static int looked;
+    static const char *dir;
+    static char beside[1024];
+
+    if (!looked) {
+        const char *v = recomp_config_lookup("RECOMP_DISC_OVERLAY", "disc_overlay");
+        const char *how = "disc_overlay";
+        char probe[1100];
+
+        looked = 1;
+        dir = (v && *v) ? v : NULL;
+        if (!dir && host_exe_path(beside, sizeof beside)) {
+            host_path_dirname(beside);
+            strncat(beside, "/disc_overlay", sizeof beside - strlen(beside) - 1);
+            snprintf(probe, sizeof probe, "%s/default.xbe", beside);
+            if (host_file_exists(probe)) {
+                dir = beside;
+                how = "beside the executable";
+            }
+        }
+        if (dir)
+            fprintf(stderr, "  [PATH] D: has %s laid over it (%s)\n", dir, how);
+    }
+    return dir;
+}
+
+static int disc_overlay_for(const char *xbox_path, char *out, size_t n)
+{
+    const char *dir = xbox_path_disc_overlay();
+    static const char *const prefixes[] = {
+        "\\Device\\CdRom0\\", "D:\\", "\\??\\D:\\",
+    };
+    size_t i, k;
+
+    if (!dir || !xbox_path)
+        return 0;
+    for (i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++) {
+        size_t len = strlen(prefixes[i]);
+        const char *rest;
+        FILE *f;
+
+        if (_strnicmp(xbox_path, prefixes[i], len) != 0)
+            continue;
+        rest = xbox_path + len;
+        if (!*rest || strstr(rest, ".."))
+            return 0;
+        snprintf(out, n, "%s/%s", dir, rest);
+        for (k = strlen(dir) + 1; out[k]; k++)
+            if (out[k] == '\\')
+                out[k] = '/';
+        f = fopen(out, "rb");
+        if (!f)
+            return 0;
+        fclose(f);
+        /* A mod (RECOMP_MODS) changes the game, so its copy wins over the
+         * overlay's: step aside, and the disc rule serves the mod's file.
+         * Order: mods, then the overlay, then the game folder. */
+        {
+            char mod[1024];
+            if (xbox_mods_find(rest, mod, sizeof mod) >= 0)
+                return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* The folder a game-folder rule goes to instead, or NULL: hdd_dir for E:,
+ * system_dir for C: and Y:. */
+static const char *rule_dir_override(const char *prefix)
+{
+    static const char *const system_prefixes[] = {
+        "\\Device\\Harddisk0\\Partition2\\", "C:\\", "\\??\\C:\\",
+        "Y:\\", "y:\\", "\\??\\Y:\\", "\\??\\y:\\",
+    };
+    size_t i;
+
+    if (strcmp(prefix, PARTITION1_PREFIX) == 0)
+        return hdd_dir_setting();
+    for (i = 0; i < sizeof system_prefixes / sizeof system_prefixes[0]; i++)
+        if (strcmp(prefix, system_prefixes[i]) == 0)
+            return system_dir_setting();
+    return NULL;
+}
+
 /* A device-path translation rule, shared by both backends. */
 typedef struct {
     const char* prefix;     /* Xbox path prefix (backslash form)         */
@@ -82,7 +237,7 @@ static const path_rule s_rules[] = {
      * empty remainder makes it the game directory, which NtCreateFile opens
      * as a directory handle. */
     { "\\Device\\CdRom0",                     0, NULL,         NULL          },
-    { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
+    { PARTITION1_PREFIX,                      0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
      * Without these the path layer reported "Unrecognized Xbox path" and
@@ -323,6 +478,33 @@ static int xbox_partition_device_index(const char *xbox_path)
     return *rest == '\0' ? digit - '0' : -1;
 }
 
+/* "\Device\Harddisk0\PartitionN\" for a partition with a filesystem
+ * (1-5), the trailing separator included: on a console that is the root
+ * directory of the volume, as "\??\E:\" is. Opening it still reaches the
+ * partition image (xbox_partition_device_index), but asked for its
+ * attributes it is a directory: the 5960 online updater makes the folders
+ * of "\Device\Harddisk0\Partition5\$t\..." one at a time, checks that each
+ * one that exists is a directory, and gave up with ERROR_FILE_EXISTS at
+ * the volume root when it was told it was a 750 MB file. */
+int xbox_path_is_volume_root(const char *xbox_path)
+{
+    char linked[512];
+    size_t n;
+    int p;
+
+    if (!xbox_path)
+        return 0;
+    /* Through a drive the title linked for itself: "z:\" is the root of
+     * whatever \??\Z: names. */
+    if (resolve_symlink(xbox_path, linked, sizeof(linked)))
+        return xbox_path_is_volume_root(linked);
+    n = strlen(xbox_path);
+    if (n == 0 || (xbox_path[n - 1] != '\\' && xbox_path[n - 1] != '/'))
+        return 0;
+    p = xbox_partition_device_index(xbox_path);
+    return p >= 1 && p <= 5;
+}
+
 /* ======================================================================== */
 #if defined(_WIN32)
 /* ======================================================================== */
@@ -513,6 +695,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
     fprintf(stderr, "[PATH] saves in %ls (%s)\n", s_save_dir, save_source);
     fflush(stderr);
+    /* The console's Xbox Live accounts onto the new disk, from its backup. */
+    {
+        char save[MAX_PATH * 3], image[MAX_PATH * 3 + 32];
+        if (xbox_path_save_dir_utf8(save, sizeof save)) {
+            snprintf(image, sizeof image, "%s\\Partition0.img", save);
+            xbox_console_import_accounts(image);
+        }
+    }
 }
 
 int xbox_path_save_dir_utf8(char *out, size_t n)
@@ -523,6 +713,17 @@ int xbox_path_save_dir_utf8(char *out, size_t n)
     if (!s_initialized || !s_save_dir[0])
         return 0;
     return WideCharToMultiByte(CP_UTF8, 0, s_save_dir, -1, out, (int)n,
+                               NULL, NULL) > 0;
+}
+
+int xbox_path_game_dir_utf8(char *out, size_t n)
+{
+    if (!out || n == 0)
+        return 0;
+    out[0] = 0;
+    if (!s_initialized || !s_game_dir[0])
+        return 0;
+    return WideCharToMultiByte(CP_UTF8, 0, s_game_dir, -1, out, (int)n,
                                NULL, NULL) > 0;
 }
 
@@ -568,6 +769,16 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             return xbox_translate_path(linked, host_path_buf, buf_size);
     }
 
+    {
+        char over[MAX_PATH];
+        if (disc_overlay_for(xbox_path, over, sizeof over)) {
+            MultiByteToWideChar(CP_UTF8, 0, over, -1, host_path_buf, (int)buf_size);
+            fprintf(stderr, "  [PATH] %s -> disc_overlay\n", xbox_path);
+            fflush(stderr);
+            return TRUE;
+        }
+    }
+
     if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
         fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
         fflush(stderr);
@@ -579,6 +790,19 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
+            if (!s_rules[i].to_save && rule_dir_override(s_rules[i].prefix)) {
+                /* Two settings at most, each converted once. */
+                static WCHAR over_w[2][MAX_PATH];
+                static const char *over_u[2];
+                const char *u = rule_dir_override(s_rules[i].prefix);
+                int k = (over_u[0] == u || !over_u[0]) ? 0 : 1;
+                if (over_u[k] != u) {
+                    over_u[k] = u;
+                    MultiByteToWideChar(CP_UTF8, 0, u, -1, over_w[k], MAX_PATH);
+                    SHCreateDirectoryExW(NULL, over_w[k], NULL);
+                }
+                base_dir = over_w[k];
+            }
             sub_dir   = cache_sub_dir(s_rules[i].sub_win, '\\', sub_buf, sizeof sub_buf);
             disc      = rule_is_disc(i);
             goto translate;
@@ -830,6 +1054,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              s_game_dir, s_save_dir);
     fprintf(stderr, "[PATH] saves in %s (%s)\n", s_save_dir, save_source);
     fflush(stderr);
+    /* The console's Xbox Live accounts onto the new disk, from its backup. */
+    {
+        char image[MAX_PATH + 32];
+        snprintf(image, sizeof image, "%s/Partition0.img", s_save_dir);
+        xbox_console_import_accounts(image);
+    }
 }
 
 /* The host path the last translation produced, for the bridge's .wmv movie
@@ -862,6 +1092,17 @@ int xbox_path_save_dir_utf8(char *out, size_t n)
     return 1;
 }
 
+int xbox_path_game_dir_utf8(char *out, size_t n)
+{
+    if (!out || n == 0)
+        return 0;
+    out[0] = 0;
+    if (!s_initialized || !s_game_dir[0])
+        return 0;
+    snprintf(out, n, "%s", s_game_dir);
+    return 1;
+}
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char* remainder = NULL;
@@ -884,6 +1125,17 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     {
+        char over[MAX_PATH];
+        if (disc_overlay_for(xbox_path, over, sizeof over)) {
+            snprintf(host_path_buf, buf_size, "%s", over);
+            fprintf(stderr, "  [PATH] %s -> disc_overlay\n", xbox_path);
+            fflush(stderr);
+            xbox_remember_host_path(host_path_buf);
+            return TRUE;
+        }
+    }
+
+    {
         int p = xbox_partition_device_index(xbox_path);
         if (p >= 0) {
             snprintf(host_path_buf, buf_size, "%s/Partition%d.img", s_save_dir, p);
@@ -899,6 +1151,14 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
+            if (!s_rules[i].to_save && rule_dir_override(s_rules[i].prefix)) {
+                static const char *made[2];
+                base_dir = rule_dir_override(s_rules[i].prefix);
+                if (made[0] != base_dir && made[1] != base_dir) {
+                    mkdir_p(base_dir);
+                    made[made[0] ? 1 : 0] = base_dir;
+                }
+            }
             sub_dir   = cache_sub_dir(s_rules[i].sub_posix, '/', sub_buf, sizeof sub_buf);
             disc      = rule_is_disc(i);
             goto translate;

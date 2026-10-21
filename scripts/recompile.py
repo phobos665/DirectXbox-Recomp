@@ -203,8 +203,10 @@ def build_commands(args, xbe: Path, analysis_json: Path, stage_xbe: Path = None)
                                if project else None)
     if gen_dir:
         lift += ["--gen-dir", gen_dir]
-    if project and (project / "src" / "recomp_manual.c").is_file():
-        lift += ["--exclude-manual", str(project / "src" / "recomp_manual.c")]
+    manual = Path(args.manual) if args.manual else (
+        project / "src" / "recomp_manual.c" if project else None)
+    if manual and manual.is_file():
+        lift += ["--exclude-manual", str(manual)]
     if args.game_name:
         lift += ["--game-name", args.game_name]
     if args.trace_all_entries:
@@ -320,6 +322,11 @@ def main() -> int:
                          "1 lifts in a single process")
     ap.add_argument("--gen-dir", metavar="DIR",
                     help="Output directory for generated sources")
+    ap.add_argument("--manual", metavar="FILE",
+                    help="The hand-written functions to leave out of the "
+                         "generated set (default: the project's "
+                         "src/recomp_manual.c) -- for a second build of the "
+                         "same project, such as a title update's.")
     ap.add_argument("--work-dir", metavar="DIR",
                     help="Per-title directory for the stage outputs "
                          "(disasm/, func_id/, recomp/). Without it every "

@@ -17,6 +17,14 @@ int host_exe_path(char *buf, size_t bytes)
     return n != 0 && n < (DWORD)bytes;
 }
 
+/* There are no application bundles here; the launcher asks on every host. */
+int host_app_bundle_dir(char *buf, size_t bytes)
+{
+    (void)buf;
+    (void)bytes;
+    return 0;
+}
+
 void host_path_dirname(char *path)
 {
     char *a = strrchr(path, '\\'), *b = strrchr(path, '/');
@@ -132,6 +140,30 @@ int host_relaunch_self(void)
      * is where the caller put the launch data. */
     if (!CreateProcessA(exe, GetCommandLineA(), NULL, NULL, TRUE, 0, NULL,
                         NULL, &si, &pi))
+        return 0;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    ExitProcess(0);
+}
+
+int host_launch_other(const char *exe)
+{
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char cmd[MAX_PATH + 3];
+
+    if (!exe || !*exe)
+        return 0;
+    fflush(stdout);
+    fflush(stderr);
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    snprintf(cmd, sizeof cmd, "\"%s\"", exe);
+    if (!CreateProcessA(exe, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
         return 0;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);

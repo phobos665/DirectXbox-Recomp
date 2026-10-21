@@ -3,6 +3,7 @@
  */
 #include "host.h"
 #include "host_mac.h"
+#include "recomp_config.h"                /* recomp_window_fit */
 
 #include <SDL3/SDL.h>
 #ifdef __APPLE__
@@ -257,6 +258,33 @@ static void report_size(host_window *w)
         w->cb.on_resize(w->cb.user, pw, ph);
 }
 
+/* No bigger than the room the screen it is on has, title bar included,
+ * keeping the shape it was asked for: a 16:9 window for a large guest, or
+ * a small screen, would otherwise open with its bottom under the dock.
+ * Done while the window is still hidden, so it is never seen at the size
+ * it could not have. Borders a window system cannot tell before the
+ * window is shown count as none. */
+static void fit_to_display(SDL_Window *win, int width, int height)
+{
+    SDL_DisplayID d = SDL_GetDisplayForWindow(win);
+    SDL_Rect r;
+    int top = 0, left = 0, bottom = 0, right = 0;
+    int w = width, h = height;
+
+    if (!d || !SDL_GetDisplayUsableBounds(d, &r))
+        return;
+    if (!SDL_GetWindowBordersSize(win, &top, &left, &bottom, &right))
+        top = left = bottom = right = 0;
+    recomp_window_fit(r.w - left - right, r.h - top - bottom, &w, &h);
+    if (w == width && h == height)
+        return;
+    SDL_SetWindowSize(win, w, h);
+    SDL_SetWindowPosition(win, (int)SDL_WINDOWPOS_CENTERED_DISPLAY(d),
+                          (int)SDL_WINDOWPOS_CENTERED_DISPLAY(d));
+    fprintf(stderr, "[HOST] window %dx%d, to fit the screen (%dx%d asked for)\n",
+            w, h, width, height);
+}
+
 static void open_on_main(void *arg)
 {
     open_request *req = arg;
@@ -282,6 +310,7 @@ static void open_on_main(void *arg)
         fprintf(stderr, "[HOST] SDL_CreateWindow failed: %s\n", SDL_GetError());
         return;
     }
+    fit_to_display(w->sdl, req->width, req->height);
     w->id = SDL_GetWindowID(w->sdl);
     w->background = background;
     memset(&w->cb, 0, sizeof w->cb);
@@ -399,6 +428,34 @@ static void fullscreen_on_main(void *arg)
         w->cb.on_fullscreen(w->cb.user, on);
 }
 
+static void relative_on_main(void *arg)
+{
+    window_op *op = arg;
+    host_window *w = op->w;
+
+    if (!w->sdl)
+        return;
+    if (op->on && w->background) {
+        fprintf(stderr, "[HOST] mouse capture refused: background window\n");
+        return;
+    }
+    if (!SDL_SetWindowRelativeMouseMode(w->sdl, op->on ? true : false))
+        fprintf(stderr, "[HOST] mouse capture %s failed: %s\n", op->on ? "on" : "off",
+                SDL_GetError());
+}
+
+void host_window_set_relative_mouse(host_window *w, int on)
+{
+    window_op op;
+
+    if (!w)
+        return;
+    memset(&op, 0, sizeof op);
+    op.w = w;
+    op.on = on;
+    recomp_host_call_main(relative_on_main, &op);
+}
+
 void host_window_set_fullscreen(host_window *w, int on)
 {
     window_op op;
@@ -509,8 +566,28 @@ static void dispatch_event(const SDL_Event *e)
             SDL_SetAtomicInt(&w->focus, 1);
         break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
-        if (e->window.windowID == w->id)
+        if (e->window.windowID == w->id) {
             SDL_SetAtomicInt(&w->focus, 0);
+            /* Their releases go to whatever has the focus now. */
+            if (w->cb.on_mouse_button) {
+                int b;
+
+                for (b = SDL_BUTTON_LEFT; b <= SDL_BUTTON_X2; b++)
+                    w->cb.on_mouse_button(w->cb.user, b, 0);
+            }
+        }
+        break;
+    case SDL_EVENT_MOUSE_MOTION:
+        /* Only the held pointer's: a free one crossing the window is
+         * someone on their way to another. */
+        if (e->motion.windowID == w->id && w->cb.on_mouse_motion &&
+            SDL_GetWindowRelativeMouseMode(w->sdl))
+            w->cb.on_mouse_motion(w->cb.user, e->motion.xrel, e->motion.yrel);
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (e->button.windowID == w->id && w->cb.on_mouse_button)
+            w->cb.on_mouse_button(w->cb.user, e->button.button, e->button.down ? 1 : 0);
         break;
     case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
     case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:

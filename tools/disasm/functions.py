@@ -487,11 +487,39 @@ class FunctionDetector:
                 code_ranges.add(addr)
 
         call_targets = self.engine.get_call_targets()
-        realigned = unaligned = 0
+        realigned = unaligned = inside_code = 0
+        # Function heads found by their prologue, for the check below.
+        heads = sorted(a for a, (_, how) in self._candidates.items()
+                       if how == "prologue")
+        reach_cache: Dict[int, Set[int]] = {}
         for target in call_targets:
             section = self.image.get_section_at_va(target)
             if not (section and section.executable):
                 continue
+            # A "call" read out of data can name an address in the middle of
+            # an instruction of a real function. Taking that as a function
+            # start cuts the real one short there, and its lifted body then
+            # ends without its epilogue on every path past the cut: Rainbow
+            # Six 3's XNet connect (0x003A8C6B, title update 0x501) lost its
+            # pops and `ret 0xC` to a "call" at 0x003B4D96 -- bytes of a
+            # table -- aimed at 0x003A8CDA, the second byte of a `je`. Each
+            # call left 36 bytes on the guest stack, the logon's saved
+            # registers came back wrong, and the title closed its own logon
+            # task. So: a target strictly inside an instruction that a
+            # prologue-found function reaches by its own control flow is not
+            # a function start.
+            if target not in self.engine.instructions:
+                cov = self.engine.instruction_covering(target)
+                if cov is not None and heads:
+                    i = bisect.bisect_right(heads, cov.address) - 1
+                    head = heads[i] if i >= 0 else None
+                    if head is not None and cov.address - head < 0x4000:
+                        if head not in reach_cache:
+                            reach_cache[head] = self.engine.recursive_descent(
+                                [head], [(head, head + 0x4000)])
+                        if cov.address in reach_cache[head]:
+                            inside_code += 1
+                            continue
             # A direct call to an executable address is the strongest evidence
             # of a function start there is -- stronger than a prologue match,
             # which is a guess about bytes. It used to be discarded whenever the
@@ -530,6 +558,9 @@ class FunctionDetector:
         if realigned or unaligned:
             print(f"  Realigned {realigned} call targets the sweep stepped over"
                   f" ({unaligned} rejected: bytes do not decode as a function)")
+        if inside_code:
+            print(f"  {inside_code} call target(s) rejected: inside an instruction"
+                  f" of a function's own code")
 
     def _pass_indirect_call_slots(self) -> None:
         """
@@ -770,6 +801,18 @@ class FunctionDetector:
                 continue
             first = self.engine.instructions[target]
             if first.mnemonic.lower() in ("int3", "nop"):
+                continue
+
+            # Code that runs straight into the target: the target is the
+            # middle of a function this pass cannot see yet, not an entry.
+            # Turok: Evolution's D3D writes the push-buffer method word
+            # 0x001809E0 (`mov dword ptr [esi], 1809E0h`), which lands on
+            # `add ebx, 10h` inside a vtable-only constructor's loop, after
+            # `inc edi`. The constructor was still a gap when this pass ran,
+            # so the gap test let it through; the start cut the loop off its
+            # own head, its back edge became a call to a stub, and the object
+            # was left with a null member the game later called through.
+            if self._reached_by_fall_through(target):
                 continue
 
             self._add_candidate(target, config.CONFIDENCE_IMM_REF,
@@ -1187,6 +1230,63 @@ class FunctionDetector:
         if found:
             print(f"  {found} function address(es) found in data tables")
         return found > 0
+
+    def _is_filler(self, insn) -> bool:
+        """A padding instruction: nop, or one that moves a register onto
+        itself. Code runs through these too -- a loop head aligned inside a
+        function is reached across them."""
+        m = insn.mnemonic.lower()
+        if insn.is_nop or m == "nop":
+            return True
+        op = insn.op_str.lower().replace(" ", "")
+        if m == "lea":
+            # lea ecx, [ecx] / lea esi, [esi + 0]: a multi-byte nop.
+            reg, _, mem = op.partition(",")
+            return mem in ("[%s]" % reg, "[%s+0]" % reg, "[%s+0x0]" % reg)
+        if m in ("mov", "xchg"):
+            a, _, b = op.partition(",")
+            return a == b
+        return False
+
+    def _reached_by_fall_through(self, addr: int) -> bool:
+        """Does the instruction the sweep decoded just before `addr` run into
+        it, across any padding-like filler, without a ret or jmp between?
+
+        A function entry follows a terminator, padding after one, or nothing;
+        it is never the next instruction of code that keeps going. Only a
+        known instruction counts: with none decoded right before `addr` the
+        answer is no, so a target after data or a gap is left to the other
+        tests. A call does not count as running into it -- the call may never
+        return (a throw helper, an exit) and the compiler puts the next
+        function straight after it.
+
+        Nor does anything in front of nop or int3 padding when `addr` is laid
+        out as a function start (_is_padded_entry): what the sweep decoded
+        there may be data. BLiNX's 0x0011F7E0 follows a switch's byte index
+        table (0x91..0xA5, which decode as xchg, popfd, sahf, movsd) and four
+        nops; refused, the function was never lifted and the first call to it
+        crashed the title.
+        """
+        a = addr
+        padded = False
+        for _ in range(32):
+            prev = None
+            for back in range(1, 16):
+                insn = self.engine.instructions.get(a - back)
+                if insn is not None and insn.end_address == a:
+                    prev = insn
+                    break
+            if prev is None:
+                return False
+            m = prev.mnemonic.lower()
+            if prev.is_terminator or m in ("int3", "hlt", "ud2") or prev.is_call:
+                return False
+            if self._is_filler(prev):
+                a = prev.address
+                padded = True
+                continue
+            return not (padded and self._is_padded_entry(addr))
+        return False
 
     def _is_padded_entry(self, addr: int) -> bool:
         """Is `addr` laid out exactly like a function start: 16-byte aligned,

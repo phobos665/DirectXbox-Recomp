@@ -28,7 +28,7 @@ def _args(**over):
     base = dict(text_only=False, seeds=[], verbose=False, all=False,
                 split=1000, gen_dir=None, trace_all_entries=False,
                 only=None, start="parse", work_dir=None, project=None,
-                game_name=None)
+                game_name=None, manual=None)
     base.update(over)
     return argparse.Namespace(**base)
 
@@ -104,6 +104,20 @@ class ProjectPointsTheLiftAtATitle(unittest.TestCase):
             lift = _stage(cmds, "lift")
             self.assertEqual(lift[lift.index("--exclude-manual") + 1],
                              str(manual.resolve()))
+
+    def test_an_explicit_manual_wins_over_the_project(self):
+        # A second build of the same project (a title update's) has its own
+        # overrides, at that build's addresses.
+        with tempfile.TemporaryDirectory() as d:
+            proj = pathlib.Path(d)
+            (proj / "src").mkdir()
+            (proj / "src" / "recomp_manual.c").write_text("/* disc */\n", encoding="utf-8")
+            update = proj / "src" / "recomp_manual_update.c"
+            update.write_text("/* update */\n", encoding="utf-8")
+            cmds = self.driver.build_commands(
+                _args(project=str(proj), manual=str(update)), self.xbe, self.json)
+            lift = _stage(cmds, "lift")
+            self.assertEqual(lift[lift.index("--exclude-manual") + 1], str(update))
 
     def test_an_explicit_gen_dir_wins_over_the_project(self):
         with tempfile.TemporaryDirectory() as d:

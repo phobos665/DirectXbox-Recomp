@@ -120,11 +120,14 @@ typedef struct Envelope {
 typedef struct Buffer {
     uint32_t iface;              /* the IDirectSoundBuffer the game holds */
     uint32_t data, size, format;
+    uint32_t region;      /* the play region's start: data and size are the region's */
+    uint32_t whole;       /* the buffer's own size, as the title's settings hold it */
     int      output;             /* samples we can send to the host */
     /* IDirectSoundBuffer_Pause: the model is stopped with its cursor kept,
      * and paused_flags holds the play flags to resume with. */
     int      paused;
     uint32_t paused_flags;
+    int      synch_held;         /* paused by SYNCHPLAYBACK: SynchPlayback starts it */
     RecompDsoundBufferModel model;        /* what the game is told */
     RecompDsoundBufferModel output_model; /* what has been sent */
     int      primed;             /* the host voice has had its pre-roll */
@@ -582,8 +585,8 @@ static void pump(Buffer *b, uint64_t now)
     if (!b->output || !out->playing || now <= out->last_ms ||
         now - out->last_ms < 10u)
         return;
-    if (b->data != setting(b->iface, SET_DATA) ||
-        b->size != setting(b->iface, SET_SIZE) ||
+    if (b->data - b->region != setting(b->iface, SET_DATA) ||
+        b->whole != setting(b->iface, SET_SIZE) ||
         b->format != setting(b->iface, SET_FORMAT)) {
         retire(b);
         return;
@@ -752,7 +755,7 @@ static int reclaim_slot(uint64_t now)
         Buffer *b = &g_buffers[i];
         if (b->iface == 0u)
             return 1;
-        if (b->data != setting(b->iface, SET_DATA) ||
+        if (b->data - b->region != setting(b->iface, SET_DATA) ||
             b->format != setting(b->iface, SET_FORMAT)) {
             retire(b);
             if (!gone++)
@@ -787,6 +790,7 @@ static Buffer *model_for_known(Buffer *known, uint32_t iface, uint64_t now)
 {
     Buffer *b = known ? known : find(iface);
     uint32_t size, data, format, tag, channels, bits, align, rate, loop_start;
+    uint32_t play_start, play_len, whole;
     uint32_t decoded_size, decoded_loop, block_align;
     int output;
     uint32_t i;
@@ -796,10 +800,30 @@ static Buffer *model_for_known(Buffer *known, uint32_t iface, uint64_t now)
         return NULL;
     size       = setting(iface, SET_SIZE);
     data       = setting(iface, SET_DATA);
+    whole      = size;
     format     = setting(iface, SET_FORMAT);
     align      = setting(iface, SET_ALIGN);
     rate       = setting(iface, SET_RATE);
     loop_start = setting(iface, SET_LOOP_START);
+    /* The play region (SetPlayRegion): only that part of the buffer plays,
+     * and the loop region is counted from its start. Modelled as a buffer of
+     * its own -- data moved to the region, size its length -- so a sound ends
+     * where its region does and a new region retires the old model as new
+     * data would. XGRA keeps a sound bank in one buffer and plays each sound
+     * as a region of it (a menu blip is 3,302 bytes at 86,952 of 145,308);
+     * played whole, every blip ran on through the rest of the bank, and
+     * every sound overlapped the ones after it. */
+    play_start = setting(iface, SET_PLAY_START);
+    play_len   = setting(iface, SET_PLAY_LEN);
+    if (play_start >= size)
+        play_start = 0u;
+    if (play_start || play_len) {
+        uint32_t len = size - play_start;
+        if (play_len && play_len < len)
+            len = play_len;
+        data += play_start;
+        size = len;
+    }
     tag        = format & 0xFFFFu;
     channels   = (format >> 16) & 0xFFu;
     bits       = format >> 24;
@@ -875,6 +899,8 @@ static Buffer *model_for_known(Buffer *known, uint32_t iface, uint64_t now)
             b->iface = iface;
             b->data = data;
             b->size = size;
+            b->region = play_start;
+            b->whole = whole;
             b->format = format;
             b->output = output;
             b->model.loop_start_bytes = decoded_loop;
@@ -1468,8 +1494,8 @@ enum { DSBPAUSE_RESUME = 0u, DSBPAUSE_PAUSE = 1u, DSBPAUSE_SYNCHPLAYBACK = 2u };
  * not replaced, so the model never heard of it, GetStatus said PLAYING for
  * ever, and the title hung for good straight after its difficulty select.
  *
- * SYNCHPLAYBACK pauses too: it holds the buffer so that several can be
- * resumed together, which from the title's side looks the same. */
+ * SYNCHPLAYBACK pauses too: it holds the buffer until IDirectSound::
+ * SynchPlayback starts every held buffer and stream together (below). */
 static uint32_t pause_buffer(uint32_t iface, uint32_t how)
 {
     uint64_t now = now_ms();
@@ -1484,6 +1510,7 @@ static uint32_t pause_buffer(uint32_t iface, uint32_t how)
     if (b) {
         pump(b, now);
         recomp_dsound_buffer_cursor(&b->model, now);
+        b->synch_held = how == DSBPAUSE_SYNCHPLAYBACK;
         if (how == DSBPAUSE_RESUME) {
             if (b->paused) {
                 b->paused = 0;
@@ -1503,6 +1530,58 @@ static uint32_t pause_buffer(uint32_t iface, uint32_t how)
     }
     unlock();
     return RECOMP_DSOUND_OK;
+}
+
+/* HRESULT IDirectSound::SynchPlayback(this)
+ *
+ * Starts every buffer and stream paused with SYNCHPLAYBACK, together. Pro
+ * Evolution Soccer 5's movie player creates its sound stream, pauses it with
+ * DSSTREAMPAUSE_SYNCHPLAYBACK, queues two packets and calls SynchPlayback.
+ * Not replaced, the call reached the APU, which this path does not use; the
+ * stream stayed paused, its packets never completed, and the player waited
+ * on them for good after the logos. */
+int hle_dsound_stream_synch_playback(void);   /* hle_dsound_stream.c */
+
+static uint32_t synch_playback(void)
+{
+    uint64_t now = now_ms();
+    int i, buffers = 0, streams;
+
+    lock();
+    for (i = 0; i < SLOTS; i++) {
+        Buffer *b = &g_buffers[i];
+        if (!b->iface || !b->synch_held)
+            continue;
+        b->synch_held = 0;
+        if (b->paused) {
+            b->paused = 0;
+            if (recomp_dsound_buffer_play(&b->model, b->paused_flags, now)
+                    == RECOMP_DSOUND_OK) {
+                resync_output(b, 0);
+                notify_start(b, now);
+            }
+            buffers++;
+        }
+    }
+    unlock();
+    streams = hle_dsound_stream_synch_playback();
+    {
+        static int said;
+        if (said++ < 4)
+            fprintf(stderr, "[DSOUND] SynchPlayback: %d buffer(s) and %d "
+                    "stream(s) started\n", buffers, streams);
+    }
+    return RECOMP_DSOUND_OK;
+}
+
+HLE_EXPORT(IDirectSound_SynchPlayback)
+{
+    HLE_RETURN(synch_playback());
+}
+
+HLE_EXPORT(CDirectSound_SynchPlayback)
+{
+    HLE_RETURN(synch_playback());
 }
 
 /* HRESULT IDirectSoundBuffer_Pause(this, DWORD dwPause) */
@@ -1576,6 +1655,7 @@ HLE_EXPORT(IDirectSoundBuffer_GetCurrentPosition)
         if ((b->format & 0xFFFFu) == TAG_ADPCM && b->output)
             cursor = cursor / (XBOX_ADPCM_BLOCK_SAMPLES * b->model.block_align) *
                      (XBOX_ADPCM_BLOCK_BYTES * b->model.block_align / 2u);
+        cursor += b->region;          /* the title counts from the buffer's start */
         /* RECOMP_DSOUND_CURSOR_TRACE=1: what a title polling for its clock
          * sees, once a second per buffer. A movie paced by its sound stops
          * dead when this stops moving. */
@@ -1617,6 +1697,8 @@ HLE_EXPORT(IDirectSoundBuffer_SetCurrentPosition)
     b = model_for(iface, now);
     if (b) {
         pump(b, now);
+        /* From the buffer's start, as the title counts, to the region's. */
+        position = position >= b->region ? position - b->region : 0u;
         if ((b->format & 0xFFFFu) == TAG_ADPCM && b->output) {
             uint32_t block = XBOX_ADPCM_BLOCK_BYTES * b->model.block_align / 2u;
             if (position >= b->size || position % block != 0u)

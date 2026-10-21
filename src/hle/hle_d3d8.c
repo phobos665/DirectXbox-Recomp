@@ -65,6 +65,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "platform/host_main.h"   /* host_exe_path: where F11 writes */
 #include "hle.h"
 #include "recomp_config.h"
 
@@ -75,9 +76,13 @@
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
 #include "rhi.h"                         /* rhi_set_wait_hooks */
+#include "input_bindings.h"              /* the mouse, for mouse look and mouse: bindings */
 #include "../kernel/xbox_memory_layout.h"  /* the guest lock */
 
 void hle_d3d8_push_constants_sync(void);   /* hle_d3d8_vertex.c */
+int  hle_d3d8_pb_walking(void);             /* hle_d3d8_vertex.c */
+void hle_d3d8_apply_pending_textures(void); /* hle_d3d8_texture.c */
+void hle_d3d8_apply_pending_constants(void); /* hle_d3d8_vertex.c */
 void hle_d3d8_push_skip(void);
 int  hle_d3d8_pb_inline_on(void);
 
@@ -319,9 +324,161 @@ static int  g_shadow_fullscreen;
  * kept by the host shell's window, below. */
 static void shadow_set_fullscreen(HWND hwnd, int on);
 
+/* ---- the mouse
+ *
+ * Its buttons go to the bindings as they arrive (mouse: sources). With
+ * mouse look on (recomp_mouse_look) the window also takes the pointer while
+ * it is in front: hidden, held inside the client area, and its motion read
+ * as raw input, which keeps coming at the edge of the screen and has no
+ * pointer acceleration in it. Switching away gives the pointer back; a
+ * click in the window, or switching back to it, takes it again. The click
+ * that takes it is not passed on, so it does not also fire. All of this
+ * runs on the window's own thread. */
+static int  g_mouse_look = -1;          /* -1 not asked yet */
+static int  g_mouse_captured;
+static UINT g_mouse_down;               /* buttons this window saw go down */
+
+static int shadow_mouse_look(void)
+{
+    if (g_mouse_look < 0) {
+        const char *bg = getenv("RECOMP_WINDOW_BACKGROUND");
+
+        /* Never for a background run: it must not take anything from the
+         * person at the desk, the pointer least of all. */
+        g_mouse_look = recomp_mouse_look() && !(bg && *bg && strcmp(bg, "0") != 0);
+    }
+    return g_mouse_look;
+}
+
+static void shadow_mouse_clip(HWND hwnd)
+{
+    RECT r;
+    POINT a, b;
+
+    GetClientRect(hwnd, &r);
+    a.x = r.left;  a.y = r.top;
+    b.x = r.right; b.y = r.bottom;
+    ClientToScreen(hwnd, &a);
+    ClientToScreen(hwnd, &b);
+    r.left = a.x;  r.top = a.y;
+    r.right = b.x; r.bottom = b.y;
+    ClipCursor(&r);
+}
+
+static void shadow_mouse_capture(HWND hwnd, int on)
+{
+    if (on && !shadow_mouse_look())
+        return;
+    if (on == g_mouse_captured) {
+        if (on)
+            shadow_mouse_clip(hwnd);        /* the window moved or changed size */
+        return;
+    }
+    g_mouse_captured = on;
+    if (on) {
+        RAWINPUTDEVICE rid;
+
+        rid.usUsagePage = 0x01;             /* generic desktop */
+        rid.usUsage     = 0x02;             /* mouse */
+        rid.dwFlags     = 0;                /* only while this window is in front */
+        rid.hwndTarget  = hwnd;
+        if (!RegisterRawInputDevices(&rid, 1, sizeof rid))
+            fprintf(stderr, "[HLE-D3D8] mouse look: no raw input (%lu)\n", GetLastError());
+        shadow_mouse_clip(hwnd);
+        SetCursor(NULL);
+    } else {
+        ClipCursor(NULL);
+        recomp_mouse_release();
+        g_mouse_down = 0;
+    }
+}
+
+/* One button, from its window message: 1 when the message was this. */
+static int shadow_mouse_button(HWND hwnd, UINT msg, WPARAM wp)
+{
+    int button, down;
+
+    switch (msg) {
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP: button = RECOMP_MOUSE_LEFT;   break;
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP: button = RECOMP_MOUSE_RIGHT;  break;
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP: button = RECOMP_MOUSE_MIDDLE; break;
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+        button = GET_XBUTTON_WPARAM(wp) == XBUTTON2 ? RECOMP_MOUSE_X2 : RECOMP_MOUSE_X1;
+        break;
+    default:
+        return 0;
+    }
+    down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+           msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN;
+    if (down && shadow_mouse_look() && !g_mouse_captured) {
+        shadow_mouse_capture(hwnd, 1);
+        return 1;
+    }
+    recomp_mouse_button(button, down);
+    /* Held outside the window, a button's release would go to whatever is
+     * under the pointer and the game would see it held for good. */
+    if (down) {
+        if (!g_mouse_down)
+            SetCapture(hwnd);
+        g_mouse_down |= 1u << button;
+    } else {
+        g_mouse_down &= ~(1u << button);
+        if (!g_mouse_down)
+            ReleaseCapture();
+    }
+    return 1;
+}
+
+static void shadow_mouse_raw(LPARAM lp)
+{
+    RAWINPUT ri;
+    UINT size = sizeof ri;
+
+    if (!g_mouse_captured)
+        return;
+    if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) ==
+            (UINT)-1 || ri.header.dwType != RIM_TYPEMOUSE)
+        return;
+    /* Absolute reports come from a tablet or a remote desktop session, and
+     * are positions rather than movement; mouse look has nothing to do with
+     * them. */
+    if (ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)
+        return;
+    if (ri.data.mouse.lLastX || ri.data.mouse.lLastY)
+        recomp_mouse_move((float)ri.data.mouse.lLastX, (float)ri.data.mouse.lLastY);
+}
+
 static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (shadow_mouse_button(hwnd, msg, wp))
+        return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP ? TRUE : 0;
     switch (msg) {
+    case WM_INPUT:
+        shadow_mouse_raw(lp);
+        break;                          /* DefWindowProc cleans up after it */
+    case WM_ACTIVATE:
+        /* Switched to by keyboard: take the pointer now. Clicked to the
+         * front: on the click, if it lands in the window (shadow_mouse_button)
+         * -- one on the title bar is someone moving the window. */
+        if (LOWORD(wp) == WA_INACTIVE)
+            shadow_mouse_capture(hwnd, 0);
+        else if (LOWORD(wp) == WA_ACTIVE && !HIWORD(wp))   /* not minimised */
+            shadow_mouse_capture(hwnd, 1);
+        break;
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        /* Something else took the mouse (a system dialog, the window menu):
+         * nothing still counts as held. */
+        if (g_mouse_down) {
+            g_mouse_down = 0;
+            recomp_mouse_release();
+        }
+        break;
+    case WM_SIZE:
+    case WM_MOVE:
+        if (g_mouse_captured)
+            shadow_mouse_clip(hwnd);
+        break;
     case WM_SYSKEYDOWN:
         /* Alt+Enter, the usual Windows key for it: fullscreen and back. */
         if (wp == VK_RETURN && (lp & (1 << 29)) && !(lp & (1 << 30))) {
@@ -334,8 +491,9 @@ static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             return 0;                   /* no beep for Alt+Enter */
         break;
     case WM_SETCURSOR:
-        /* The game has no pointer; over a fullscreen picture it is in the way. */
-        if (g_shadow_fullscreen && LOWORD(lp) == HTCLIENT) {
+        /* The game has no pointer; over a fullscreen picture it is in the
+         * way, and with mouse look the pointer is not a pointer at all. */
+        if ((g_shadow_fullscreen || g_mouse_captured) && LOWORD(lp) == HTCLIENT) {
             SetCursor(NULL);
             return TRUE;
         }
@@ -423,6 +581,7 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
     WNDCLASSA wc;
     RECT r;
     MSG msg;
+    DWORD ex_style = 0;
 
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc   = shadow_wndproc;
@@ -431,12 +590,39 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
     wc.lpszClassName = "xboxrecomp_hle_d3d8_shadow";
     RegisterClassA(&wc);
 
+    {
+        /* No bigger than the screen it opens on, frame included, keeping
+         * its shape: CW_USEDEFAULT puts a new window on the primary
+         * monitor, whose work area is the desktop less the taskbar. */
+        RECT work, frame = { 0, 0, 0, 0 };
+        int w = (int)req->width, h = (int)req->height;
+
+        AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
+            recomp_window_fit((work.right - work.left) - (frame.right - frame.left),
+                              (work.bottom - work.top) - (frame.bottom - frame.top),
+                              &w, &h);
+            req->width = (UINT)w;
+            req->height = (UINT)h;
+        }
+    }
     r.left = 0;
     r.top = 0;
     r.right = (LONG)req->width;
     r.bottom = (LONG)req->height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    req->hwnd = CreateWindowA(wc.lpszClassName, "xboxrecomp - D3D8 replacement (shadow)",
+    /* A background run's window is never activated, not even by a click:
+     * WS_EX_NOACTIVATE keeps the focus where it is however the window is
+     * shown. WS_EX_APPWINDOW keeps it on the taskbar, which NOACTIVATE
+     * would otherwise take it off. */
+    {
+        const char *bg = getenv("RECOMP_WINDOW_BACKGROUND");
+
+        if (bg && *bg && strcmp(bg, "0") != 0)
+            ex_style = WS_EX_NOACTIVATE | WS_EX_APPWINDOW;
+    }
+    req->hwnd = CreateWindowExA(ex_style, wc.lpszClassName,
+                              "xboxrecomp - D3D8 replacement (shadow)",
                               WS_OVERLAPPEDWINDOW,
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               r.right - r.left, r.bottom - r.top,
@@ -565,6 +751,29 @@ static void shadow_host_fullscreen(void *user, int on)
     xbox_D3D8SetFullscreen(on ? TRUE : FALSE);
 }
 
+/* The mouse, for mouse look and mouse: bindings. The shell reports motion
+ * only while the window holds the pointer, which it does only with mouse
+ * look on (shadow_window), and every button up when the window loses the
+ * focus. */
+static void shadow_host_mouse_motion(void *user, float dx, float dy)
+{
+    (void)user;
+    recomp_mouse_move(dx, dy);
+}
+
+static void shadow_host_mouse_button(void *user, int button, int down)
+{
+    (void)user;
+    switch (button) {
+    case 1: recomp_mouse_button(RECOMP_MOUSE_LEFT, down);   break;
+    case 2: recomp_mouse_button(RECOMP_MOUSE_MIDDLE, down); break;
+    case 3: recomp_mouse_button(RECOMP_MOUSE_RIGHT, down);  break;
+    case 4: recomp_mouse_button(RECOMP_MOUSE_X1, down);     break;
+    case 5: recomp_mouse_button(RECOMP_MOUSE_X2, down);     break;
+    default: break;
+    }
+}
+
 static HWND shadow_window(UINT width, UINT height)
 {
     host_window_callbacks cb;
@@ -575,6 +784,8 @@ static HWND shadow_window(UINT width, UINT height)
     cb.on_key = shadow_host_key;
     cb.on_resize = shadow_host_resize;
     cb.on_fullscreen = shadow_host_fullscreen;
+    cb.on_mouse_motion = shadow_host_mouse_motion;
+    cb.on_mouse_button = shadow_host_mouse_button;
     /* The title's own name, out of its XBE certificate (UTF-8). */
     g_shadow_host = host_window_open((int)width, (int)height, xbox_XbeTitleName(), &cb);
     if (!g_shadow_host) {
@@ -593,6 +804,10 @@ static HWND shadow_window(UINT width, UINT height)
      * staying out of the way (the shell refuses it then as well). */
     if (!host_window_background() && recomp_config_bool("RECOMP_FULLSCREEN", "fullscreen", 0))
         host_window_set_fullscreen(g_shadow_host, 1);
+    /* Mouse look: the window holds the pointer while it is in front. Not
+     * for a background run, which must not take it from anyone. */
+    if (!host_window_background() && recomp_mouse_look())
+        host_window_set_relative_mouse(g_shadow_host, 1);
     return (HWND)target;
 }
 
@@ -888,8 +1103,13 @@ static void shadow_create(uint32_t pp_va)
          * thread here, the main thread off Windows) and touches no guest
          * state, so the other guest threads keep running meanwhile. */
         int held = xbox_GuestLockDrop();
+        UINT win_w, win_h;
 
-        hwnd = shadow_window(width, height);
+        /* The window opens at the shape the picture is presented at --
+         * 16:9 in widescreen -- at the guest's height; the back buffer
+         * below stays the guest's own size whatever the window is. */
+        xbox_D3D8DefaultWindowSize(width, height, &win_w, &win_h);
+        hwnd = shadow_window(win_w, win_h);
         xbox_GuestLockRestore(held);
     }
     g_shadow_hwnd = hwnd;
@@ -995,6 +1215,7 @@ struct shadow_program {
      * stream 0 vertex, as they are when the host can read the format
      * (packed_raw, packed_size bytes) and unpacked when it cannot. */
     uint8_t  packed_stream[SHADOW_MAX_PACKED];
+    uint8_t  packed_reg[SHADOW_MAX_PACKED];      /* the v register it feeds */
     uint8_t  packed_raw[SHADOW_MAX_PACKED];
     UINT     packed_size[SHADOW_MAX_PACKED];
     int      other_streams;              /* any register from stream 1..15 */
@@ -1139,11 +1360,14 @@ static void shadow_read_declaration(int slot, uint32_t handle);
 void hle_d3d8_push_arrays_off(void);
 
 
+static int g_pushed_active;              /* below, with the pushed programs */
+
 static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
 {
     int i;
 
     hle_d3d8_push_arrays_off();
+    g_pushed_active = 0;                 /* the API's choice from here on */
     if (shadow_trace_on())
         fprintf(stderr, "[TRACE swap %lu] vertex shader 0x%08X (slot %u)\n",
                 g_shadow_swaps, handle, address);
@@ -1181,6 +1405,110 @@ static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
     g_shadow_vs_kind = i >= 0 ? g_programs[i].kind : -1;
     if (g_shadow_vs_kind == SHADER_HOST_PROGRAM)
         host_SetVertexShader(g_shadow, g_programs[i].host);
+}
+
+/* A program the title loads and starts itself, by writing
+ * SET_TRANSFORM_PROGRAM_LOAD, SET_TRANSFORM_PROGRAM and
+ * SET_TRANSFORM_PROGRAM_START into the push buffer with no XDK call -- the
+ * push-buffer walk (hle_d3d8_vertex.c) mirrors the program memory and hands
+ * the started program here. Turok: Evolution loads ~57 programs a frame that
+ * way, its characters among them; drawn under whatever the API last selected,
+ * they came out as slabs of their own texture sheets.
+ *
+ * It runs through one g_programs entry of its own, keeping the declaration of
+ * the shader the API selected, until the API selects another. Host programs
+ * are shared by content with LoadVertexShaderProgram's (g_slot_programs). */
+static int g_pushed_entry = -1;
+static DWORD g_pushed_uncached;          /* the current one, when the cache is full */
+static unsigned long g_pushed_starts, g_pushed_failed;
+
+/* Around one of the walk's draws: the program the title started, if it has
+ * started one since the API last selected a shader. The selection is put
+ * back afterwards, on both sides. */
+typedef struct {
+    int used, is_program, kind, slot;
+} PushedProgramSave;
+
+static void pushed_program_begin(PushedProgramSave *s)
+{
+    s->used = g_shadow && g_pushed_active && g_pushed_entry >= 0;
+    if (!s->used)
+        return;
+    s->is_program = g_shadow_vs_is_program;
+    s->kind = g_shadow_vs_kind;
+    s->slot = g_shadow_vs_slot;
+    g_shadow_vs_is_program = 1;
+    g_shadow_vs_kind = SHADER_HOST_PROGRAM;
+    g_shadow_vs_slot = g_pushed_entry;
+    host_SetVertexShader(g_shadow, g_programs[g_pushed_entry].host);
+}
+
+static void pushed_program_end(const PushedProgramSave *s)
+{
+    if (!s->used)
+        return;
+    g_shadow_vs_is_program = s->is_program;
+    g_shadow_vs_kind = s->kind;
+    g_shadow_vs_slot = s->slot;
+    if (s->kind == SHADER_HOST_PROGRAM && s->slot >= 0)
+        host_SetVertexShader(g_shadow, g_programs[s->slot].host);
+    else if (!s->is_program)
+        host_SetVertexShader(g_shadow, g_shadow_vs);
+}
+
+void hle_d3d8_pb_program_started(const DWORD *microcode, int count)
+{
+    struct shadow_program *p;
+    uint32_t hash;
+    DWORD host = 0;
+    int i;
+
+    if (!g_shadow || count <= 0 || count > SHADOW_PROGRAM_SLOTS)
+        return;
+    hash = microcode_hash(microcode, count);
+    i = slot_program_find(hash, count, microcode);
+    if (i >= 0) {
+        host = g_slot_programs[i].host;
+    } else if (FAILED(host_vsh_create_shader(microcode, count, &host))) {
+        if (g_pushed_failed++ < 3)
+            fprintf(stderr, "[HLE-D3D8] a program the title started itself (%d instructions) "
+                    "could not be made; its draws keep the selected one\n", count);
+        return;
+    } else if (g_slot_program_count < SLOT_PROGRAM_CACHE) {
+        SlotProgram *sp = &g_slot_programs[g_slot_program_count++];
+        sp->hash = hash;
+        sp->count = count;
+        sp->host = host;
+    } else {
+        if (g_pushed_uncached)
+            host_vsh_delete_shader(g_pushed_uncached);
+        g_pushed_uncached = host;
+    }
+    if (g_pushed_entry < 0) {
+        if (g_program_count >= SHADOW_MAX_PROGRAMS)
+            return;
+        g_pushed_entry = g_program_count++;
+        memset(&g_programs[g_pushed_entry], 0, sizeof g_programs[g_pushed_entry]);
+    }
+    /* Only the walk's own draws run it (pushed_program_begin): the title's
+     * API draws keep the shader the API selected, as the XDK's lazy state
+     * puts that back when it next draws. Made current for everything, the
+     * front end's 2D -- drawn through the API, with a fixed-function FVF --
+     * ran under it with no vertex layout, and 79,000 draws in a session were
+     * skipped as "program without layout": a main menu with no menu. */
+    p = &g_programs[g_pushed_entry];
+    memset(p, 0, sizeof *p);
+    p->guest = 0xFFFFFFFEu;              /* no handle names it */
+    p->host = host;
+    p->kind = SHADER_HOST_PROGRAM;
+    p->from_slot = 1;                    /* the host program is not this entry's */
+    g_pushed_active = 1;
+    if (g_pushed_starts++ == 0)
+        fprintf(stderr, "[HLE-D3D8] the title starts vertex programs it loads itself "
+                "(%d instructions first); drawn with those\n", count);
+    if (shadow_trace_on())
+        fprintf(stderr, "[TRACE swap %lu] pushed vertex program, %d instructions, host 0x%08lX\n",
+                g_shadow_swaps, count, (unsigned long)host);
 }
 
 /* ---------------------------------------------------------------- drawing */
@@ -1702,6 +2030,22 @@ unsigned long hle_d3d8_screen_changes(void)
 /* Set by the key that asks for the frame on screen; see overlay_frame. */
 static int g_dump_requested;
 
+/* `name` in the executable's own folder: where F11's picture and capture go.
+ * They were relative names, so they landed in the folder the game was started
+ * from -- / for a game opened from Finder, which cannot be written, and the
+ * key appeared to do nothing. Falls back to the bare name. */
+void hle_d3d8_beside_exe(char *out, size_t bytes, const char *name)
+{
+    char dir[1024];
+
+    if (host_exe_path(dir, sizeof dir)) {
+        host_path_dirname(dir);
+        snprintf(out, bytes, "%s/%s", dir, name);
+    } else {
+        snprintf(out, bytes, "%s", name);
+    }
+}
+
 static void shadow_dump_next_frame(void)
 {
     g_dump_requested = 1;
@@ -1869,7 +2213,12 @@ static void ram_dump_at_swap(void)
             snprintf(path, sizeof path, "%s_%lu.bin", prefix, g_shadow_swaps);
             f = fopen(path, "wb");
             if (f) {
-                fwrite(HLE_PTR(0), 1, g_xbox_total_ram, f);
+                /* RECOMP_RAM_DUMP_BASE=0x80000000: the contiguous window
+                 * instead, where textures and vertex buffers are addressed by
+                 * their physical offset. */
+                const char *b = getenv("RECOMP_RAM_DUMP_BASE");
+                uint32_t base = b ? (uint32_t)strtoul(b, NULL, 0) : 0u;
+                fwrite(HLE_PTR(base), 1, g_xbox_total_ram, f);
                 fclose(f);
                 fprintf(stderr, "[RAM-DUMP] swap %lu: %lu bytes to %s\n", g_shadow_swaps,
                         (unsigned long)g_xbox_total_ram, path);
@@ -1882,10 +2231,10 @@ static void shadow_dump_frame(void)
 {
     ram_dump_at_swap();
     static const char *prefix;
-    static int configured, every = 300, written, keep_last;
+    static int configured, every = 300, written, keep_last, max_files = 24;
     static unsigned long min_draws, last_dump, from_swap;
     static char ring[24][512];
-    static char asked_prefix[8];
+    static char asked_prefix[1024];
     int asked;
     char path[512];
 
@@ -1911,6 +2260,12 @@ static void shadow_dump_frame(void)
          * frames, as <prefix>_s<swap>.bmp. Without it a fast title fills the
          * 24 files in its first few hundred swaps: Outrun 2's matrix frames
          * all showed the intro logos while it was 90 seconds into a race. */
+        /* RECOMP_HLE_D3D8_DUMP_MAX=<n>: more than 24 files, for a run of
+         * consecutive frames long enough to catch a draw that drops out of
+         * one frame in many (flicker). */
+        e = getenv("RECOMP_HLE_D3D8_DUMP_MAX");
+        if (e && atoi(e) > 0)
+            max_files = atoi(e);
         e = getenv("RECOMP_HLE_D3D8_DUMP_KEEP_LAST");
         if (e && atoi(e) > 0)
             keep_last = atoi(e) > 24 ? 24 : atoi(e);
@@ -1921,13 +2276,13 @@ static void shadow_dump_frame(void)
     asked = g_dump_requested;
     g_dump_requested = 0;
     if (asked && (!prefix || !*prefix)) {
-        snprintf(asked_prefix, sizeof asked_prefix, "frame");
+        hle_d3d8_beside_exe(asked_prefix, sizeof asked_prefix, "frame");
         prefix = asked_prefix;
     }
     if (!asked) {
         if (!prefix || !*prefix || g_shadow_swaps < from_swap)
             return;
-        if (written >= 24 && !keep_last)
+        if (written >= max_files && !keep_last)
             return;
         if (min_draws) {
             if (g_frame_draws < min_draws ||
@@ -2733,11 +3088,16 @@ static int cpu_frame_present(void)
     return g_cpu_frame_live;
 }
 
+/* When the title last finished a frame (frame_end_shadow). */
+static DWORD g_last_frame_end;
+
 static void frame_end_shadow(void)
 {
     if (g_shadow) {
         DWORD now = GetTickCount();
         DWORD thread = GetCurrentThreadId();
+
+        g_last_frame_end = now;
 
         /* Which guest threads swap, against the one that created the device.
          * Capped, in case they alternate. */
@@ -2871,6 +3231,72 @@ static void frame_end_shadow(void)
     }
 }
 
+/* The title's swap callback (D3DDevice_SetSwapCallback), raised once a
+ * frame has been flipped.
+ *
+ * On a console the XDK calls it from its GPU interrupt when the flip takes
+ * effect, with a D3DSWAPDATA saying which swap and which vblank. No GPU here
+ * raises that interrupt, so it never came: the 5960 dashboard's online
+ * updater sets a "frame in flight" flag before every Swap and draws nothing
+ * until its callback clears it, so it showed one frame and then waited
+ * forever. The flip gate has already held this Swap to a vblank by the time
+ * the title's own body returns, so the frame is up and the callback is due.
+ *
+ * The callback is wherever SetSwapCallback stored it in the device; the
+ * offset comes from the title's XDK symbols, so a title whose symbols do not
+ * name it keeps the old behaviour. __cdecl void (D3DSWAPDATA *). */
+HLE_IMPORT_VAR(D3DDevice__m_SwapCallback_OFFSET);
+static void run_swap_callback(void)
+{
+    static uint32_t swaps;
+    static int said_missing;
+    uint32_t device, callback, data;
+    uint32_t saved_esp, saved_eax;
+    recomp_func_t fn;
+
+    swaps++;
+    if (!hle_var_D3D_g_pDevice || !hle_var_D3DDevice__m_SwapCallback_OFFSET)
+        return;
+    device = HLE_MEM32(hle_var_D3D_g_pDevice);
+    if (!device)
+        return;
+    callback = HLE_MEM32(device + hle_var_D3DDevice__m_SwapCallback_OFFSET);
+    if (!callback)
+        return;
+    fn = recomp_lookup(callback);
+    if (!fn)
+        fn = recomp_lookup_manual(callback);
+    if (!fn) {
+        if (!said_missing++)
+            fprintf(stderr, "[HLE-D3D8] swap callback 0x%08X is not in the dispatch "
+                    "table; it does not run\n", callback);
+        return;
+    }
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[HLE-D3D8] swap callback 0x%08X (device +0x%X) raised after "
+                    "each flip, as the GPU interrupt would\n",
+                    callback, hle_var_D3DDevice__m_SwapCallback_OFFSET);
+    }
+    saved_esp = g_esp;
+    saved_eax = g_eax;
+    /* D3DSWAPDATA on the guest stack: Swap, SwapVBlank, MissedVBlanks,
+     * TimeUntilSwapVBlank, TimeBetweenSwapVBlanks. */
+    g_esp -= 32;
+    data = g_esp;
+    HLE_MEM32(data + 0) = swaps;
+    HLE_MEM32(data + 4) = swaps;
+    HLE_MEM32(data + 8) = 0;
+    HLE_MEM32(data + 12) = 0;
+    HLE_MEM32(data + 16) = 0;
+    g_esp -= 4; HLE_MEM32(g_esp) = data;
+    g_esp -= 4; HLE_MEM32(g_esp) = 0;        /* return address, popped by its ret */
+    fn();
+    g_esp = saved_esp;
+    g_eax = saved_eax;
+}
+
 HLE_EXPORT(D3DDevice_Swap)
 {
     static int seen;
@@ -2933,6 +3359,7 @@ HLE_EXPORT(D3DDevice_Swap)
         g_swap_last = t2;
         g_swap_timed++;
     }
+    run_swap_callback();
     frame_end_shadow();
 }
 
@@ -3267,6 +3694,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
             p->packed_out[packed] = out;
             p->packed_format[packed] = format;
             p->packed_stream[packed] = (uint8_t)(stream == base ? 0u : stream);
+            p->packed_reg[packed] = (uint8_t)i;
             p->packed_raw[packed] = 0;
             p->packed_size[packed] = size;
             packed++;
@@ -3280,6 +3708,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
             p->packed_out[packed] = out;
             p->packed_format[packed] = format;
             p->packed_stream[packed] = (uint8_t)(stream == base ? 0u : stream);
+            p->packed_reg[packed] = (uint8_t)i;
             p->packed_raw[packed] = 1;
             p->packed_size[packed] = size;
             packed++;
@@ -3795,8 +4224,25 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
  * the immediate-mode path already uses, and its own declaration put back.
  * 1 when drawn; 0 when no host program is selected (the caller then falls
  * back to the declaration path). `idx` NULL for a non-indexed draw. */
+static int draw_registers(uint32_t xpt, uint32_t nverts, const float (*verts)[16][4],
+                          const uint16_t *idx, uint32_t nidx);
+
+/* Only the walk draws this way, so a program the title started itself
+ * applies (pushed_program_begin). */
 int hle_d3d8_draw_registers(uint32_t xpt, uint32_t nverts, const float (*verts)[16][4],
                             const uint16_t *idx, uint32_t nidx)
+{
+    PushedProgramSave s;
+    int drawn;
+
+    pushed_program_begin(&s);
+    drawn = draw_registers(xpt, nverts, verts, idx, nidx);
+    pushed_program_end(&s);
+    return drawn;
+}
+
+static int draw_registers(uint32_t xpt, uint32_t nverts, const float (*verts)[16][4],
+                          const uint16_t *idx, uint32_t nidx)
 {
     struct shadow_program *p, saved;
     D3D8VshInput in[16];
@@ -3960,7 +4406,11 @@ void hle_d3d8_pb_inline_method(uint32_t method, uint32_t value)
         } else if (g_pbi_group) {
             g_pbi_groups++;
             if (g_inline_nverts) {
+                PushedProgramSave s;
+
+                pushed_program_begin(&s);   /* the title's own group */
                 inline_draw();
+                pushed_program_end(&s);
                 g_pbi_drawn++;
             }
             g_inline_on = 0;
@@ -5208,7 +5658,34 @@ HLE_EXPORT(D3DDevice_EnableOverlay)
     }
 }
 
-#ifdef _WIN32
+HLE_ORIGINAL(D3DDevice_GetDisplayFieldStatus);
+
+/* void D3DDevice_GetDisplayFieldStatus(D3DFIELD_STATUS *pFieldStatus)
+ *
+ * { Field, VBlankCount }, Field being D3DFIELD_ODD (1), _EVEN (2) or
+ * _PROGRESSIVE (3). The XDK's body writes the vblank count and, in an
+ * interlaced mode, a field from a device flag that its interrupt handler
+ * sets from the TV encoder -- which nothing here emulates, so the flag never
+ * changed and the field was odd for ever. Pro Evolution Soccer 5's XMV
+ * player starts its clock (and calls SynchPlayback) only on a field that is
+ * not odd, so its intro movie never began: the decoder queued two sound
+ * packets and waited on them for good, after the logos.
+ *
+ * The body still runs, for the count and for a progressive mode; an
+ * interlaced field is then taken from the count, so it alternates every
+ * vblank as the console's does. */
+HLE_EXPORT(D3DDevice_GetDisplayFieldStatus)
+{
+    uint32_t status = HLE_ARG(0);
+
+    HLE_CALL_ORIGINAL(D3DDevice_GetDisplayFieldStatus);
+    if (status) {
+        uint32_t field = HLE_MEM32(status);
+        if (field == 1u || field == 2u)
+            HLE_MEM32(status) = (HLE_MEM32(status + 4u) & 1u) ? 1u : 2u;
+    }
+}
+
 /* A picture the title decoded itself, put on the overlay plane.
  *
  * The plane's picture came only from hle_xmv.c, which decodes XMV movies on
@@ -5286,7 +5763,6 @@ static void overlay_from_surface(uint32_t surface)
     }
     d3d8_movie_set_frame(bgra, w, h);
 }
-#endif
 
 /* void D3DDevice_UpdateOverlay(D3DSurface *pSurface, const RECT *SrcRect,
  *     const RECT *DstRect, BOOL EnableColorKey, D3DCOLOR ColorKey)          */
@@ -5297,15 +5773,34 @@ HLE_EXPORT(D3DDevice_UpdateOverlay)
     first_call(&seen, "D3DDevice_UpdateOverlay", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_UpdateOverlay, "D3DDevice_UpdateOverlay"))
         HLE_RETURN(0u);
-#ifdef _WIN32
     /* Before the body: it pops the arguments. */
     overlay_from_surface(HLE_ARG(0));
-#endif
     HLE_CALL_ORIGINAL(D3DDevice_UpdateOverlay);
     /* A title that never calls EnableOverlay still means the plane to show
      * when it updates it; the XDK turns it on at the first update. */
     g_overlay_enabled = 1;
     g_overlay_updated = HLE_ARG(0) != 0;
+
+    /* The overlay is a plane the scan-out shows whether or not the title
+     * flips, and a movie player may only ever update it: Pro Evolution
+     * Soccer 5's intro calls UpdateOverlay for each decoded frame and no
+     * Swap at all, so the host, which shows the movie when a frame ends,
+     * showed nothing and the intro was black with its sound playing. With
+     * no frame ended for a while, the update is shown on its own. A title
+     * that swaps as well (Future Perfect) never gets here. */
+    if (g_shadow && g_overlay_updated &&
+        GetTickCount() - g_last_frame_end > 100u) {
+        static int said;
+        if (!said++) {
+            fprintf(stderr, "[HLE-D3D8] overlay: the title updates the video overlay "
+                    "without swapping; each update is shown on its own (guest "
+                    "thread %lu, device on %lu)\n", (unsigned long)GetCurrentThreadId(),
+                    (unsigned long)g_shadow_create_thread);
+            fflush(stderr);
+        }
+        d3d8_movie_draw();
+        host_Swap(g_shadow, 0);
+    }
 }
 
 /* void D3DDevice_SetRenderTargetFast(D3DSurface *pRenderTarget,
@@ -5514,6 +6009,40 @@ HLE_EXPORT(D3DDevice_CopyRects)
 }
 
 
+/* What a packed register whose stream has no buffer reads: the register's
+ * current value (d3d8_vsh_get_vertex_data; (0, 0, 0, 1) until the title sets
+ * one), in the form its slot in the expanded vertex holds -- floats for an
+ * unpacked format, or the host's own format for one copied as it is. */
+static void packed_current(const struct shadow_program *p, int k, uint8_t *dst)
+{
+    float v[4];
+    int floats;
+    UINT size;
+
+    d3d8_vsh_get_vertex_data(p->packed_reg[k], v);
+    if (!p->packed_raw[k]) {
+        floats = xbox_vsdt_expanded(p->packed_format[k], &size);
+        memcpy(dst, v, (size_t)floats * sizeof v[0]);
+        return;
+    }
+    switch (p->packed_format[k]) {
+    case 0x12: case 0x22: case 0x32: case 0x42:          /* FLOAT1..4 */
+        memcpy(dst, v, p->packed_size[k]);
+        break;
+    case 0x40: {                                          /* D3DCOLOR, BGRA */
+        int c;
+        for (c = 0; c < 4; c++) {
+            float f = v[c == 3 ? 3 : 2 - c];
+            dst[c] = (uint8_t)(f <= 0 ? 0 : f >= 1 ? 255 : (int)(f * 255.0f + 0.5f));
+        }
+        break;
+    }
+    default:                                              /* shorts, bytes */
+        memset(dst, 0, p->packed_size[k]);
+        break;
+    }
+}
+
 /* The vertices a program with NORMPACKED3 registers reads: each vertex copied
  * behind its unpacked normals, as shadow_read_declaration laid them out. The
  * bits are x:11, y:11, z:10, signed, divided by 1023, 1023 and 511
@@ -5622,7 +6151,14 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
         base[k] = first == NO_FIRST_VERTEX ? NULL
                 : (const uint8_t *)hle_d3d8_stream_vertices(p->packed_stream[k], first,
                                                             vertices, &sstride[k]);
-        if (!base[k] || sstride[k] < p->packed_offset[k] + p->packed_size[k]) {
+        /* A stream with no buffer behind it: the NV2A reads the register's
+         * current value for every vertex (packed_current below). XGRA's
+         * fixed-function declarations put the normal on stream 2 and never
+         * bind it; refusing those draws took two of every three of them,
+         * its skies and terrain among them. */
+        if (!base[k])
+            continue;
+        if (sstride[k] < p->packed_offset[k] + p->packed_size[k]) {
             *failed = 1;
             return NULL;
         }
@@ -5644,9 +6180,15 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
         uint8_t *dst = out + (size_t)v * out_stride;
 
         for (k = 0; k < p->packed_count; k++) {
-            const uint8_t *at = base[k] + (size_t)v * sstride[k] + p->packed_offset[k];
+            const uint8_t *at;
             float n[4];
             int c, count;
+
+            if (!base[k]) {
+                packed_current(p, k, dst + p->packed_out[k]);
+                continue;
+            }
+            at = base[k] + (size_t)v * sstride[k] + p->packed_offset[k];
 
             if (p->packed_raw[k]) {
                 memcpy(dst + p->packed_out[k], at, p->packed_size[k]);
@@ -5708,6 +6250,10 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
     if (!g_shadow || !verts || !stride || !count)
         return;
     hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
+    if (!hle_d3d8_pb_walking()) {
+        hle_d3d8_apply_pending_textures();
+        hle_d3d8_apply_pending_constants();
+    }
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
@@ -5766,6 +6312,10 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
     if (!g_shadow || !idx || !verts || !stride || !count)
         return;
     hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
+    if (!hle_d3d8_pb_walking()) {
+        hle_d3d8_apply_pending_textures();
+        hle_d3d8_apply_pending_constants();
+    }
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {

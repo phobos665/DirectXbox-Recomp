@@ -1,5 +1,5 @@
 /**
- * Rainbow Six 3 - Recompiled Game Entry Point
+ * Xbox Online Updater (the 5960 dashboard's update.xbe) - Recompiled Entry Point
  *
  * This is the executable that hosts the recompiled game code, on Windows,
  * macOS and Linux. It performs the following initialization sequence:
@@ -26,7 +26,7 @@
  * src/platform/recomp_fault.h), not here.
  *
  * XBE Details (fill in from xbe_parser output):
- *   Title:       Rainbow Six 3
+ *   Title:       Online Updater Application (FFFE0000)
  *   Title ID:    0x00000000
  *   Base addr:   0x00010000
  *   Entry point: 0x00000000
@@ -91,14 +91,11 @@ extern ptrdiff_t g_xbox_mem_offset;
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
 #define YOUR_GAME_ENTRY_POINT   0x0009F067  /* XBE entry point VA */
-/* Relative to the executable's own directory, titles/<title>/build/<Config>/,
- * which is where scripts/run_and_report.py starts it. Run it from there by
- * hand too, or the XBE is not found. */
-#define YOUR_GAME_XBE_PATH      "..\\..\\..\\..\\games\\Rainbow Six 3\\default.xbe"
-#define YOUR_GAME_DIR            "..\\..\\..\\..\\games\\Rainbow Six 3"
-/* The image the console boots. A disc whose default.xbe only picks a language
- * and launches another image names that one here. */
-#define YOUR_GAME_XBE_NAME       "default.xbe"
+/* Relative to the executable's own directory, build/<Config>/: the game's
+ * files go in game/ at the top of this repository. A game/ folder beside the
+ * executable is looked at first, and RECOMP_GAME_DIR overrides both. */
+#define YOUR_GAME_XBE_PATH      "..\\..\\game\\default.xbe"
+#define YOUR_GAME_DIR            "..\\..\\game"
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -158,15 +155,39 @@ static BOOL find_game(char *tried, size_t tried_bytes)
     int i;
 
     tried[0] = '\0';
+    /* The updater is launched by the title it updates, from that title's
+     * disc ("\Device\CdRom0;update.xbe"), so on a console its D: is the
+     * title's disc: it reads the disc's files to patch them. The title hands
+     * its RECOMP_GAME_DIR over (launch_map), and that is D: here. The XBE is
+     * always the updater's own, found beside the executable as usual, and
+     * its own files (fonts, sounds) come through C: and Y: -- system_dir,
+     * which defaults to that same folder. */
     if (env && *env) {
-        snprintf(g_game_dir, sizeof g_game_dir, "%s", env);
-        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\%s", env, YOUR_GAME_XBE_NAME);
+        char own[MAX_PATH];
+
+        snprintf(own, sizeof own, "%s", env);
+#ifdef _WIN32
+        SetEnvironmentVariableA("RECOMP_GAME_DIR", NULL);
+#else
+        unsetenv("RECOMP_GAME_DIR");
+#endif
+        if (!find_game(tried, tried_bytes))
+            return FALSE;
+        if (!getenv("RECOMP_SYSTEM_DIR")) {
+#ifdef _WIN32
+            SetEnvironmentVariableA("RECOMP_SYSTEM_DIR", g_game_dir);
+#else
+            setenv("RECOMP_SYSTEM_DIR", g_game_dir, 1);
+#endif
+        }
+        snprintf(g_game_dir, sizeof g_game_dir, "%s", own);
         xbox_path_normalize(g_game_dir);
-        xbox_path_normalize(g_xbe_path);
-        if (file_exists(g_xbe_path))
-            return TRUE;
-        snprintf(tried, tried_bytes, "RECOMP_GAME_DIR: %s", g_xbe_path);
-        return FALSE;
+#ifdef _WIN32
+        SetEnvironmentVariableA("RECOMP_GAME_DIR", own);
+#else
+        setenv("RECOMP_GAME_DIR", own, 1);
+#endif
+        return TRUE;
     }
 
 #ifdef __APPLE__
@@ -185,7 +206,7 @@ static BOOL find_game(char *tried, size_t tried_bytes)
                     strncat(candidate, "/Contents/Resources/game",
                             sizeof candidate - strlen(candidate) - 1);
                 }
-                snprintf(g_xbe_path, sizeof g_xbe_path, "%s/%s", candidate, YOUR_GAME_XBE_NAME);
+                snprintf(g_xbe_path, sizeof g_xbe_path, "%s/default.xbe", candidate);
                 if (file_exists(g_xbe_path)) {
                     snprintf(g_game_dir, sizeof g_game_dir, "%s", candidate);
                     return TRUE;
@@ -213,7 +234,7 @@ static BOOL find_game(char *tried, size_t tried_bytes)
             snprintf(candidate, sizeof candidate, "%s\\%s", dir, YOUR_GAME_DIR + 3);
         else
             break;
-        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\%s", candidate, YOUR_GAME_XBE_NAME);
+        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\default.xbe", candidate);
         xbox_path_normalize(candidate);
         xbox_path_normalize(g_xbe_path);
         if (file_exists(g_xbe_path)) {
@@ -445,7 +466,7 @@ static int title_main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("=== Rainbow Six 3 - Static Recompilation ===\n");
+    printf("=== Xbox Online Updater - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 
     /* The fault handler, first in line: a VEH on Windows, signals on POSIX.
@@ -464,21 +485,21 @@ static int title_main(int argc, char **argv)
             snprintf(message, sizeof message,
                      "This needs the game's own files, which are not included.\n\n"
                      "Put them in a folder called \"game\" next to this program, so that\n"
-                     "\"game\\" YOUR_GAME_XBE_NAME "\" exists, or set RECOMP_GAME_DIR to where they are.\n\n"
+                     "\"game\\default.xbe\" exists, or set RECOMP_GAME_DIR to where they are.\n\n"
                      "Looked for:\n%s", tried);
             fprintf(stderr, "%s\n", message);
             log_hint(message, sizeof message);
-            host_error_box("Rainbow Six 3", message);
+            host_error_box("Xbox Online Updater", message);
             return 1;
         }
         printf("Game files: %s\n", g_game_dir);
         if (!load_xbe(g_xbe_path, &xbe_data, &xbe_size)) {
             snprintf(message, sizeof message,
-                     "Found the game at\n%s\nbut could not read " YOUR_GAME_XBE_NAME ".",
+                     "Found the game at\n%s\nbut could not read default.xbe.",
                      g_game_dir);
             fprintf(stderr, "%s\n", message);
             log_hint(message, sizeof message);
-            host_error_box("Rainbow Six 3", message);
+            host_error_box("Xbox Online Updater", message);
             return 1;
         }
     }

@@ -105,9 +105,13 @@ extern uint32_t g_xbox_code_hi;
  * means this title was lifted before the macros published it. */
 /* g_icall_dispatch_form: recomp_cpu.h. */
 
-/* ── Rainbow Six 3: virtual memory on 64 KB boundaries ─────── */
+/* ── Rainbow Six 3: Black Arrow: virtual memory on 64 KB boundaries ── */
 
 /*
+ * Black Arrow is Rainbow Six 3's engine rebuilt on XDK 5849, and everything
+ * in this file is carried over from Rainbow Six 3 (now its own repository,
+ * Rainbow-six-three-recomp) with the addresses moved.
+ *
  * The title's allocator is Unreal's pooled FMalloc: it takes 64 KB pools from
  * NtAllocateVirtualMemory and finds a block's pool from ptr >> 16, which is
  * exact on the console, where every region starts on the 64 KB allocation
@@ -120,21 +124,22 @@ extern uint32_t g_xbox_code_hi;
  *
  * RECOMP_ETHERNET_LINK=0 too: with no network card the honest answer is "no
  * cable". With the link reported up, XNet ran DHCP against nobody and the
- * start-up loop on XNetGetTitleXnAddr (0x001D0710) waited 25 to 100 s for it
+ * start-up loop on XNetGetTitleXnAddr (RS3's 0x001D0710) waited 25 to 100 s for it
  * to give up.
  *
  * Not set: RECOMP_TITLE_INTERVAL. The title asks D3D for 30 fps
  * (D3DPRESENT_INTERVAL_TWO_OR_IMMEDIATE), but its game is timed by the clock
  * (Unreal's delta time; no fixed step anywhere in the XBE), and the one thing
  * it stepped once a frame, the Bink movies, is paced by the clock below. So
- * it runs at 60, checked by hand in play on 12 Oct 2026.
+ * it runs at 60 -- checked by hand in RS3's play on 12 Oct 2026, assumed
+ * for Black Arrow until its own play says otherwise.
  * RECOMP_TITLE_INTERVAL=1 holds it to the console's 30.
  *
  * Both are set before main, and only if the variable is not already set, so
  * =0 or =1 on the command line still wins.
  */
 #if defined(_MSC_VER)
-static void __cdecl rs3_defaults(void)
+static void __cdecl rs3ba_defaults(void)
 {
     if (!getenv("RECOMP_VA_64K"))
         _putenv("RECOMP_VA_64K=1");
@@ -142,11 +147,11 @@ static void __cdecl rs3_defaults(void)
         _putenv("RECOMP_ETHERNET_LINK=0");
 }
 #pragma section(".CRT$XCU", read)
-__declspec(allocate(".CRT$XCU")) void (__cdecl *rs3_defaults_init)(void) = rs3_defaults;
-#pragma comment(linker, "/include:rs3_defaults_init")
+__declspec(allocate(".CRT$XCU")) void (__cdecl *rs3ba_defaults_init)(void) = rs3ba_defaults;
+#pragma comment(linker, "/include:rs3ba_defaults_init")
 #elif defined(__GNUC__) || defined(__clang__)
 /* The same, for clang and GCC, which skip the MSVC section above. */
-__attribute__((constructor)) static void rs3_defaults(void)
+__attribute__((constructor)) static void rs3ba_defaults(void)
 {
 #ifdef _WIN32
     if (!getenv("RECOMP_VA_64K"))
@@ -160,10 +165,10 @@ __attribute__((constructor)) static void rs3_defaults(void)
 }
 #endif
 
-/* ── Rainbow Six 3: Bink movies paced by the clock ─────────── */
+/* ── Rainbow Six 3: Black Arrow: Bink movies paced by the clock ── */
 
 /*
- * sub_002BC000 is the title's "show the next movie frame": BinkDoFrame,
+ * sub_00337CE0 (RS3's sub_002BC000) is the title's "show the next movie frame": BinkDoFrame,
  * BinkNextFrame, then BinkCopyToBuffer into the locked back buffer. It never
  * calls BinkWait. On the console that is right only because the title runs
  * at 30 (it asks D3D for INTERVAL_TWO) and every movie is 30 fps, so one call
@@ -179,8 +184,12 @@ __attribute__((constructor)) static void rs3_defaults(void)
  * frames behind (the title stopped calling, or a new movie reused the handle)
  * is re-based rather than raced to catch up. RECOMP_RS3_MOVIE_PACE=0 turns
  * it off.
+ *
+ * Black Arrow's version is a thiscall with a fifth argument (`ret 0x14`,
+ * RS3's is `ret 0x10`) and a table of paused movies it consults before
+ * decoding; the Bink handle is still the first stack argument.
  */
-extern void sub_002BC000_gen(void);
+extern void sub_00337CE0_gen(void);
 uint64_t xbox_ReadTimeStampCounter(void);     /* 733,333,333 Hz, the console's */
 void hle_d3d8_cpu_frame_repeat(void);
 int xbox_EnvSwitch(const char *name, int default_on);
@@ -188,7 +197,7 @@ int xbox_EnvSwitch(const char *name, int default_on);
 #define RS3_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
 #define RS3_TSC_HZ 733333333ull
 
-void sub_002BC000(void)
+void sub_00337CE0(void)
 {
     static int pace = -1;
     static uint32_t movie;
@@ -199,7 +208,7 @@ void sub_002BC000(void)
     if (pace < 0)
         pace = xbox_EnvSwitch("RECOMP_RS3_MOVIE_PACE", 1);
     if (!pace || !bink) {
-        sub_002BC000_gen();
+        sub_00337CE0_gen();
         return;
     }
     rate = RS3_MEM32(bink + 0x14);
@@ -224,14 +233,14 @@ void sub_002BC000(void)
         half_frames = 0;
     }
     if (shown * 2u > half_frames + 1u) {
-        /* Not due: the last frame is shown again. `ret 0x10`. */
+        /* Not due: the last frame is shown again. `ret 0x14`. */
         hle_d3d8_cpu_frame_repeat();
         g_eax = 0;
-        g_esp += 4u + 0x10u;
+        g_esp += 4u + 0x14u;
         return;
     }
     shown++;
-    sub_002BC000_gen();
+    sub_00337CE0_gen();
     {
         /* RECOMP_RS3_MOVIE_LOG=1: movie frames shown against the clock. */
         static int log = -1;
@@ -250,6 +259,68 @@ void sub_002BC000(void)
                 log_frames = 0;
             }
         }
+    }
+}
+
+/* ── Black Arrow: the sound engine's own errors ─────────────── */
+
+/*
+ * Two windows into Ubisoft's SND engine, which reports nothing in a retail
+ * build. Both run the title's own code unchanged and only print; both are
+ * off unless RECOMP_RS3_SND_LOG is set. Added 12 Oct 2026 while looking for
+ * why the guns' own reports, the reloads and the night-vision switch are
+ * never requested (docs/technical/rs3ba-audio.md): neither fired, so the
+ * engine is not refusing them -- nothing asks it to play them.
+ *
+ *   sub_00036610  the engine's DirectSound result check: edx is the HRESULT,
+ *                 [esp+4] the call as text; it accepts 0 and 1 and swallows
+ *                 the rest. =1 prints every failure.
+ *   sub_00170A67  sprintf. The engine formats its refusals ("Play fails,
+ *                 first resource 0x%x ... is not loaded", "Unexpected return
+ *                 value %d of SND_fn_eSynchStreamAsyncSnd") into a local
+ *                 buffer and drops them. =1 prints those whose format is the
+ *                 engine's (0x0050C000-0x00510000); =2 also any formatted
+ *                 text that reads like an error.
+ */
+static int rs3ba_snd_log(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_RS3_SND_LOG");
+        on = e ? atoi(e) : 0;
+    }
+    return on;
+}
+
+extern void sub_00036610_gen(void);
+
+void sub_00036610(void)
+{
+    uint32_t hr = g_edx, text = RS3_MEM32(g_esp + 4);
+    if (rs3ba_snd_log() && hr != 0u && hr != 1u) {
+        static unsigned long said;
+        if (said++ < 200)
+            fprintf(stderr, "[SND] failed 0x%08X: %.160s\n", hr,
+                    text ? (const char *)(uintptr_t)(text + g_xbox_mem_offset) : "?");
+    }
+    sub_00036610_gen();
+}
+
+extern void sub_00170A67_gen(void);
+
+void sub_00170A67(void)
+{
+    uint32_t buf = RS3_MEM32(g_esp + 4), fmt = RS3_MEM32(g_esp + 8);
+    int on = rs3ba_snd_log();
+    sub_00170A67_gen();
+    if (on && buf) {
+        const char *t = (const char *)(uintptr_t)(buf + g_xbox_mem_offset);
+        int engine = fmt >= 0x0050C000u && fmt < 0x00510000u;
+        int errorish = strstr(t, "ail") || strstr(t, "rror") || strstr(t, "nexpected") ||
+                       strstr(t, "not loaded");
+        static unsigned long said;
+        if ((engine || (on > 1 && errorish)) && said++ < 400)
+            fprintf(stderr, "[SND] %.200s\n", t);
     }
 }
 

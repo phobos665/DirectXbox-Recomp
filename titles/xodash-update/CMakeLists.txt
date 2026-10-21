@@ -1,19 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ============================================================================
-# Rainbow Six 3 - Static Recompilation
+# Xbox Online Updater (5960 dashboard) - Static Recompilation
 #
-# Copy this template to your game project root and customize:
-#   1. Change the project name below
-#   2. Set XBOXRECOMP_DIR to where you cloned xboxrecomp
-#   3. Adjust source file lists as you add game-specific code
-#   4. Add any game-specific compile definitions or link libraries
+# Built against the xboxrecomp toolkit, a checkout beside this one
+# (../xboxrecomp) unless XBOXRECOMP_DIR says otherwise. See README.md.
 # ============================================================================
 
 # C and C++: the runtime's renderer has C++ in it (the DXC loader, VMA),
 # so the executable links with the C++ driver and its standard library.
 # The game's own sources are all C.
-project(rs3_recomp C CXX)
+project(xodash_update_recomp C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -179,3 +176,10 @@ endif()
 # # A game nobody has described is treated as NATIVE, and looks stretched
 # # if it is not. See src/config/CMakeLists.txt.
 # recomp_title_widescreen(HOR_PLUS REGISTER 60)
+
+# The launcher (the toolkit's src/launcher): the settings worth choosing,
+# written to the file the game reads, then the game started. Beside the
+# game's executable, as xodash_update_launcher.
+if(COMMAND recomp_add_launcher)
+    recomp_add_launcher(xodash_update_launcher $<TARGET_FILE_NAME:${PROJECT_NAME}>)
+endif()
