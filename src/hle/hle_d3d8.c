@@ -1422,6 +1422,18 @@ static int g_pushed_entry = -1;
 static DWORD g_pushed_uncached;          /* the current one, when the cache is full */
 static unsigned long g_pushed_starts, g_pushed_failed;
 
+/* Inside the XDK's own Swap body, and how many programs had been started
+ * when it began. A multisampled device's Swap filters the back buffer down
+ * to the front buffer itself: it starts a two-instruction program through
+ * the push buffer and draws one triangle through Begin/End, all inside
+ * Swap's body. That draw comes back through the D3DDevice_End replacement,
+ * an API draw, so it kept whatever program the title had selected last --
+ * and Forza's front end went black (a strip at the left edge in 16:9)
+ * whenever that was its textured-quad program rather than its plain one:
+ * the name-entry keyboard, and the main menu once its wheel settled. */
+static int g_in_swap_body;
+static unsigned long g_swap_body_starts;
+
 /* Around one of the walk's draws: the program the title started, if it has
  * started one since the API last selected a shader. The selection is put
  * back afterwards, on both sides. */
@@ -3324,7 +3336,10 @@ HLE_EXPORT(D3DDevice_Swap)
             fprintf(stderr, "[TRACE swap %lu] (after %lu draws) Swap flags 0x%X: first half of a frame\n",
                     g_shadow_swaps, g_frame_draws, swap_flags);
 #endif
+        g_in_swap_body = 1;
+        g_swap_body_starts = g_pushed_starts;
         HLE_CALL_ORIGINAL(D3DDevice_Swap);
+        g_in_swap_body = 0;
         return;
     }
 
@@ -3352,7 +3367,10 @@ HLE_EXPORT(D3DDevice_Swap)
             g_swap_frame_ticks += t0.QuadPart - g_swap_last.QuadPart;
         xbox_Nv2aFlipGateArm();
         QueryPerformanceCounter(&t1);
+        g_in_swap_body = 1;
+        g_swap_body_starts = g_pushed_starts;
         HLE_CALL_ORIGINAL(D3DDevice_Swap);
+        g_in_swap_body = 0;
         QueryPerformanceCounter(&t2);
         g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
         g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
@@ -3401,7 +3419,10 @@ HLE_EXPORT(D3DDevice_Present)
             g_swap_frame_ticks += t0.QuadPart - g_swap_last.QuadPart;
         xbox_Nv2aFlipGateArm();
         QueryPerformanceCounter(&t1);
+        g_in_swap_body = 1;
+        g_swap_body_starts = g_pushed_starts;
         HLE_CALL_ORIGINAL(D3DDevice_Present);
+        g_in_swap_body = 0;
         QueryPerformanceCounter(&t2);
         g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
         g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
@@ -4556,7 +4577,22 @@ HLE_EXPORT(D3DDevice_End)
     HLE_CALL_ORIGINAL(D3DDevice_End);
     hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_inline_on) {
+        /* The XDK's own draw inside Swap, under the program it started
+         * there (g_in_swap_body). RECOMP_HLE_D3D8_SWAP_PROGRAM=0 for the
+         * title's selected one. */
+        static int swap_program = -1;
+        PushedProgramSave ps = { 0 };
+        int own;
+
+        if (swap_program < 0)
+            swap_program = getenv("RECOMP_HLE_D3D8_SWAP_PROGRAM") &&
+                           atoi(getenv("RECOMP_HLE_D3D8_SWAP_PROGRAM")) == 0 ? 0 : 1;
+        own = swap_program && g_in_swap_body && g_pushed_starts != g_swap_body_starts;
+        if (own)
+            pushed_program_begin(&ps);
         inline_draw();
+        if (own)
+            pushed_program_end(&ps);
         g_inline_on = 0;
         g_inline_nverts = 0;
     }
