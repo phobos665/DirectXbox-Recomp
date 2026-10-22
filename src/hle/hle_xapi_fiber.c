@@ -26,13 +26,12 @@
  * block's address is taken from ConvertThreadToFiber, whose result is the
  * block's own +0x10, so it is found without a per-title address.
  *
- * Windows only for now: a POSIX host needs ucontext or similar.
+ * Every host: off Windows the host fibers are win32_compat.c's, a native
+ * context switch written for MKDA's scheduler.
  */
 #include "hle.h"
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "platform/xbox_winnt.h"     /* <windows.h> on Windows, win32_compat.h elsewhere */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -203,7 +202,7 @@ HLE_EXPORT(ConvertThreadToFiber)
         f->host = IsThreadAFiber() ? GetCurrentFiber() : ConvertThreadToFiber(NULL);
         if (fiber_log())
             fprintf(stderr, "[FIBER] thread %lu is fiber 0x%08X\n",
-                    GetCurrentThreadId(), g_eax);
+                    (unsigned long)GetCurrentThreadId(), g_eax);
     }
 }
 
@@ -257,7 +256,7 @@ HLE_EXPORT(SwitchToFiber)
     if (!to->host) {
         to->host = CreateFiberEx(64 * 1024, 2 * 1024 * 1024, 0, fiber_main, to);
         if (!to->host) {
-            fprintf(stderr, "[FIBER] CreateFiberEx failed (%lu)\n", GetLastError());
+            fprintf(stderr, "[FIBER] CreateFiberEx failed (%lu)\n", (unsigned long)GetLastError());
             fflush(stderr);
             return;
         }
@@ -270,18 +269,3 @@ HLE_EXPORT(SwitchToFiber)
     /* Back on this fiber: whoever switched here already made it current. */
     regs_load(&from->regs);
 }
-
-#else /* !_WIN32 */
-
-/* No host fibers here yet: the title's own bodies, as before this file. The
- * markers are scanned whatever the platform, so the names must exist. */
-HLE_ORIGINAL(CreateFiber);
-HLE_ORIGINAL(ConvertThreadToFiber);
-HLE_ORIGINAL(DeleteFiber);
-HLE_ORIGINAL(SwitchToFiber);
-HLE_EXPORT(CreateFiber)          { if (hle_original_CreateFiber) HLE_CALL_ORIGINAL(CreateFiber); }
-HLE_EXPORT(ConvertThreadToFiber) { if (hle_original_ConvertThreadToFiber) HLE_CALL_ORIGINAL(ConvertThreadToFiber); }
-HLE_EXPORT(DeleteFiber)          { if (hle_original_DeleteFiber) HLE_CALL_ORIGINAL(DeleteFiber); }
-HLE_EXPORT(SwitchToFiber)        { if (hle_original_SwitchToFiber) HLE_CALL_ORIGINAL(SwitchToFiber); }
-
-#endif /* _WIN32 */
