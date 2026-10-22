@@ -567,3 +567,31 @@ Not done: the vertical zoom is not recorded in a frame capture, so a replay of a
 widescreen frame draws the title's own viewports; and a HUD placed this way sits
 in the centre 4:3 block (`XBOX_D3D8_2D_SIDE` would pin it to the edges, but it
 does not let a whole-screen fade span the picture).
+
+## 9. A title that does its own 2D, and movies at 16:9 (Oct 2026)
+
+Forza Motorsport has a 16:9 mode on the console flag, and its 2D needs nothing
+from the renderer: it draws all of it through one horizontal scale of its own
+(the float at 0x56F954, x on the screen = (x + (S*640 - 640)/2) / S), which its
+races set to 4/3 in widescreen. Its HUD was finished for 16:9 that way; its
+menus set the scale back to 1.0 and were stretched. The title project holds
+the scale at 4/3 and lays the menus out for the wider space itself, so the
+title declares `OWN_2D` and the renderer squeezes none of its 2D.
+
+Before that was found, Forza was run under the renderer's squeeze, and every
+fix that took was a heuristic for a case the title had already handled: its
+HUD came out squeezed twice. **Before declaring CENTRE_2D or tuning the
+squeeze for a NATIVE title, run it with the squeeze off and look at what the
+title draws by itself.**
+
+Movies: the movie layer (`d3d8_movie.c`, which also shows frames a title
+writes into its back buffer with the CPU) fits a 4:3 movie to the shape the
+frame is shown at, not to the back buffer's own shape. In widescreen a 640x480
+frame is shown at 16:9, so a movie now sits in its middle three quarters
+between bars instead of being stretched across it. This applies to every
+title.
+
+Its line: `recomp_title_widescreen(NATIVE REGISTER 181 OWN_2D)`. The register
+is where its vertex programs' combined matrix starts (c181..c184; c58/c59 are
+the XDK's viewport constants), found by listing which constants its programs
+read.
