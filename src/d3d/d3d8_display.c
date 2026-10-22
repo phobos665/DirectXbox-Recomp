@@ -103,8 +103,10 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
                        "says so (recomp_title_widescreen) or hor_plus is set.";
             fprintf(stderr, "D3D8 display: widescreen, so the title's frame is presented "
                     "at 16:9. %s%s\n", what,
-                    g_policy.centre_2d ? " All 2D but whole-screen passes is kept at 4:3."
-                                       : "");
+                    recomp_widescreen_title_own_2d()
+                        ? " Its 2D is laid out for 16:9 by the title and left alone."
+                        : g_policy.centre_2d ? " All 2D but whole-screen passes is kept at 4:3."
+                                             : "");
         }
         if (g_policy.anisotropy > 1)
             fprintf(stderr, "D3D8 display: anisotropic filtering forced to %ux where the "
