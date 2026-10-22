@@ -27,6 +27,9 @@ endif()
 # bars) -- the widescreen_2d = centre policy, as what widescreen_2d = auto
 # means for this title.
 #
+# OWN_2D: the title lays its own 2D out for 16:9 (its game code, or its
+# project's layout work), so the renderer never squeezes any of it.
+#
 # The player has one widescreen switch. Whether that is the console flag
 # alone or the flag and a wider camera is a fact about the game, and so is
 # the vertex constant register its projection is in (REGISTER, optional for
@@ -39,7 +42,7 @@ endif()
 # A title where widescreen cannot be right at all says so to its launcher
 # instead: recomp_add_launcher(... NO_WIDESCREEN).
 function(recomp_title_widescreen MODE)
-    cmake_parse_arguments(_wide "CENTRE_2D" "REGISTER" "" ${ARGN})
+    cmake_parse_arguments(_wide "CENTRE_2D;OWN_2D" "REGISTER" "" ${ARGN})
     if(MODE STREQUAL "NATIVE")
         set(_mode 1)                                # RECOMP_WIDE_NATIVE
     elseif(MODE STREQUAL "HOR_PLUS")
@@ -55,6 +58,9 @@ function(recomp_title_widescreen MODE)
     target_compile_definitions(xbox_config PRIVATE RECOMP_TITLE_WIDESCREEN=${_mode})
     if(_wide_CENTRE_2D)
         target_compile_definitions(xbox_config PRIVATE RECOMP_TITLE_CENTRE_2D=1)
+    endif()
+    if(_wide_OWN_2D)
+        target_compile_definitions(xbox_config PRIVATE RECOMP_TITLE_OWN_2D=1)
     endif()
     if(DEFINED _wide_REGISTER)
         if(NOT _wide_REGISTER MATCHES "^[0-9]+$" OR _wide_REGISTER GREATER 191)

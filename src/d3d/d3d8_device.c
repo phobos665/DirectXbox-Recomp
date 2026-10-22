@@ -2163,7 +2163,7 @@ static void apply_host_viewport(void)
  * frame is a run of 3D draws and then a run of 2D ones. */
 static void set_squeeze(BOOL on)
 {
-    if (!d3d8_display_wide_now())
+    if (!d3d8_display_wide_now() || recomp_widescreen_title_own_2d())
         on = FALSE;
     if (g_2d_squeeze == (on ? TRUE : FALSE))
         return;
@@ -2179,7 +2179,8 @@ void d3d8_SetTwoDSqueeze(BOOL on)
     /* The vertical zoom is for 3D draws only, so the viewport changes with
      * the kind of draw even where the squeeze does not. */
     if (was != g_2d_screen_space && g_3d_vzoom != 1.0f) {
-        g_2d_squeeze = (on && d3d8_display_wide_now()) ? TRUE : FALSE;
+        g_2d_squeeze = (on && d3d8_display_wide_now() &&
+                        !recomp_widescreen_title_own_2d()) ? TRUE : FALSE;
         apply_host_viewport();
         return;
     }
