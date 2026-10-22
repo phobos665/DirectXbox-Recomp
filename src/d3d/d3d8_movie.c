@@ -12,6 +12,7 @@
  * the device's thread.
  */
 #include "d3d8_internal.h"
+#include "d3d8_display.h"
 #include "d3d8_movie.h"
 
 #include <stdio.h>
@@ -231,12 +232,20 @@ void d3d8_movie_draw(void)
     /* The whole screen goes black first, then the picture at its own aspect:
      * a 720x576 PAL movie and a 640x480 one both fill a 4:3 window, and
      * neither is stretched to a wide one. Xbox movies are encoded for a 4:3
-     * screen whatever their pixel size, so 4:3 is the aspect used. */
+     * screen whatever their pixel size, so 4:3 is the aspect used. The back
+     * buffer's aspect is the one it is shown at: a 640x480 frame presented
+     * at 16:9 takes the movie into its middle three quarters, between bars,
+     * where filling it stretched Forza Motorsport's Bink movies. */
     rhi_clear_color(rtv, black);
     if (!(mapped = rhi_buffer_map(g.cb, RHI_MAP_WRITE_DISCARD)))
         goto restore;
     fa = 4.0f / 3.0f;
-    ba = (float)bw / (float)bh;
+    {
+        UINT sw = bw, sh = bh;
+
+        d3d8_display_output_shape(bw, bh, &sw, &sh);
+        ba = (float)sw / (float)sh;
+    }
     c.w = ba > fa ? 2.0f * fa / ba : 2.0f;
     c.h = ba > fa ? 2.0f : 2.0f * ba / fa;
     c.x = -c.w / 2.0f;
