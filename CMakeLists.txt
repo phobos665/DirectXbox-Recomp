@@ -76,7 +76,15 @@ if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/third_party/SDL/CMakeLists.txt)
     # Not used by the runtime; leaving them out keeps the build short.
     set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
     set(SDL_GPU OFF CACHE BOOL "" FORCE)
-    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    # Except the renderer on Linux, which is how the launcher shows its
+    # frames there (src/launcher/launcher_sdl.c): Wayland gives a window no
+    # way to show a buffer but a GPU API, and SDL's window surface falls back
+    # to the renderer for it. macOS draws through Core Animation instead.
+    if(UNIX AND NOT APPLE)
+        set(SDL_RENDER ON CACHE BOOL "" FORCE)
+    else()
+        set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    endif()
     add_subdirectory(third_party/SDL EXCLUDE_FROM_ALL)
     if(NOT TARGET SDL3::SDL3)
         add_library(SDL3::SDL3 ALIAS SDL3-static)
