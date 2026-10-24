@@ -587,11 +587,59 @@ fn install(release: &Release, user: &Path, built: &Path, sha1: &str) -> Result<P
     Ok(dest)
 }
 
+// ── one build at a time ─────────────────────────────────────────────────────
+
+/// Held for the length of a build: two builds in one folder would extract,
+/// lift and compile over each other. A lock whose process has gone (a
+/// crash, a power cut) is taken over.
+struct BuildLock(PathBuf);
+
+impl BuildLock {
+    fn take(user: &Path) -> Result<BuildLock, Failure> {
+        let path = user.join("build.lock");
+        for _ in 0..2 {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut f) => {
+                    let _ = write!(f, "{}", std::process::id());
+                    return Ok(BuildLock(path));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let holder = fs::read_to_string(&path).ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                    if holder.is_some_and(process_alive) {
+                        return fail("this game is already being built (another window \
+                                     may be building it); wait for that to finish");
+                    }
+                    let _ = fs::remove_file(&path);         // left by a build that died
+                }
+                Err(e) => return fail(format!("cannot create {}: {e}", path.display())),
+            }
+        }
+        fail(format!("cannot take {}", path.display()))
+    }
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+#[cfg(not(target_os = "linux"))]
+fn process_alive(_pid: u32) -> bool {
+    true        // no cheap check here: a stale lock is removed by hand
+}
+
 // ── commands ────────────────────────────────────────────────────────────────
 
 fn cmd_build(release: &Release, source: Option<PathBuf>) -> Result<(), Failure> {
     let user = user_dir(&release.title_id)?;
     fs::create_dir_all(&user).or_else(|e| fail(format!("cannot create {}: {e}", user.display())))?;
+    let _lock = BuildLock::take(&user)?;
     let source = match source {
         Some(s) => s,
         None => match read_json::<SourceRecord>(&user.join("source.json")) {
