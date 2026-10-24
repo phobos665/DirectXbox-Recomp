@@ -297,6 +297,31 @@ toolkit's `CMakeLists.txt` instead of your project's.
 
 **It will crash.** That's expected and normal. The stderr log tells you what happened.
 
+### Building the runtime once (optional)
+
+Every title builds the same runtime libraries, about 450 files. Build them once
+and point titles at that build, and a title compiles only its own code:
+
+```bash
+# Once, and again whenever you like (titles bring it up to date themselves)
+cmake -S <toolkit> -B <toolkit>/build-engine -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build <toolkit>/build-engine --target xboxrecomp_engine
+
+# A title's first configure
+cmake -S . -B build/Release -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+      -DXBOXRECOMP_PREBUILT=<toolkit>/build-engine
+```
+
+The engine has to come from the same toolkit tree as the title, with the same
+compiler, build type and `RECOMP_ABI_CHECK`; the configure says so if not. The
+title's own widescreen and timing settings still apply: `xbox_config` is always
+built per title. On a 6-core Linux machine, with lifted code at `-O1` (the
+default off MSVC, `XBOXRECOMP_GENERATED_OPT` to change it), a clean
+TimeSplitters 2 build takes 27 s instead of 41 s, and the engine 9 s, once.
+Not yet with `XBOXRECOMP_MACOS_APP`.
+
 ### Running it: never from a build step
 
 No CMake target, custom command, post-build step or ctest may start a title.
