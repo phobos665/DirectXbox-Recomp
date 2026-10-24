@@ -333,7 +333,10 @@ recur; that is cheap and should be part of the stage.
   above `RECOMP_VBLANK_HZ`) paces Swaps by the host clock instead of the
   vblank, adaptively, and leaves the guest's vblank at 60. On a frame-stepped
   title it runs the game fast, exactly as `RECOMP_FPS_CAP=0` does, and the log
-  says so. It is not one of F10's stops.
+  says so. A title's project says its logic keeps time with
+  `recomp_title_timing(DELTA)` in its CMakeLists; only then does its launcher
+  offer 90 to 240 and uncapped, and F10 add 120 and 144 to its stops.
+  Adaptive 60 stays the default either way.
 - **"Match display refresh"** should *not* drive the guest vblank. Reading the
   output's refresh (`IDXGIOutput::GetDisplayModeList`, or `EnumDisplaySettings`)
   and adopting, say, 144 Hz as the console's rate speeds the game up. Adopt it

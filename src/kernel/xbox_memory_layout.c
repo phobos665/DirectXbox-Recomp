@@ -695,13 +695,20 @@ static int           g_flip_gate_host_hz;
 /* What the on-screen toggle cycles through: the settings a player picks
  * between, in that order. A RECOMP_FPS_CAP outside this list still works --
  * it is simply not one of the stops, and the first press moves to the
- * first one. */
-static const struct { int divisor, strict; const char *name; } g_gate_modes[] = {
-    { 1, 0, "adaptive" },
-    { 1, 1, "60" },
-    { 2, 1, "30" },
-    { 0, 0, "off" },
+ * first one. The stops above 60 are offered only for a title whose logic
+ * keeps time (recomp_title_keeps_time); any other would run fast. */
+static const struct {
+    int divisor, strict, host_hz, keeps_time_only;
+    const char *name;
+} g_gate_modes[] = {
+    { 1, 0,   0, 0, "adaptive" },
+    { 1, 1,   0, 0, "60" },
+    { 2, 1,   0, 0, "30" },
+    { 1, 0, 120, 1, "120" },
+    { 1, 0, 144, 1, "144" },
+    { 0, 0,   0, 0, "off" },
 };
+#define GATE_MODE_COUNT ((int)(sizeof g_gate_modes / sizeof g_gate_modes[0]))
 
 /* A switch that is on unless it is turned off, or off unless turned on.
  *
@@ -2078,9 +2085,12 @@ static int flip_gate_divisor(void)
         g_flip_gate_divisor = d;
         if (g_flip_gate_host_hz)
             fprintf(stderr, "  [NV2A] flip gate: at most %d Swaps a second by the host clock "
-                    "(RECOMP_FPS_CAP=%s, above the %d Hz vblank): for a title whose logic "
-                    "keeps time; one that counts frames runs fast\n",
-                    g_flip_gate_host_hz, cap, vblank);
+                    "(RECOMP_FPS_CAP=%s, above the %d Hz vblank)%s\n",
+                    g_flip_gate_host_hz, cap, vblank,
+                    recomp_title_keeps_time()
+                        ? "; this title keeps time"
+                        : ": for a title whose logic keeps time; this one has not said it "
+                          "does (recomp_title_timing), and one that counts frames runs fast");
         else
             fprintf(stderr, "  [NV2A] flip gate: %s\n",
                     d == 0 ? "off, Swap never waits (RECOMP_FPS_CAP=adaptive or 60 to pace)"
@@ -2157,10 +2167,9 @@ static int flip_gate_mode_index(void)
 {
     int d = flip_gate_divisor(), i;
 
-    if (g_flip_gate_host_hz)
-        return -1;
-    for (i = 0; i < (int)(sizeof g_gate_modes / sizeof g_gate_modes[0]); i++)
+    for (i = 0; i < GATE_MODE_COUNT; i++)
         if (g_gate_modes[i].divisor == d &&
+            g_gate_modes[i].host_hz == g_flip_gate_host_hz &&
             (d == 0 || g_gate_modes[i].strict == g_flip_gate_strict))
             return i;
     return -1;
@@ -2182,10 +2191,15 @@ void xbox_Nv2aFlipGateCycle(void)
 {
     int i = flip_gate_mode_index();
 
-    i = i < 0 ? 0 : (i + 1) % (int)(sizeof g_gate_modes / sizeof g_gate_modes[0]);
+    if (i < 0)
+        i = 0;
+    else
+        do {
+            i = (i + 1) % GATE_MODE_COUNT;
+        } while (g_gate_modes[i].keeps_time_only && !recomp_title_keeps_time());
     g_flip_gate_divisor = g_gate_modes[i].divisor;
     g_flip_gate_strict = g_gate_modes[i].strict;
-    g_flip_gate_host_hz = 0;
+    g_flip_gate_host_hz = g_gate_modes[i].host_hz;
     fprintf(stderr, "  [NV2A] flip gate: %s\n", g_gate_modes[i].name);
     fflush(stderr);
 }
