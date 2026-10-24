@@ -244,13 +244,11 @@ def build(wt, name, prefix=()):
     bdir = cm.build_dir(project)
     logs = work_dir(wt, name)
     logs.mkdir(parents=True, exist_ok=True)
-    cmake = cm.find_cmake()
     t0 = time.time()
     with open(logs / "build.log", "w", encoding="utf-8", errors="replace") as f:
         if not (bdir / "CMakeCache.txt").is_file():
             if os.name == "nt":
-                cfg = [cmake, "-S", str(project), "-B", str(bdir),
-                       "-G", "Visual Studio 16 2019", "-A", "x64"]
+                cfg = cm.windows_configure_cmd(project)
             else:
                 cfg = cm.configure_cmd(project)
             rc = subprocess.run([*prefix, *cfg],

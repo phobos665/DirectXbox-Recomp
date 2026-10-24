@@ -364,6 +364,11 @@ works. What to know:
   /usr/lib/sdk/llvm22/enable.sh`. Lifted code is built with `-fwrapv` off MSVC, so signed
   overflow wraps as MSVC compiles it. A new compiler picks new instructions at MMIO sites
   as GCC did: read `undecoded access ... host insn` lines first after switching.
+  **Windows can try clang-cl** (Build Tools component "C++ Clang tools for Windows";
+  `XBOXRECOMP_VS_TOOLSET=ClangCL` makes `regress.py` configure `-T ClangCL` into
+  `build-clangcl/`). It needs `-fwrapv` as much as Linux clang does -- it folds `a + 1 <
+  a` to 0 -- so lifted code gets it there too. Not yet built or measured on Windows; cl.exe
+  stays the default until a TS2 and BLiNX regression says otherwise.
 - **Launcher.** `launcher_sdl.c` presents through an SDL renderer (the toolkit's SDL is built
   with its renderer on Linux only) and the text is FreeType with fontconfig
   (`launcher_theme_freetype.c`). `RECOMP_LAUNCHER_SHOT=<file.bmp>` writes a frame and quits,

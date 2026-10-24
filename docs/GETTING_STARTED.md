@@ -25,7 +25,11 @@ still where titles are proven first.
   code takes it about three times as long (TimeSplitters 2: 90 s against
   28 s), so give a fresh build directory `CC=clang CXX=clang++`.
   `scripts/compat_matrix.py` and `scripts/regress.py` do that themselves when
-  clang is on `PATH`
+  clang is on `PATH`. On Windows, clang-cl works too: add **C++ Clang tools
+  for Windows** in the Build Tools installer, configure a fresh build folder
+  with `-T ClangCL`, or set `XBOXRECOMP_VS_TOOLSET=ClangCL` for
+  `regress.py`, which then builds into `build-clangcl/` beside `build/`.
+  Not yet measured against cl.exe; MSVC stays the default
 - **Linux**: `bash tools/linux/install_deps.sh` installs the system libraries
   and clang (apt/pacman/dnf, needs sudo; on SteamOS it says how to build in
   the Freedesktop SDK Flatpak instead, with its LLVM extension for clang),

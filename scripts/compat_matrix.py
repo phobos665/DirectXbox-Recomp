@@ -112,16 +112,40 @@ def find_cmake():
 WINDOWS = os.name == "nt"
 
 
+def vs_toolset():
+    """XBOXRECOMP_VS_TOOLSET, the Visual Studio toolset a Windows build is
+    configured with: empty for cl.exe, ClangCL for clang-cl (the "C++ Clang
+    tools for Windows" component of the Build Tools installer)."""
+    return os.environ.get("XBOXRECOMP_VS_TOOLSET", "").strip() if WINDOWS else ""
+
+
+def _build_name():
+    """build/, or build-clangcl/ for a clang-cl build: a CMake build folder
+    keeps the toolset it was first configured with, and the two side by side
+    is how they are compared. Same depth, so a title's relative game path
+    holds in both."""
+    return "build-clangcl" if vs_toolset().lower() == "clangcl" else "build"
+
+
 def build_dir(project):
     """Where a title's build lives. Visual Studio is multi-configuration and
     puts Release under build/; a single-configuration Ninja build is given
     build/Release itself, so the executable sits at the same depth."""
-    return project / "build" if WINDOWS else project / "build" / "Release"
+    return project / _build_name() if WINDOWS else project / "build" / "Release"
 
 
 def title_exe(project, name):
-    return project / "build" / "Release" / (f"{name}_recomp.exe" if WINDOWS
-                                             else f"{name}_recomp")
+    return project / _build_name() / "Release" / (f"{name}_recomp.exe" if WINDOWS
+                                                  else f"{name}_recomp")
+
+
+def windows_configure_cmd(project):
+    """The Visual Studio configure regress.py runs, with the toolset if one
+    is asked for."""
+    toolset = vs_toolset()
+    return [find_cmake(), "-S", str(project), "-B", str(build_dir(project)),
+            "-G", "Visual Studio 16 2019", "-A", "x64",
+            *(["-T", toolset] if toolset else [])]
 
 
 def compiler_args():

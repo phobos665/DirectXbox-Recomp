@@ -257,13 +257,19 @@ target_link_libraries(xboxrecomp INTERFACE
 # wrap-around x86 gives, but GCC and clang may assume it never happens and
 # drop or reorder the arithmetic around it. -fwrapv makes it wrap on every
 # host, so a title computes on Linux and macOS what it computes on Windows.
-# Measured on TimeSplitters 2 with clang, it costs no compile time.
+# Measured on TimeSplitters 2 with clang, it costs no compile time. clang-cl
+# (Visual Studio's ClangCL toolset) is MSVC to CMake but clang underneath, and
+# folds signed overflow like any clang -- `a + 1 < a` compiles to 0 -- so it
+# gets -fwrapv too. cl.exe has no such flag and needs none.
 option(XBOXRECOMP_GENERATED_WARNINGS
        "Report compiler warnings in lifted code (src/recomp/gen)" OFF)
 
 function(xboxrecomp_generated_source_options)
     if(MSVC)
         set(_opts)
+        if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+            list(APPEND _opts -fwrapv)
+        endif()
         if(NOT XBOXRECOMP_GENERATED_WARNINGS)
             list(APPEND _opts /w /we4013)
         endif()
