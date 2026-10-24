@@ -124,6 +124,7 @@ fn progress(stage: &str, done: u64, total: u64, detail: &str) {
     }));
 }
 
+#[derive(Debug)]
 struct Failure {
     message: String,
     /// The process exit code: 2 for a disc this release does not support.
@@ -720,5 +721,67 @@ fn main() -> ExitCode {
             emit(json!({"event": "error", "message": f.message, "unsupported": f.code == 2}));
             ExitCode::from(f.code)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xboxrecomp-build-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_mirror_links_the_game_and_leaves_its_saves_out() {
+        let d = scratch("mirror");
+        let (src, out) = (d.join("src"), d.join("out"));
+        for sub in ["Data", "UDATA", "tdata"] {
+            fs::create_dir_all(src.join(sub)).unwrap();
+        }
+        fs::write(src.join("default.xbe"), b"xbe").unwrap();
+        mirror_folder(&src, &out).unwrap();
+        assert!(fs::symlink_metadata(out.join("Data")).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(out.join("default.xbe")).unwrap(), b"xbe");
+        assert!(!out.join("UDATA").exists() && !out.join("tdata").exists());
+        // Removing the mirror removes links, never what they point at.
+        remove_owned(&out).unwrap();
+        assert!(src.join("Data").is_dir() && src.join("default.xbe").is_file());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn one_build_at_a_time_and_a_dead_one_is_taken_over() {
+        let d = scratch("lock");
+        let held = BuildLock::take(&d).ok().expect("first lock");
+        assert!(BuildLock::take(&d).is_err(), "a second build must be refused");
+        drop(held);
+        assert!(!d.join("build.lock").exists());
+        // A pid no process has: what a build killed by Cancel leaves.
+        fs::write(d.join("build.lock"), "4000000000").unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(BuildLock::take(&d).is_ok(), "a dead build's lock is taken over");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_recipe_sync_leaves_unchanged_files_alone() {
+        let d = scratch("sync");
+        let (from, to) = (d.join("from"), d.join("to"));
+        fs::create_dir_all(from.join("src")).unwrap();
+        fs::write(from.join("src/main.c"), b"int main;").unwrap();
+        sync_tree(&from, &to).unwrap();
+        let before = fs::metadata(to.join("src/main.c")).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        sync_tree(&from, &to).unwrap();
+        assert_eq!(fs::metadata(to.join("src/main.c")).unwrap().modified().unwrap(), before);
+        fs::write(from.join("src/main.c"), b"int main2;").unwrap();
+        sync_tree(&from, &to).unwrap();
+        assert_eq!(fs::read(to.join("src/main.c")).unwrap(), b"int main2;");
+        let _ = fs::remove_dir_all(&d);
     }
 }
