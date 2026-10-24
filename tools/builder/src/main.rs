@@ -294,6 +294,33 @@ fn symlink_file(from: &Path, to: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_file(from, to)
 }
 
+/// The game's save folders, from the game folder being replaced into the new
+/// one. E: is the game folder, so a title that saves there (TimeSplitters 2,
+/// in UDATA) keeps its saves in it: a rebuild -- a release update, another
+/// image of the same game -- must carry them over, not delete them. Should
+/// the new folder have its own (a disc that ships one), it is kept beside
+/// them as <name>.disc.
+fn carry_saves(old: &Path, new: &Path) -> Result<(), Failure> {
+    let Ok(entries) = fs::read_dir(old) else { return Ok(()) };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let upper = name.to_string_lossy().to_uppercase();
+        let real_dir = fs::symlink_metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false);
+        if !(upper == "UDATA" || upper == "TDATA") || !real_dir {
+            continue;
+        }
+        let dest = new.join(&name);
+        if fs::symlink_metadata(&dest).is_ok() {
+            let disc = new.join(format!("{}.disc", name.to_string_lossy()));
+            fs::rename(&dest, &disc)
+                .or_else(|e| fail(format!("cannot set aside the disc's {}: {e}", dest.display())))?;
+        }
+        fs::rename(entry.path(), &dest)
+            .or_else(|e| fail(format!("cannot keep the saves in {}: {e}", entry.path().display())))?;
+    }
+    Ok(())
+}
+
 fn prepare_game(source: &Path, user: &Path) -> Result<(), Failure> {
     let game = user.join("game");
     let record_path = user.join("source.json");
@@ -325,6 +352,7 @@ fn prepare_game(source: &Path, user: &Path) -> Result<(), Failure> {
             remove_owned(&partial)?;
             return fail(format!("{} has no default.xbe: it is not a game disc", source.display()));
         }
+        carry_saves(&game, &partial)?;
         remove_owned(&game)?;
         fs::rename(&partial, &game)
             .or_else(|e| fail(format!("cannot move the extracted game into place: {e}")))?;
@@ -334,8 +362,13 @@ fn prepare_game(source: &Path, user: &Path) -> Result<(), Failure> {
                                  files are in, or the disc image", source.display()));
         }
         progress("game", 0, 1, "");
+        let partial = user.join("game.partial");
+        remove_owned(&partial)?;
+        mirror_folder(source, &partial)?;
+        carry_saves(&game, &partial)?;
         remove_owned(&game)?;
-        mirror_folder(source, &game)?;
+        fs::rename(&partial, &game)
+            .or_else(|e| fail(format!("cannot move the game folder into place: {e}")))?;
         progress("game", 1, 1, "");
     }
     write_json(&record_path, &record)
@@ -750,6 +783,32 @@ mod tests {
         // Removing the mirror removes links, never what they point at.
         remove_owned(&out).unwrap();
         assert!(src.join("Data").is_dir() && src.join("default.xbe").is_file());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_saves() {
+        let d = scratch("saves");
+        let src = d.join("src");
+        fs::create_dir_all(src.join("Data")).unwrap();
+        fs::write(src.join("default.xbe"), b"xbe").unwrap();
+        prepare_game(&src, &d).unwrap();
+        // The game saves into its own UDATA (E: is the game folder).
+        fs::create_dir_all(d.join("game/UDATA/4553000A")).unwrap();
+        fs::write(d.join("game/UDATA/4553000A/save.dat"), b"progress").unwrap();
+        // Build again: the mirror is made anew, and the save comes with it.
+        prepare_game(&src, &d).unwrap();
+        assert_eq!(fs::read(d.join("game/UDATA/4553000A/save.dat")).unwrap(), b"progress");
+        assert!(!src.join("UDATA").exists(), "never written into the player's copy");
+        // A new folder that brings its own UDATA keeps it beside the saves.
+        fs::create_dir_all(src.join("UDATA")).unwrap();
+        fs::write(src.join("UDATA/disc.txt"), b"disc").unwrap();
+        let other = d.join("game.new");
+        mirror_folder(&src, &other).unwrap();
+        fs::create_dir_all(other.join("UDATA")).unwrap();      // as an image would
+        carry_saves(&d.join("game"), &other).unwrap();
+        assert!(other.join("UDATA/4553000A/save.dat").is_file());
+        assert!(other.join("UDATA.disc").is_dir());
         let _ = fs::remove_dir_all(&d);
     }
 
