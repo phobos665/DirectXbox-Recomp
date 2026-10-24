@@ -249,17 +249,32 @@ target_link_libraries(xboxrecomp INTERFACE
 # when its targets exist. A source counts as generated when it sits in a
 # src/recomp/gen/ directory, which is where tools/recomp writes it.
 # -DXBOXRECOMP_GENERATED_WARNINGS=ON shows them again, for lifter work.
+#
+# Lifted code also gets -fwrapv off MSVC, with warnings on or off. The lifter
+# writes x86 arithmetic as C arithmetic on int32_t -- imul is
+# `(uint32_t)((int32_t)a * (int32_t)b)` -- and guest code overflows those all
+# the time. Signed overflow is undefined in C: MSVC compiles it as the
+# wrap-around x86 gives, but GCC and clang may assume it never happens and
+# drop or reorder the arithmetic around it. -fwrapv makes it wrap on every
+# host, so a title computes on Linux and macOS what it computes on Windows.
+# Measured on TimeSplitters 2 with clang, it costs no compile time.
 option(XBOXRECOMP_GENERATED_WARNINGS
        "Report compiler warnings in lifted code (src/recomp/gen)" OFF)
 
-function(xboxrecomp_quiet_generated_sources)
-    if(XBOXRECOMP_GENERATED_WARNINGS)
-        return()
-    endif()
+function(xboxrecomp_generated_source_options)
     if(MSVC)
-        set(_opts /w /we4013)
+        set(_opts)
+        if(NOT XBOXRECOMP_GENERATED_WARNINGS)
+            list(APPEND _opts /w /we4013)
+        endif()
     else()
-        set(_opts -w -Werror=implicit-function-declaration)
+        set(_opts -fwrapv)
+        if(NOT XBOXRECOMP_GENERATED_WARNINGS)
+            list(APPEND _opts -w -Werror=implicit-function-declaration)
+        endif()
+    endif()
+    if(NOT _opts)
+        return()
     endif()
     get_property(_targets DIRECTORY "${CMAKE_SOURCE_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_t IN LISTS _targets)
@@ -284,15 +299,36 @@ function(xboxrecomp_quiet_generated_sources)
             set_property(SOURCE ${_gen} DIRECTORY "${_dir}"
                          APPEND PROPERTY COMPILE_OPTIONS ${_opts})
             list(LENGTH _gen _n)
-            message(STATUS "xboxrecomp: ${_t}: ${_n} lifted sources build "
-                           "without warnings (XBOXRECOMP_GENERATED_WARNINGS=ON "
-                           "to see them)")
+            string(JOIN " " _shown ${_opts})
+            if(XBOXRECOMP_GENERATED_WARNINGS)
+                set(_hint "")
+            else()
+                set(_hint " (XBOXRECOMP_GENERATED_WARNINGS=ON to see their warnings)")
+            endif()
+            message(STATUS "xboxrecomp: ${_t}: ${_n} lifted sources build with "
+                           "${_shown}${_hint}")
         endif()
     endforeach()
 endfunction()
 
 if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
-                   CALL xboxrecomp_quiet_generated_sources)
+                   CALL xboxrecomp_generated_source_options)
+endif()
+
+# ── Lifted code compiles about three times faster with clang ──
+#
+# Measured on TimeSplitters 2's 55 lifted files (53 MB of C) on a 6-core
+# Linux machine: GCC 15 -O2 90 s, clang 22 -O2 28 s, with smaller code from
+# clang. The time is optimisation spread over dozens of passes, not parsing
+# or headers, so no flag closes the gap. macOS already builds with clang;
+# on Linux the compiler is whatever CC/CXX named at the first configure, and
+# scripts/compat_matrix.py (regress.py, the matrix) picks clang when it is on
+# PATH. Say so once, at configure time, when a Linux build has GCC instead.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_C_COMPILER_ID STREQUAL "GNU"
+   AND NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    message(NOTICE "xboxrecomp: lifted code builds about 3x faster with clang "
+                   "than with GCC. For a fresh build directory: CC=clang "
+                   "CXX=clang++ (tools/linux/install_deps.sh installs them).")
 endif()
 
