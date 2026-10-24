@@ -166,7 +166,6 @@ function(xboxrecomp_import_engine dir)
     endif()
     if(NOT WIN32)
         find_package(Threads REQUIRED GLOBAL)
-        find_package(OpenSSL REQUIRED GLOBAL)
     endif()
     include("${dir}/xboxrecomp-engine-targets.cmake")
 
