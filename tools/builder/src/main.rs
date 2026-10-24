@@ -16,7 +16,9 @@
 //!      to (the mirror's own UDATA and TDATA take the saves);
 //!   2. the check: default.xbe's SHA-1 must be one release.json lists, or
 //!      the build stops and says which image it got;
-//!   3. the pipeline, lifting the XBE to C;
+//!   3. the pipeline, lifting the XBE to C, after XbSymbolDatabase has named
+//!      the XDK functions in this player's image (the names stay here: they
+//!      are addresses in the player's own game);
 //!   4. CMake and Ninja, building that C against the engine package;
 //!   5. the executable put beside the game folder, and a stamp saying what
 //!      it was built from, so a release update can tell it is stale.
@@ -441,7 +443,7 @@ fn lift(release: &Release, user: &Path, log: &Path) -> Result<(), Failure> {
     sync_tree(&r.join("recipe"), &project)?;
 
     // The pipeline writes beside the XBE it is given, so it gets its own
-    // copy (a hard link where possible), with the title's XDK symbols.
+    // copy (a hard link where possible), with the XDK symbols beside it.
     let xdir = user.join("pipe").join("xbe");
     fs::create_dir_all(&xdir).or_else(|e| fail(format!("cannot create {}: {e}", xdir.display())))?;
     let xbe = xdir.join("default.xbe");
@@ -450,26 +452,42 @@ fn lift(release: &Release, user: &Path, log: &Path) -> Result<(), Failure> {
         .or_else(|e| fail(format!("cannot find default.xbe: {e}")))?;
     fs::hard_link(&game_xbe, &xbe).or_else(|_| fs::copy(&game_xbe, &xbe).map(|_| ()))
         .or_else(|e| fail(format!("cannot copy default.xbe: {e}")))?;
-    let symbols = project.join("config").join("xdk_symbols.json");
-    if symbols.is_file() {
-        fs::copy(&symbols, xdir.join("default_xdk_symbols.json"))
-            .or_else(|e| fail(format!("cannot copy the XDK symbols: {e}")))?;
-    }
 
     let tmp = user.join("tmp");
     fs::create_dir_all(&tmp).ok();
+    let python = |c: &mut Command| {
+        c.current_dir(r.join("toolkit"))
+            .env("PYTHONDONTWRITEBYTECODE", "1").env("PYTHONUNBUFFERED", "1")
+            .env("TMPDIR", &tmp);
+    };
+
+    // Which XDK functions sit where in this image, for the replacements the
+    // lifter links in by name. A recipe may carry them; otherwise they are
+    // found here, by signature, as tools.xdk_symbols does at a desk.
+    progress("lift", 0, 5, "naming the XDK functions");
+    let symbols = xdir.join("default_xdk_symbols.json");
+    let carried = project.join("config").join("xdk_symbols.json");
+    if carried.is_file() {
+        fs::copy(&carried, &symbols)
+            .or_else(|e| fail(format!("cannot copy the XDK symbols: {e}")))?;
+    } else {
+        let mut c = Command::new(r.join("python/bin/python3"));
+        c.args(["-m", "tools.xdk_symbols"]).arg(&xbe)
+            .arg("--cli").arg(r.join("bin/XbSymbolDatabaseCLI"))
+            .arg("--out").arg(&symbols);
+        python(&mut c);
+        run(&mut c, log, "XbSymbolDatabase", |_| {})?;
+    }
+
     let mut cmd = Command::new(r.join("python/bin/python3"));
     cmd.arg(r.join("toolkit/scripts/recompile.py")).arg(&xbe)
         .arg("--work-dir").arg(user.join("pipe").join("out"))
-        .arg("--project").arg(&project)
-        .current_dir(r.join("toolkit"))
-        .env("PYTHONDONTWRITEBYTECODE", "1").env("PYTHONUNBUFFERED", "1")
-        .env("TMPDIR", &tmp);
+        .arg("--project").arg(&project);
+    python(&mut cmd);
     let seeds = project.join("config").join("seeds.json");
     if seeds.is_file() {
         cmd.arg("--seeds").arg(&seeds);
     }
-    progress("lift", 0, 4, "");
     run(&mut cmd, log, "the translation to C", |line| {
         // recompile.py prints "  2/4  disasm" as each stage starts.
         let t = line.trim_start();
@@ -477,12 +495,12 @@ fn lift(release: &Release, user: &Path, log: &Path) -> Result<(), Failure> {
             let mut words = rest.split_whitespace();
             if let (Ok(n), Some("4")) = (n.parse::<u64>(), words.next()) {
                 if (1..=4).contains(&n) {
-                    progress("lift", n - 1, 4, words.next().unwrap_or(""));
+                    progress("lift", n, 5, words.next().unwrap_or(""));
                 }
             }
         }
     })?;
-    progress("lift", 4, 4, "");
+    progress("lift", 5, 5, "");
     Ok(())
 }
 
