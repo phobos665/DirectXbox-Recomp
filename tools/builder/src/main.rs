@@ -332,6 +332,13 @@ fn symlink_file(from: &Path, to: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_file(from, to)
 }
 
+/// A save folder in the game folder: UDATA or TDATA, or one kept beside them
+/// under a suffix (UDATA.disc, UDATA.rescued), which must travel with them.
+fn is_save_dir(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    ["UDATA", "TDATA"].iter().any(|s| upper == *s || upper.starts_with(&format!("{s}.")))
+}
+
 /// The game's save folders, from the game folder being replaced into the new
 /// one. E: is the game folder, so a title that saves there (TimeSplitters 2,
 /// in UDATA) keeps its saves in it: a rebuild -- a release update, another
@@ -342,9 +349,8 @@ fn carry_saves(old: &Path, new: &Path) -> Result<(), Failure> {
     let Ok(entries) = fs::read_dir(old) else { return Ok(()) };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let upper = name.to_string_lossy().to_uppercase();
         let real_dir = fs::symlink_metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false);
-        if !(upper == "UDATA" || upper == "TDATA") || !real_dir {
+        if !is_save_dir(&name.to_string_lossy()) || !real_dir {
             continue;
         }
         let dest = new.join(&name);
@@ -359,9 +365,38 @@ fn carry_saves(old: &Path, new: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Saves left in a game.partial by a run that stopped between carrying them
+/// over and putting the new folder in place (Cancel, a crash, a failed
+/// rename), moved back into the game folder before game.partial is cleared.
+/// Should the game folder somehow have its own as well, neither is lost:
+/// the rescued one is kept beside it as <name>.rescued.
+fn rescue_saves(partial: &Path, game: &Path) -> Result<(), Failure> {
+    let Ok(entries) = fs::read_dir(partial) else { return Ok(()) };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let real_dir = fs::symlink_metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false);
+        if !is_save_dir(&name.to_string_lossy()) || !real_dir {
+            continue;
+        }
+        fs::create_dir_all(game)
+            .or_else(|e| fail(format!("cannot create {}: {e}", game.display())))?;
+        let mut dest = game.join(&name);
+        let mut n = 0;
+        while fs::symlink_metadata(&dest).is_ok() {
+            n += 1;
+            let suffix = if n == 1 { String::new() } else { format!("-{n}") };
+            dest = game.join(format!("{}.rescued{suffix}", name.to_string_lossy()));
+        }
+        fs::rename(entry.path(), &dest)
+            .or_else(|e| fail(format!("cannot rescue the saves in {}: {e}", entry.path().display())))?;
+    }
+    Ok(())
+}
+
 fn prepare_game(source: &Path, user: &Path) -> Result<(), Failure> {
     let game = user.join("game");
     let record_path = user.join("source.json");
+    rescue_saves(&user.join("game.partial"), &game)?;
     let meta = fs::metadata(source)
         .or_else(|e| fail(format!("cannot open {}: {e}", source.display())))?;
     let record = SourceRecord {
@@ -949,6 +984,30 @@ mod tests {
         assert!(game_intact(&user));
         assert_eq!(fs::read(user.join("game").join("UDATA").join("save")).unwrap(), b"s",
                    "laying the folder out again keeps the saves");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn saves_left_by_an_interrupted_run_are_rescued() {
+        let d = scratch("interrupted");
+        let (src, user) = (d.join("src"), d.join("user"));
+        fs::create_dir_all(src.join("Data")).unwrap();
+        fs::write(src.join("default.xbe"), b"xbe").unwrap();
+        // A run stopped after carrying the saves into game.partial and
+        // removing the old game folder, before the rename.
+        let stranded = user.join("game.partial").join("UDATA");
+        fs::create_dir_all(&stranded).unwrap();
+        fs::write(stranded.join("save"), b"s").unwrap();
+        prepare_game(&src, &user).unwrap();
+        assert_eq!(fs::read(user.join("game").join("UDATA").join("save")).unwrap(), b"s");
+        assert!(!user.join("game.partial").exists());
+        // Both a stranded copy and one in the game folder: both kept.
+        let stranded = user.join("game.partial").join("UDATA");
+        fs::create_dir_all(&stranded).unwrap();
+        fs::write(stranded.join("save"), b"old").unwrap();
+        prepare_game(&src, &user).unwrap();
+        assert_eq!(fs::read(user.join("game").join("UDATA").join("save")).unwrap(), b"s");
+        assert_eq!(fs::read(user.join("game").join("UDATA.rescued").join("save")).unwrap(), b"old");
         let _ = fs::remove_dir_all(&d);
     }
 
