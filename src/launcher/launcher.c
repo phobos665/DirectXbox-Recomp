@@ -461,7 +461,8 @@ static char g_release_exe[128];
 static char g_release_version[96];
 static char g_user_dir[LAUNCHER_PATH];   /* where the builder builds it */
 
-typedef enum { REL_READY, REL_SETUP, REL_BUILDING } RelState;
+/* REL_DONE: built just now, and saying so until the player presses OK. */
+typedef enum { REL_READY, REL_SETUP, REL_BUILDING, REL_DONE } RelState;
 static RelState g_rel = REL_READY;
 static int    g_rel_stale;              /* built, but by an older release */
 static char   g_source[LAUNCHER_PATH];  /* the disc: typed, picked or remembered */
@@ -471,6 +472,7 @@ static char   g_rel_note[200];
 static double g_build_progress;
 static char   g_build_label[96], g_build_detail[200];
 static int    g_build_cancelled;
+static uint64_t g_build_started, g_build_ms; /* lhost_ticks; how long it took */
 static int    g_setup_sel;              /* 0 the path, 1 image, 2 folder, 3 build */
 
 static int read_small_file(const char *path, char *buf, size_t n)
@@ -1522,6 +1524,7 @@ static void release_start_build(void)
     g_build_progress = 0.0;
     snprintf(g_build_label, sizeof g_build_label, "Starting");
     g_build_detail[0] = '\0';
+    g_build_started = lhost_ticks();
     if (!lhost_job_start(argv)) {
         snprintf(g_rel_error, sizeof g_rel_error,
                  "The builder could not be started (%s). This launcher can run "
@@ -1573,7 +1576,11 @@ static void release_tick(void)
                      "The build finished but the game is not where it should be (%s).",
                      g_user_dir);
             g_rel = REL_SETUP;
+            return;
         }
+        /* Say so, rather than swapping screens under the player. */
+        g_build_ms = lhost_ticks() - g_build_started;
+        g_rel = REL_DONE;
         return;
     }
     g_rel = REL_SETUP;
@@ -1662,7 +1669,7 @@ static void draw_building(void)
     snprintf(pct, sizeof pct, "%d%%", (int)(g_build_progress * 100.0 + 0.5));
     theme_text(r, pct, 13, 700, THEME_TEXT, THEME_RIGHT);
     b.x = r.x; b.y = r.y + 40; b.w = r.w; b.h = 16;
-    theme_bar(b, g_build_progress);
+    theme_bar(b, g_build_progress, g_pulse * 2.0);   /* a sweep every ~1.4 s */
     r.y = b.y + 34; r.h = 22;
     theme_text(r, g_build_detail, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
     r.y += 44; r.h = 70;
@@ -1678,6 +1685,47 @@ static void draw_building(void)
     theme_text(b, "CANCEL", 13, 700, THEME_TEXT, THEME_CENTRE);
 }
 
+static void draw_done(void)
+{
+    ThemeRect p, r, b;
+    char text[400];
+    unsigned secs = (unsigned)((g_build_ms + 500) / 1000);
+
+    if (secs >= 60)
+        snprintf(text, sizeof text, "%s was built from your copy in %u min %u s. "
+                 "Next time, the launcher opens straight to the settings and Play.",
+                 g_title_name, secs / 60, secs % 60);
+    else
+        snprintf(text, sizeof text, "%s was built from your copy in %u s. "
+                 "Next time, the launcher opens straight to the settings and Play.",
+                 g_title_name, secs);
+
+    p.x = 60; p.y = 130; p.w = g_cw - 120; p.h = 300;
+    theme_panel(p, 0.3);
+    r.x = p.x + 30; r.y = p.y + 26; r.w = p.w - 60; r.h = 28;
+    theme_text(r, "The game is ready", 16, 700, THEME_GREEN, THEME_LEFT);
+    r.y += 50; r.h = 24;
+    theme_text(r, "Build complete", 13, 700, THEME_TEXT, THEME_LEFT);
+    theme_text(r, "100%", 13, 700, THEME_TEXT, THEME_RIGHT);
+    b.x = r.x; b.y = r.y + 40; b.w = r.w; b.h = 16;
+    theme_bar(b, 1.0, -1.0);
+    r.y = b.y + 34; r.h = 90;
+    theme_text_wrapped(r, text, 12, THEME_TEXT);
+
+    r.x = 60; r.y = g_ch - 44; r.w = g_cw - 260; r.h = 24;
+    theme_text(r, g_pad_seen ? "A  OK" : "Enter  OK", 11, 400,
+               THEME_TEXT_DIM, THEME_LEFT);
+    b.w = 150; b.h = 42; b.x = g_cw - 60 - b.w; b.y = g_ch - 74;
+    theme_panel(b, 0.9);
+    theme_text(b, "OK", 13, 700, THEME_TEXT, THEME_CENTRE);
+}
+
+/* OK: on to the ordinary launcher, Play and all. */
+static void done_ok(void)
+{
+    g_rel = REL_READY;
+}
+
 static void setup_activate(int i)
 {
     if (i == 1 || i == 2) {
@@ -1691,6 +1739,11 @@ static void setup_activate(int i)
 
 static void setup_nav(int dx, int dy, int accept, int cancel)
 {
+    if (g_rel == REL_DONE) {
+        if (accept || cancel)
+            done_ok();
+        return;
+    }
     if (g_rel == REL_BUILDING) {
         if (cancel && !g_build_cancelled) {
             g_build_cancelled = 1;
@@ -1715,6 +1768,11 @@ static void setup_click(int mx, int my)
 {
     int i;
 
+    if (g_rel == REL_DONE) {
+        if (hit_play(mx, my))
+            done_ok();
+        return;
+    }
     if (g_rel == REL_BUILDING) {
         if (hit_play(mx, my) && !g_build_cancelled) {
             g_build_cancelled = 1;
@@ -1779,6 +1837,8 @@ static void draw(void)
     if (g_release && g_rel != REL_READY) {
         if (g_rel == REL_BUILDING)
             draw_building();
+        else if (g_rel == REL_DONE)
+            draw_done();
         else
             draw_setup();
         return;
@@ -2083,9 +2143,15 @@ void launcher_init(void)
     }
 }
 
+/* The window's title: the toolkit's name, then the game's. */
+#define LAUNCHER_BRAND "DirectXRecomp"
+
 const char *launcher_title(void)
 {
-    return g_title_name;
+    static char title[sizeof g_title_name + 32];
+
+    snprintf(title, sizeof title, LAUNCHER_BRAND " - %s", g_title_name);
+    return title;
 }
 
 int launcher_mouse_button(int button)
