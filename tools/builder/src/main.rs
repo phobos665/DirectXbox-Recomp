@@ -2,6 +2,7 @@
 //! own copy of the disc.
 //!
 //!     xboxrecomp-build build  [--source <iso or folder>] [--release <dir>]
+//!     xboxrecomp-build relink --source <iso or folder> [--release <dir>]
 //!     xboxrecomp-build status [--release <dir>]
 //!
 //! A release (tools/release/make_release.py) carries no game code. It carries
@@ -22,6 +23,11 @@
 //!   4. CMake and Ninja, building that C against the engine package;
 //!   5. the executable put beside the game folder, and a stamp saying what
 //!      it was built from, so a release update can tell it is stale.
+//!
+//! A folder's mirror is links, so moving or deleting the folder breaks the
+//! game without touching what was built: `status` then says `moved`, and
+//! `relink` lays out the game folder again from wherever the same copy is
+//! now, rebuilding nothing.
 //!
 //! Everything happens in the player's folder for this title
 //! ($XDG_DATA_HOME/xboxrecomp/builds/<TITLEID>, or XBOXRECOMP_BUILD_DIR), so
@@ -775,11 +781,70 @@ fn cmd_build(release: &Release, source: Option<PathBuf>) -> Result<(), Failure> 
     Ok(())
 }
 
+/// Whether the game folder still reaches every file: a folder the player
+/// picked is linked, not copied, so moving or deleting it breaks the links.
+fn game_intact(user: &Path) -> bool {
+    let game = user.join("game");
+    if !game.join("default.xbe").is_file() {
+        return false;
+    }
+    match fs::read_dir(&game) {
+        Ok(entries) => entries.flatten().all(|e| fs::metadata(e.path()).is_ok()),
+        Err(_) => false,
+    }
+}
+
+/// Point a built game at its files again, after the player moved them:
+/// the game folder is laid out afresh and nothing is rebuilt. A different
+/// copy (another region, another revision) needs the build its addresses
+/// came from, so it is refused, and if an image had to be extracted before
+/// that could be seen, the stamp goes too, so the launcher offers a build.
+fn cmd_relink(release: &Release, source: Option<PathBuf>) -> Result<(), Failure> {
+    let user = user_dir(&release.title_id)?;
+    let Some(stamp) = read_json::<Stamp>(&user.join("build.json")) else {
+        return fail("nothing is built yet: build it first");
+    };
+    let _lock = BuildLock::take(&user)?;
+    let Some(source) = source else {
+        return fail("relink needs --source <iso or folder>");
+    };
+    let source = fs::canonicalize(&source)
+        .or_else(|e| fail(format!("{}: {e}", source.display())))?;
+    let log = user.join("build.log");
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&log) {
+        let _ = writeln!(f, "relink from {}", source.display());
+    }
+    emit(json!({"event": "start", "title": release.title_name, "user_dir": user,
+                "source": source, "log": log}));
+    let different = |sha1: &str| Failure {
+        message: format!("This is a different copy of {} from the one it was built from \
+                          (its default.xbe has SHA-1 {sha1}, not {}). Build again to use it.",
+                         release.title_name, stamp.xbe_sha1),
+        code: 3,
+    };
+    if source.is_dir() {
+        let sha1 = sha1_file(&source.join("default.xbe"))?;
+        if sha1 != stamp.xbe_sha1 {
+            return Err(different(&sha1));
+        }
+    }
+    prepare_game(&source, &user)?;
+    let sha1 = sha1_file(&user.join("game").join("default.xbe"))?;
+    if sha1 != stamp.xbe_sha1 {
+        let _ = fs::remove_file(user.join("build.json"));
+        return Err(different(&sha1));
+    }
+    emit(json!({"event": "done", "exe": stamp.exe, "game_dir": user.join("game")}));
+    Ok(())
+}
+
 fn cmd_status(release: &Release) -> Result<(), Failure> {
     let user = user_dir(&release.title_id)?;
     let source: Option<SourceRecord> = read_json(&user.join("source.json"));
     let stamp: Option<Stamp> = read_json(&user.join("build.json"));
     let state = match &stamp {
+        Some(s) if s.release_version == release.version
+            && Path::new(&s.exe).is_file() && !game_intact(&user) => "moved",
         Some(s) if s.release_version == release.version
             && Path::new(&s.exe).is_file() => "ready",
         Some(_) => "stale",
@@ -797,6 +862,7 @@ fn cmd_status(release: &Release) -> Result<(), Failure> {
 
 fn usage() -> ExitCode {
     eprintln!("usage: xboxrecomp-build build [--source <iso or folder>] [--release <dir>]\n       \
+               xboxrecomp-build relink --source <iso or folder> [--release <dir>]\n       \
                xboxrecomp-build status [--release <dir>]");
     ExitCode::from(64)
 }
@@ -822,13 +888,15 @@ fn main() -> ExitCode {
     let result = Release::load(&release_dir).map_err(|m| Failure { message: m, code: 1 })
         .and_then(|release| match command.as_str() {
             "build" => cmd_build(&release, source),
+            "relink" => cmd_relink(&release, source),
             "status" => cmd_status(&release),
             _ => fail(format!("unknown command {command}")),
         });
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(f) => {
-            emit(json!({"event": "error", "message": f.message, "unsupported": f.code == 2}));
+            emit(json!({"event": "error", "message": f.message, "unsupported": f.code == 2,
+                        "rebuild": f.code == 3}));
             ExitCode::from(f.code)
         }
     }
@@ -860,6 +928,27 @@ mod tests {
         // Removing the mirror removes links, never what they point at.
         remove_owned(&out).unwrap();
         assert!(src.join("Data").is_dir() && src.join("default.xbe").is_file());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_moved_folder_is_seen_and_relinked() {
+        let d = scratch("moved");
+        let (src, user) = (d.join("src"), d.join("user"));
+        fs::create_dir_all(src.join("Data")).unwrap();
+        fs::write(src.join("default.xbe"), b"xbe").unwrap();
+        prepare_game(&src, &user).unwrap();
+        fs::create_dir_all(user.join("game").join("UDATA")).unwrap();
+        fs::write(user.join("game").join("UDATA").join("save"), b"s").unwrap();
+        assert!(game_intact(&user));
+        // The player moves their folder: the folder links dangle.
+        let moved = d.join("moved");
+        fs::rename(&src, &moved).unwrap();
+        assert!(!game_intact(&user), "a dangling link is a broken game");
+        prepare_game(&moved, &user).unwrap();
+        assert!(game_intact(&user));
+        assert_eq!(fs::read(user.join("game").join("UDATA").join("save")).unwrap(), b"s",
+                   "laying the folder out again keeps the saves");
         let _ = fs::remove_dir_all(&d);
     }
 

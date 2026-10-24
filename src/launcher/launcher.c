@@ -23,7 +23,9 @@
 #ifdef _WIN32
 #define strcasecmp _stricmp
 #else
+#include <dirent.h>
 #include <strings.h>
+#include <sys/stat.h>
 #endif
 
 #include "launcher.h"
@@ -465,6 +467,8 @@ static char g_user_dir[LAUNCHER_PATH];   /* where the builder builds it */
 typedef enum { REL_READY, REL_SETUP, REL_BUILDING, REL_DONE } RelState;
 static RelState g_rel = REL_READY;
 static int    g_rel_stale;              /* built, but by an older release */
+static int    g_rel_moved;              /* built, but its files have gone */
+static int    g_rel_relinking;          /* the job is a relink, not a build */
 static char   g_source[LAUNCHER_PATH];  /* the disc: typed, picked or remembered */
 static char   g_rel_error[2048];
 static int    g_rel_unsupported;
@@ -561,13 +565,53 @@ static int release_user_dir(uint32_t id, char *out, size_t n)
     return 1;
 }
 
-/* What the builder has left: ready, built by another release, or not yet. */
+/* Whether the game folder still reaches every file. A folder the player
+ * picked is linked, not copied (tools/builder, mirror_folder), so moving or
+ * deleting it leaves links to nothing; the builder's game_intact is the same
+ * test. Only the release builds on Linux so far, so elsewhere only
+ * default.xbe is looked for. */
+static int game_intact(void)
+{
+    char path[LAUNCHER_PATH + 300];
+    FILE *f;
+#ifndef _WIN32
+    DIR *dir;
+    struct dirent *e;
+    struct stat st;
+    int ok = 1;
+#endif
+
+    snprintf(path, sizeof path, "%s/game/default.xbe", g_user_dir);
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    fclose(f);
+#ifndef _WIN32
+    snprintf(path, sizeof path, "%s/game", g_user_dir);
+    dir = opendir(path);
+    if (!dir)
+        return 0;
+    while (ok && (e = readdir(dir)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        snprintf(path, sizeof path, "%s/game/%s", g_user_dir, e->d_name);
+        ok = stat(path, &st) == 0;          /* follows the link */
+    }
+    closedir(dir);
+    return ok;
+#else
+    return 1;
+#endif
+}
+
+/* What the builder has left: ready, built by another release, built with
+ * its files since moved, or not yet. */
 static void release_status(void)
 {
     char path[LAUNCHER_PATH + 32], text[4096], built[96], exe[LAUNCHER_PATH];
     FILE *f;
 
-    g_rel_stale = 0;
+    g_rel_stale = g_rel_moved = 0;
     snprintf(path, sizeof path, "%s/source.json", g_user_dir);
     if (!g_source[0] && read_small_file(path, text, sizeof text))
         json_str(text, "path", g_source, sizeof g_source);
@@ -583,6 +627,10 @@ static void release_status(void)
         fclose(f);
     if (f && strcmp(built, g_release_version) == 0) {
         g_rel = REL_READY;
+        if (!game_intact()) {
+            g_rel = REL_SETUP;
+            g_rel_moved = 1;
+        }
     } else {
         g_rel = REL_SETUP;
         g_rel_stale = 1;
@@ -1517,7 +1565,9 @@ static void release_start_build(void)
         return;
     }
     snprintf(exe, sizeof exe, "%s/bin/xboxrecomp-build", g_release_dir);
-    argv[0] = exe; argv[1] = "build"; argv[2] = "--source"; argv[3] = g_source;
+    g_rel_relinking = g_rel_moved;
+    argv[0] = exe; argv[1] = g_rel_relinking ? "relink" : "build";
+    argv[2] = "--source"; argv[3] = g_source;
     argv[4] = NULL;
     g_rel_error[0] = g_rel_note[0] = '\0';
     g_rel_unsupported = g_build_cancelled = 0;
@@ -1549,6 +1599,9 @@ static void release_line(const char *line)
     } else if (strcmp(ev, "error") == 0) {
         json_str(line, "message", g_rel_error, sizeof g_rel_error);
         g_rel_unsupported = strstr(line, "\"unsupported\":true") != NULL;
+        /* Another copy of the game: relinking can't help, building can. */
+        if (strstr(line, "\"rebuild\":true"))
+            g_rel_moved = 0;
     }
 }
 
@@ -1585,7 +1638,9 @@ static void release_tick(void)
     }
     g_rel = REL_SETUP;
     if (g_build_cancelled) {
-        snprintf(g_rel_note, sizeof g_rel_note, "Cancelled. Build again to start over.");
+        snprintf(g_rel_note, sizeof g_rel_note, g_rel_relinking
+                 ? "Cancelled. Choose the game's files to try again."
+                 : "Cancelled. Build again to start over.");
         g_rel_error[0] = '\0';
     } else if (!g_rel_error[0]) {
         snprintf(g_rel_error, sizeof g_rel_error,
@@ -1601,10 +1656,15 @@ static void draw_setup(void)
     p.x = 60; p.y = 104; p.w = g_cw - 120; p.h = 140;
     theme_panel(p, 0.2);
     r.x = p.x + 24; r.y = p.y + 18; r.w = p.w - 48; r.h = 26;
-    theme_text(r, g_rel_stale ? "Build the game again" : "Your copy of the game",
+    theme_text(r, g_rel_moved ? "The game's files have moved"
+                  : g_rel_stale ? "Build the game again" : "Your copy of the game",
                15, 700, THEME_TEXT, THEME_LEFT);
     r.y += 36; r.h = 80;
-    theme_text_wrapped(r, g_rel_stale
+    theme_text_wrapped(r, g_rel_moved
+        ? "The game is built, but the folder it was built from is no longer where "
+          "it was. Choose where it is now, or the disc image: the game is linked to "
+          "it again in a few seconds, with nothing rebuilt. Your saves stay."
+        : g_rel_stale
         ? "This release is newer than the game it built for you. Build it again "
           "from the same disc to bring it up to date; your saves and settings stay."
         : "Choose your disc image (.iso) or the folder the game's files are in. "
@@ -1627,7 +1687,8 @@ static void draw_setup(void)
     }
     for (i = 1; i <= 3; i++) {
         static const char *const k_labels[] = { "", "DISC IMAGE...", "FOLDER...", "BUILD" };
-        const char *label = (i == 3 && g_rel_stale) ? "BUILD AGAIN" : k_labels[i];
+        const char *label = (i == 3 && g_rel_moved) ? "LINK AGAIN"
+                          : (i == 3 && g_rel_stale) ? "BUILD AGAIN" : k_labels[i];
 
         r = setup_rect(i);
         theme_panel(r, g_setup_sel == i ? 0.9 : 0.3);
@@ -1639,7 +1700,9 @@ static void draw_setup(void)
     if (g_rel_error[0]) {
         theme_panel(r, 0.15);
         r.x += 24; r.y += 16; r.w -= 48; r.h = 24;
-        theme_text(r, g_rel_unsupported ? "This disc can't be used" : "The build did not finish",
+        theme_text(r, g_rel_unsupported ? "This disc can't be used"
+                      : g_rel_relinking ? "The game's files were not linked"
+                      : "The build did not finish",
                    13, 700, THEME_GREEN, THEME_LEFT);
         r.y += 30; r.h = 230;
         theme_text_wrapped(r, g_rel_error, 11, THEME_TEXT);
@@ -1663,7 +1726,8 @@ static void draw_building(void)
     p.x = 60; p.y = 130; p.w = g_cw - 120; p.h = 300;
     theme_panel(p, 0.3);
     r.x = p.x + 30; r.y = p.y + 26; r.w = p.w - 60; r.h = 28;
-    theme_text(r, "Building the game", 16, 700, THEME_TEXT, THEME_LEFT);
+    theme_text(r, g_rel_relinking ? "Finding the game's files" : "Building the game",
+               16, 700, THEME_TEXT, THEME_LEFT);
     r.y += 50; r.h = 24;
     theme_text(r, g_build_label, 13, 700, THEME_GREEN, THEME_LEFT);
     snprintf(pct, sizeof pct, "%d%%", (int)(g_build_progress * 100.0 + 0.5));
@@ -1673,8 +1737,10 @@ static void draw_building(void)
     r.y = b.y + 34; r.h = 22;
     theme_text(r, g_build_detail, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
     r.y += 44; r.h = 70;
-    theme_text_wrapped(r, "This happens once. Later starts go straight to the game. "
-                          "It is building from your own copy, on this computer.",
+    theme_text_wrapped(r, g_rel_relinking
+                          ? "Linking the game to its files again. Nothing is rebuilt."
+                          : "This happens once. Later starts go straight to the game. "
+                            "It is building from your own copy, on this computer.",
                        11, THEME_TEXT_DIM);
 
     r.x = 60; r.y = g_ch - 44; r.w = g_cw - 260; r.h = 24;
@@ -1688,10 +1754,13 @@ static void draw_building(void)
 static void draw_done(void)
 {
     ThemeRect p, r, b;
-    char text[400];
+    char text[LAUNCHER_PATH + 400];
     unsigned secs = (unsigned)((g_build_ms + 500) / 1000);
 
-    if (secs >= 60)
+    if (g_rel_relinking)
+        snprintf(text, sizeof text, "%s is linked to its files at %s again. Nothing was "
+                 "rebuilt, and your saves are where they were.", g_title_name, g_source);
+    else if (secs >= 60)
         snprintf(text, sizeof text, "%s was built from your copy in %u min %u s. "
                  "Next time, the launcher opens straight to the settings and Play.",
                  g_title_name, secs / 60, secs % 60);
@@ -1705,7 +1774,8 @@ static void draw_done(void)
     r.x = p.x + 30; r.y = p.y + 26; r.w = p.w - 60; r.h = 28;
     theme_text(r, "The game is ready", 16, 700, THEME_GREEN, THEME_LEFT);
     r.y += 50; r.h = 24;
-    theme_text(r, "Build complete", 13, 700, THEME_TEXT, THEME_LEFT);
+    theme_text(r, g_rel_relinking ? "Files found" : "Build complete",
+               13, 700, THEME_TEXT, THEME_LEFT);
     theme_text(r, "100%", 13, 700, THEME_TEXT, THEME_RIGHT);
     b.x = r.x; b.y = r.y + 40; b.w = r.w; b.h = 16;
     theme_bar(b, 1.0, -1.0);
