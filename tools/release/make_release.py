@@ -16,8 +16,8 @@ it with what the release brings (docs/technical/self-build-release.md):
     engine/                the runtime, prebuilt (make_engine_package.py)
     toolkit/               the pipeline: tools/, scripts/recompile.py,
                            config/, templates/runtime, src/hle
-    recipe/                the title's project: its CMakeLists, main.c,
-                           recomp_manual.c and any other sources
+    recipe/                the title's project: its CMakeLists, src/ (main.c,
+                           recomp_manual.c, any other sources) and config/
     dxc/                   the shader compiler the renderer loads
     LICENSE NOTICE.txt README.txt
 
@@ -135,14 +135,23 @@ def main():
     out = Path(args.out).resolve()
     work = Path(args.work).resolve() if args.work else out.parent / "release-work"
     cache = Path(args.cache).resolve() if args.cache else out.parent / "downloads"
+    # Its own output, finished or not, is marked, so a folder it did not make
+    # is never deleted.
+    marker = ".made-by-make_release"
     if out.exists():
-        if not (out / "release.json").is_file():
+        if not (out / marker).is_file():
             sys.exit(f"make_release: {out} exists and is not a release; not replacing it")
         shutil.rmtree(out)
     out.mkdir(parents=True)
+    (out / marker).write_text("tools/release/make_release.py\n")
+    # Zig's cache is shared; the builds are per release, because CMake keeps
+    # a build folder on the compiler it was first configured with, and each
+    # release's compiler is its own.
+    zig_cache = work / "zig-cache"
+    work = work / recipe["release_name"]
     work.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(work / "zig-cache"),
-               ZIG_LOCAL_CACHE_DIR=str(work / "zig-cache"))
+    env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(zig_cache),
+               ZIG_LOCAL_CACHE_DIR=str(zig_cache))
 
     if args.version:
         version = args.version
@@ -192,7 +201,11 @@ def main():
     tracked = subprocess.run(["git", "-C", str(project), "ls-files", "-z", "."],
                              capture_output=True, text=True).stdout.split("\0")
     for rel in filter(None, tracked):
-        if rel.endswith((".bat", ".gitignore")) or "/recomp/gen/" in rel:
+        # What a title's build reads: its CMakeLists, its sources and its own
+        # config (seeds, XDK symbols). Not scripts, a submodule, or lifted code.
+        if not (rel == "CMakeLists.txt" or rel.startswith(("src/", "config/"))):
+            continue
+        if "/recomp/gen/" in rel or not (project / rel).is_file():
             continue
         (out / "recipe" / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(project / rel, out / "recipe" / rel)
