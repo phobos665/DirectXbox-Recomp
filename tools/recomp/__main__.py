@@ -650,9 +650,10 @@ def main():
         # those bodies are still lifted, under their own name. Scanned whether
         # or not there is a symbols file, like the imported variables, because
         # the implementations declare the pointers either way.
-        from .hle import grouped_names, keep_originals, wanted_originals
+        from .hle import grouped_names, keep_originals, serialized_names, wanted_originals
         wanted = wanted_originals([p for p in hle_impl_paths if os.path.exists(p)])
         hle_groups = grouped_names([p for p in hle_impl_paths if os.path.exists(p)])
+        hle_serialized = serialized_names([p for p in hle_impl_paths if os.path.exists(p)])
         hle_keep = keep_originals(hle_replace, wanted)
 
         if args.only_hle_thunks:
@@ -728,7 +729,8 @@ def main():
             from .hle import render_thunks
             out = out_path
             write_if_changed(out, render_thunks(hle_replace, hle_variables,
-                                                hle_originals, hle_groups))
+                                                hle_originals, hle_groups,
+                                                hle_serialized))
             # The runtime header travels with the generated code, and a real
             # lift refreshes it every run for the reason translator.py spells
             # out at length: the lifter and this header are two halves of one
@@ -795,7 +797,7 @@ def main():
         from .hle import render_thunks
         write_if_changed(os.path.join(gen_dir, "recomp_hle.c"),
                          render_thunks(hle_replace, hle_variables, hle_originals,
-                                       hle_groups))
+                                       hle_groups, hle_serialized))
         _write_xbe_patches(gen_dir, args.xbe_path, args.xbe_original)
 
         t_translate = time.time() - t0

@@ -90,6 +90,34 @@ class Render(unittest.TestCase):
         self.assertIn("void hle_D3DDevice_SetFlickerFilter(void);", src)
         self.assertIn("void sub_002158D0(void) { hle_D3DDevice_SetFlickerFilter(); g_esp += 8; }",
                       src)
+        self.assertNotIn("recomp_hle_serial_enter", src)
+
+    def test_serialized_thunk_holds_the_lock_around_the_call(self):
+        src = render_thunks({0x002158D0: ("D3DDevice_SetFlickerFilter", 4, {}),
+                             0x00300000: ("D3DDevice_SelectVertexShader", 0,
+                                          {1: "eax", 2: "ebx"})},
+                            serialized={"D3DDevice_SetFlickerFilter",
+                                        "D3DDevice_SelectVertexShader"})
+        self.assertIn("void recomp_hle_serial_enter(void);", src)
+        self.assertIn("void sub_002158D0(void) { recomp_hle_serial_enter(); "
+                      "hle_D3DDevice_SetFlickerFilter(); recomp_hle_serial_leave(); "
+                      "g_esp += 8; }", src)
+        # The LTCG form: the lock is outside the frame it lays out.
+        line = next(l for l in src.splitlines() if l.startswith("void sub_00300000"))
+        self.assertTrue(line.startswith("void sub_00300000(void) { recomp_hle_serial_enter(); "
+                                        "RECOMP_HLE_LTCG_CALL("), line)
+        self.assertIn("RECOMP_HLE_LTCG_END recomp_hle_serial_leave(); }", line)
+
+    def test_serialize_marker_names_every_export_in_its_file(self):
+        from tools.recomp.hle import serialized_names
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "d3d.c"), "w") as f:
+                f.write("HLE_SERIALIZE()   /* the lock */\n"
+                        "HLE_EXPORT(D3DDevice_Clear)\n{\n}\n")
+            with open(os.path.join(d, "dsound.c"), "w") as f:
+                f.write("/* HLE_SERIALIZE() only in a comment */\n"
+                        "HLE_EXPORT(DirectSoundDoWork)\n{\n}\n")
+            self.assertEqual(serialized_names([d]), {"D3DDevice_Clear"})
 
 
 class Originals(unittest.TestCase):

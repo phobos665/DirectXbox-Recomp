@@ -38,6 +38,16 @@ extern ptrdiff_t g_xbox_mem_offset;
  * audio: the DirectSound replacement, off under RECOMP_AUDIO=apu. */
 #define HLE_GROUP(group)
 
+/* On a line of its own in a file: every HLE_EXPORT in the file runs under one
+ * recursive lock, taken by its thunk (recomp_hle_serial_enter/leave). For
+ * replacements that share host state no two guest threads may touch at once:
+ * the D3D8 device. On the console a title's loader thread could create
+ * shaders and textures while its main thread drew, because the CPU ran one
+ * thread at a time; here they run in parallel on one host device.
+ * WrestleMania 21's match load crashed in the push-buffer walk and in frame
+ * interpolation's replay that way. */
+#define HLE_SERIALIZE()
+
 /* On a line of its own, in a grouped file: this replacement stays on while
  * its group is off. Only for one that runs the original body and records
  * what it was told, so the title's own code still does the work. */

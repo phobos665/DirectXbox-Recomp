@@ -46,6 +46,8 @@
 #include "d3d8_internal.h"
 #include "hle_d3d8_record.h"
 
+HLE_SERIALIZE()   /* the D3D8 lock: hle.h, hle_d3d8.c */
+
 /* Reads a RECOMP_* switch; see xbox_memory_layout.h. Declared here rather than
  * including the kernel header, which this file otherwise has no need of. */
 int xbox_EnvSwitch(const char *name, int default_on);

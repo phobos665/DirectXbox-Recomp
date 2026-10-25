@@ -64,6 +64,8 @@ HLE_IMPORT_VAR(D3D_g_DeferredTextureState);
 #include "d3d8_xbox.h"
 #include "hle_d3d8_record.h"
 
+HLE_SERIALIZE()   /* the D3D8 lock: hle.h, hle_d3d8.c */
+
 #define XRS_COUNT        167         /* X_D3DRS_DONOTCULLUNCOMPRESSED + 1 */
 #define XRS_REMOVED      154         /* X_D3DRS_MULTISAMPLETYPE */
 #define XRS_FOGENABLE    92

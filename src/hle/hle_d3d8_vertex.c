@@ -48,6 +48,8 @@
 #include "d3d8_vsh.h"
 #include "hle_d3d8_record.h"
 
+HLE_SERIALIZE()   /* the D3D8 lock: hle.h, hle_d3d8.c */
+
 /* From hle_d3d8.c. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void);
 void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,

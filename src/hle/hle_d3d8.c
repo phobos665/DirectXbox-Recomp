@@ -79,6 +79,41 @@
 #include "input_bindings.h"              /* the mouse, for mouse look and mouse: bindings */
 #include "../kernel/xbox_memory_layout.h"  /* the guest lock */
 
+HLE_SERIALIZE()
+
+/* The lock HLE_SERIALIZE's thunks take (hle.h): one for every D3D8
+ * replacement, so two guest threads never use the host device, the
+ * push-buffer walk or frame interpolation's kept frame at once. Recursive,
+ * because a replacement that runs the title's own body can reach another
+ * replacement. A thread that has to wait gives the guest lock up first, as
+ * a kernel wait does: the holder may need it to finish. Set up once, by
+ * whichever thread comes first. */
+static CRITICAL_SECTION g_serial;
+static volatile LONG    g_serial_state;      /* 0 none, 1 being set up, 2 ready */
+
+void recomp_hle_serial_enter(void)
+{
+    if (g_serial_state != 2) {
+        if (InterlockedCompareExchange(&g_serial_state, 1, 0) == 0) {
+            InitializeCriticalSection(&g_serial);
+            InterlockedExchange(&g_serial_state, 2);
+        } else {
+            while (g_serial_state != 2)
+                Sleep(0);
+        }
+    }
+    if (!TryEnterCriticalSection(&g_serial)) {
+        int guest_held = xbox_GuestLockDrop();
+        EnterCriticalSection(&g_serial);
+        xbox_GuestLockRestore(guest_held);
+    }
+}
+
+void recomp_hle_serial_leave(void)
+{
+    LeaveCriticalSection(&g_serial);
+}
+
 void hle_d3d8_push_constants_sync(void);   /* hle_d3d8_vertex.c */
 int  hle_d3d8_pb_walking(void);             /* hle_d3d8_vertex.c */
 void hle_d3d8_apply_pending_textures(void); /* hle_d3d8_texture.c */
