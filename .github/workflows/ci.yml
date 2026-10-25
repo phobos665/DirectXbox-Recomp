@@ -283,6 +283,14 @@ jobs:
             --cache "$RUNNER_TEMP/downloads" --version "ci-${GITHUB_SHA::7}" --archive
           ls -l "$RUNNER_TEMP"/release/*.zip
 
+      # Kept for a few days, to try on a Windows machine: it holds no game
+      # code, only the tools and TimeSplitters 2's project.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: timesplitters2-windows-x86_64
+          path: ${{ runner.temp }}/release/*.zip
+          retention-days: 3
+
   windows:
     name: Build and test (Windows, MSVC)
     runs-on: windows-2022
