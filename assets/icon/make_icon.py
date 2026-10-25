@@ -1,4 +1,4 @@
-"""Draw DirectXRecomp's icon and render it at every size the platforms use.
+"""Draw DirectXboxRecomp's icon and render it at every size the platforms use.
 
     python3 assets/icon/make_icon.py
 
@@ -88,7 +88,7 @@ def svg():
         bevels.append((quad, shade((ex, ey), (0x5c, 0x66, 0x55), (0x05, 0x06, 0x05))))
 
     out = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">',
-           "  <!-- DirectXRecomp's own mark, drawn by make_icon.py: edit that, not this. -->",
+           "  <!-- DirectXboxRecomp's own mark, drawn by make_icon.py: edit that, not this. -->",
            "  <defs>",
            '    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">'
            '<stop offset="0" stop-color="#86cc1e"/><stop offset="1" stop-color="#2c740b"/></linearGradient>',
@@ -169,7 +169,7 @@ def png_rgba(path):
 
 def header(w, h, rgba):
     rows = [", ".join("0x%02x" % v for v in rgba[i:i + 16]) for i in range(0, len(rgba), 16)]
-    return ("/* DirectXRecomp's icon, %dx%d RGBA, for SDL_SetWindowIcon.\n"
+    return ("/* DirectXboxRecomp's icon, %dx%d RGBA, for SDL_SetWindowIcon.\n"
             " * Written by assets/icon/make_icon.py: edit that, not this. */\n"
             "#ifndef RECOMP_ICON_H\n#define RECOMP_ICON_H\n\n"
             "#define RECOMP_ICON_SIZE %d\n\n"

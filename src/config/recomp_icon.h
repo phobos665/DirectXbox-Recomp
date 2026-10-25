@@ -1,4 +1,4 @@
-/* DirectXRecomp's icon, 64x64 RGBA, for SDL_SetWindowIcon.
+/* DirectXboxRecomp's icon, 64x64 RGBA, for SDL_SetWindowIcon.
  * Written by assets/icon/make_icon.py: edit that, not this. */
 #ifndef RECOMP_ICON_H
 #define RECOMP_ICON_H
