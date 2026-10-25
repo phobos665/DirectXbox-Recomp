@@ -1185,12 +1185,19 @@ static void shadow_create(uint32_t pp_va)
  * of the title's X_D3DVertexShader with bit 0 set (Cxbx-Reloaded,
  * XbVertexShader.h, VshHandleIsVertexShader). FVF bits are the PC's, so an
  * FVF code goes to the host as it is. A program is created on the host when
- * the title creates it, and found again here by its guest handle. */
-#define SHADOW_MAX_PROGRAMS 128
+ * the title creates it, and found again here by its guest handle. Entries are
+ * never freed (DeleteVertexShader is not replaced), so this is every program
+ * a session creates: WWE WrestleMania 21 makes 138 by its first match, and
+ * at 128 its wrestlers' were "table full, not tracked" and skipped as
+ * "unknown shader". */
+#define SHADOW_MAX_PROGRAMS 512
 
 enum { SHADER_DECLARATION, SHADER_HOST_PROGRAM, SHADER_NOT_REPLAYED };
 
-#define SHADOW_MAX_PACKED 8              /* registers expanded to floats per draw */
+/* Registers expanded to floats per draw: all sixteen. WWE WrestleMania 21's
+ * wrestlers are declared with ten that need it, and at eight every draw of
+ * them was skipped as "program without layout". */
+#define SHADOW_MAX_PACKED 16
 
 struct shadow_program {
     uint32_t guest;

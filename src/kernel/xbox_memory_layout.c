@@ -2205,15 +2205,37 @@ void xbox_Nv2aFlipGateCycle(void)
 }
 
 /* The gate's wait, lent out (xbox_Nv2aFlipGateSetIdle). The time of the
- * last vblank and the period are what the hook is told the release will be:
- * the next vblank is the last one plus a period. */
+ * last vblank and the period are what the hook is told the release will be
+ * (flip_gate_next_release). */
 static xbox_FlipGateIdleFn g_flip_gate_idle;
 static volatile LONGLONG   g_flip_gate_last_vblank;
 static LONGLONG            g_flip_gate_period, g_flip_gate_qpf;
+/* The last vblank that released the gate: with a divisor of d, releases
+ * are d periods apart, starting from one of these. */
+static volatile LONGLONG   g_flip_gate_last_release;
 
 void xbox_Nv2aFlipGateSetIdle(xbox_FlipGateIdleFn fn)
 {
     g_flip_gate_idle = fn;
+}
+
+/* When the gate is next released: the next vblank at one Swap a vblank;
+ * at one every d (a title that asked for 30, held to it), the first vblank
+ * after now that is a multiple of d periods from the last release. Frame
+ * interpolation fills the vblanks in between, which is what makes a 30 fps
+ * title smooth at 60. */
+static LONGLONG flip_gate_next_release(LONGLONG now)
+{
+    int d = flip_gate_divisor();
+    LONGLONG step, next;
+
+    if (d <= 1 || !g_flip_gate_last_release)
+        return g_flip_gate_last_vblank + g_flip_gate_period;
+    step = g_flip_gate_period * d;
+    next = g_flip_gate_last_release + step;
+    while (next <= now)
+        next += step;
+    return next;
 }
 
 /* Lend the wait to the hook until it wants nothing more or the vblank comes.
@@ -2239,7 +2261,7 @@ static BOOL flip_gate_lend(void)
         if (WaitForSingleObject(g_flip_gate_event, 0) == WAIT_OBJECT_0)
             return TRUE;
         QueryPerformanceCounter(&now);
-        want = g_flip_gate_idle(now.QuadPart, g_flip_gate_last_vblank + g_flip_gate_period);
+        want = g_flip_gate_idle(now.QuadPart, flip_gate_next_release(now.QuadPart));
         if (want <= 0)
             return FALSE;
         QueryPerformanceCounter(&now);
@@ -2305,9 +2327,9 @@ void xbox_Nv2aFlipGateArm(void)
          * recorded host calls and must not touch guest memory. */
         int guest_held = xbox_GuestLockDrop();
 
-        /* Only while one Swap a vblank is the cadence: the release is then
-         * always the next vblank, which is what the hook is told. */
-        if (!(g_flip_gate_idle && flip_gate_divisor() == 1 && flip_gate_lend()) &&
+        /* At any vblank cadence; the hook is told the release the cadence
+         * gives (flip_gate_next_release). */
+        if (!(g_flip_gate_idle && flip_gate_lend()) &&
             WaitForSingleObject(g_flip_gate_event, 250) == WAIT_TIMEOUT && !said++) {
             fprintf(stderr, "  [NV2A] flip gate timed out: no vblank for 250 ms, "
                             "the title is not being paced\n");
@@ -2336,8 +2358,10 @@ void xbox_Nv2aFlipGateRelease(void)
     g_flip_gate_last_vblank = now.QuadPart;
     if (!g_flip_gate_event)
         g_flip_gate_event = CreateEventW(NULL, FALSE, FALSE, NULL);   /* auto-reset */
-    if (g_flip_gate_event && (d <= 1 || n % d == 0))
+    if (g_flip_gate_event && (d <= 1 || n % d == 0)) {
+        g_flip_gate_last_release = now.QuadPart;
         SetEvent(g_flip_gate_event);
+    }
 }
 
 static void fence_mirrors_tick(void)
