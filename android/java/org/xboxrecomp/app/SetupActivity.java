@@ -60,8 +60,9 @@ public class SetupActivity extends Activity {
             ApplicationInfo ai = getPackageManager().getApplicationInfo(
                 getPackageName(), PackageManager.GET_META_DATA);
             if (ai.metaData != null) {
+                // The release's images, comma separated (PAL, USA, ...).
                 String s = ai.metaData.getString("xboxrecomp.xbe_sha1");
-                if (s != null && s.length() == 40)
+                if (s != null && s.length() >= 40)
                     return s.toLowerCase();
             }
         } catch (PackageManager.NameNotFoundException e) {
@@ -165,7 +166,8 @@ public class SetupActivity extends Activity {
         if (depth > MAX_DEPTH || dir == null || !dir.isDirectory())
             return;
         File xbe = new File(dir, "default.xbe");
-        if (xbe.isFile() && (want == null || want.equals(sha1(xbe)))) {
+        String digest = xbe.isFile() ? sha1(xbe) : "";
+        if (xbe.isFile() && (want == null || (!digest.isEmpty() && want.contains(digest)))) {
             // Shared storage ignores case: roms/ and ROMs/ are one folder.
             boolean seen = false;
             for (String f : found)

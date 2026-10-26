@@ -284,8 +284,9 @@ def main():
     ap.add_argument("--version-code", default="1")
     ap.add_argument("--version-name", default="1.0")
     ap.add_argument("--xbe-sha1", default="",
-                    help="SHA-1 of the default.xbe the code was lifted from: the game the "
-                         "app's setup looks for on the device (any default.xbe if empty)")
+                    help="SHA-1s of the default.xbe images the release is for, comma "
+                         "separated: what the app's setup looks for on the device "
+                         "(any default.xbe if empty)")
     ap.add_argument("--icon", default=DEFAULT_ICON,
                     help="the launcher icon: a PNG, square, 192 px or more (or an SVG with "
                          "rsvg-convert installed); default the toolkit's own")

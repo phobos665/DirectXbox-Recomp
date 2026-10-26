@@ -140,6 +140,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--build", required=True)
     ap.add_argument("--project", required=True)
+    ap.add_argument("--spec-project", help="the configured copy of the project the build "
+                    "was made from (build_apk.py), where its paths point; default --project")
     ap.add_argument("--recipe", required=True)
     ap.add_argument("--python", required=True, help="the CPython for Android prefix")
     ap.add_argument("--zig-lib", required=True)
@@ -183,7 +185,8 @@ def main():
 
     # The flags, and the headers they reach.
     headers = set()
-    title, gen_flags = compile_spec(build, project, headers)
+    spec_project = Path(a.spec_project).resolve() if a.spec_project else project
+    title, gen_flags = compile_spec(build, spec_project, headers)
     # Engine headers also reach the runtime templates by relative path
     # (src/kernel/xbox_memory_layout.h: ../../templates/runtime/recomp_cpu.h).
     headers.add((TOOLKIT / "templates" / "runtime", "headers/toolkit/templates/runtime"))
