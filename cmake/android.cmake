@@ -38,7 +38,13 @@ function(xboxrecomp_android_libraries title_objects)
     # Nothing the title will need may be left out unseen.
     target_link_options(main PRIVATE -Wl,--no-undefined)
 
+    # Lifted code calls lifted code tens of thousands of times a frame. In a
+    # shared library those calls would go through the dynamic linker's tables
+    # in case another library replaced them, which nothing does: the title's
+    # own calls bind to itself.
+    target_compile_options(${title_objects} PRIVATE -fno-semantic-interposition)
     add_library(game SHARED $<TARGET_OBJECTS:${title_objects}>)
     target_link_libraries(game PRIVATE main)
+    target_link_options(game PRIVATE -Wl,-Bsymbolic)
     set_target_properties(game PROPERTIES OUTPUT_NAME game)
 endfunction()
