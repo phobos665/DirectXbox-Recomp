@@ -10,13 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The controls. Where they go is DroidDeck's GamepadGeometry, its layout
- * for a screen-wide pad on a wide screen: each thumb pivots at a bottom
- * corner, its stick diagonally in from the corner and the d-pad (left) or
- * the face buttons (right) a slide inward along the arc, two shoulders above
- * on each side -- the triggers outside, White and Black inside -- and Back,
- * the stick clicks and Start between the arcs. What each control looks like
- * and does follows Steam Link's controller, as DroidDeck draws it. */
+/* The controls. Where they go is lay_out's ("Edges"); what each looks like
+ * and how it reads follows Steam Link's controller, as DroidDeck draws it. */
 enum {
     C_LSTICK, C_RSTICK, C_DPAD, C_A, C_B, C_X, C_Y,
     C_WHITE, C_BLACK, C_LTRIG, C_RTRIG, C_BACK, C_START, C_LTHUMB, C_RTHUMB,
@@ -72,17 +67,15 @@ static struct {
     int        started;
     int        shown;           /* auto: shown now */
     float      opacity, scale;
-    float      density;         /* pixels per dp */
     int        w, h;            /* the screen the shapes were last asked for */
     int        laid_w, laid_h;  /* the screen `places` is for */
     place      places[C_COUNT];
     finger     fingers[MAX_FINGERS];
     int        nfingers;
     Uint64     last_touch_ms;
-} T = { NULL, MODE_OFF, 0, 0, 0.45f, 1.0f, 0.0f, 1920, 1080 };
+} T = { .mode = MODE_OFF, .opacity = 0.45f, .scale = 1.0f, .w = 1920, .h = 1080 };
 
 static float minf(float a, float b) { return a < b ? a : b; }
-static float maxf(float a, float b) { return a > b ? a : b; }
 
 static void put(int c, float x, float y, float w, float h)
 {
@@ -92,52 +85,39 @@ static void put(int c, float x, float y, float w, float h)
     T.places[c].h = h;
 }
 
-/* GamepadGeometry.layout's wide branch, for a w x h screen. */
+/* The "Edges" layout, chosen from the mock-ups (Oct 2026): everything along
+ * the left and right edges so the middle of the picture stays clear. Large
+ * triggers in the top corners, where index fingers rest, White and Black
+ * under them, the d-pad and face buttons at mid height, the sticks at the
+ * bottom and their clicks just inside them; Back and Start top centre.
+ *
+ * Drawn on a 1920x1080 screen; u scales it by the screen's height, and the
+ * two sides are measured from their own edges, so a wider screen moves them
+ * apart rather than stretching them. */
 static void lay_out(void)
 {
     float w = (float)T.w, h = (float)T.h;
-    float d = T.density > 0.0f ? T.density : h / 411.0f;
-    float pad = 8 * d, button_h = 40 * d, row_button = 64 * d, grid_button = 48 * d;
-    float gutter = 8 * d;
-    float reach = minf(h - pad, w * 0.33f) * T.scale;
-    float main = reach * 0.66f, second = reach * 0.54f;
-    float main_top = h - reach * 0.40f - main / 2;
-    float shoulder_w = reach * 0.36f, shoulder_h = maxf(reach * 0.16f, button_h);
-    float shoulder_y = maxf(minf(h - reach * 0.94f + shoulder_h / 2,
-                                 main_top - gutter - shoulder_h / 2), pad + shoulder_h / 2);
-    float face_x = w - reach * 1.03f, face_y = h - reach * 0.30f;
-    float face_r = second * 0.19f, face_off = second * 0.30f;
-    float gap = w - 2 * reach * 1.32f, span, each;
-    int columns, i;
-    /* The middle row, in DroidDeck's order (View, Steam, QAM, Menu), and its
-     * two-by-two places (View and Menu above Steam and QAM). */
-    static const int middle[4] = { C_BACK, C_LTHUMB, C_RTHUMB, C_START };
-    static const int grid[4] = { 0, 2, 3, 1 };
+    float u = h / 1080.0f * T.scale;
+#define L(x) ((x) * u)
+#define R(x) (w - (x) * u)
 
-    put(C_LSTICK, reach * 0.40f, h - reach * 0.40f, main, main);
-    put(C_RSTICK, w - reach * 0.40f, h - reach * 0.40f, main, main);
-    put(C_DPAD, reach * 1.03f, h - reach * 0.30f, second, second);
-    put(C_A, face_x, face_y + face_off, 2 * face_r, 2 * face_r);
-    put(C_B, face_x + face_off, face_y, 2 * face_r, 2 * face_r);
-    put(C_X, face_x - face_off, face_y, 2 * face_r, 2 * face_r);
-    put(C_Y, face_x, face_y - face_off, 2 * face_r, 2 * face_r);
-    put(C_LTRIG, reach * 0.22f, shoulder_y, shoulder_w, shoulder_h);
-    put(C_RTRIG, w - reach * 0.22f, shoulder_y, shoulder_w, shoulder_h);
-    put(C_WHITE, reach * 0.62f, shoulder_y, shoulder_w, shoulder_h);
-    put(C_BLACK, w - reach * 0.62f, shoulder_y, shoulder_w, shoulder_h);
-
-    /* Between the arcs: in a row if they fit, else two by two, else one
-     * above another. */
-    columns = gap >= 4 * row_button ? 4 : gap >= 2 * grid_button ? 2 : 1;
-    span = gap - 2 * gutter;
-    each = minf(span / (float)columns, 110 * d);
-    for (i = 0; i < 4; i++) {
-        int index = columns == 2 ? grid[i] : i;
-        float x = w / 2 + ((float)(index % columns) - (float)(columns - 1) / 2) * each;
-        float top = shoulder_y - button_h / 2;
-        put(middle[i], x, top + button_h / 2 + (float)(index / columns) * (button_h + 10 * d),
-            each - gutter, button_h);
-    }
+    put(C_LTRIG,  L(200), L(100), L(320), L(140));
+    put(C_RTRIG,  R(200), L(100), L(320), L(140));
+    put(C_WHITE,  L(140), L(262), L(200), L(96));
+    put(C_BLACK,  R(140), L(262), L(200), L(96));
+    put(C_DPAD,   L(240), L(520), L(236), L(236));
+    put(C_LSTICK, L(262), h - L(220), L(300), L(300));
+    put(C_RSTICK, R(262), h - L(220), L(300), L(300));
+    put(C_LTHUMB, L(520), h - L(70), L(130), L(72));
+    put(C_RTHUMB, R(520), h - L(70), L(130), L(72));
+    put(C_BACK,   w / 2 - L(100), L(56), L(170), L(72));
+    put(C_START,  w / 2 + L(100), L(56), L(170), L(72));
+    put(C_A, R(240),       L(620), L(116), L(116));
+    put(C_B, R(240) + L(100), L(520), L(116), L(116));
+    put(C_X, R(240) - L(100), L(520), L(116), L(116));
+    put(C_Y, R(240),       L(420), L(116), L(116));
+#undef L
+#undef R
     T.laid_w = T.w;
     T.laid_h = T.h;
 }
@@ -321,11 +301,6 @@ void recomp_touch_init(void)
 #endif
     T.opacity = setting_float("RECOMP_TOUCH_OPACITY", "touch_opacity", 0.45f, 0.1f, 1.0f);
     T.scale = setting_float("RECOMP_TOUCH_SCALE", "touch_scale", 1.0f, 0.5f, 2.0f);
-    {
-        float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
-        /* Android's density (a dp in pixels); elsewhere the desktop scale. */
-        T.density = scale > 0.0f ? scale : 0.0f;
-    }
     /* The lock and the watch exist whatever the mode, so the controls can
      * be switched on while the title runs (recomp_touch_configure). */
     T.lock = SDL_CreateMutex();
