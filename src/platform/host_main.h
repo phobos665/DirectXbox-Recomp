@@ -88,6 +88,12 @@ enum { HOST_SUSPEND_BACKGROUND = 1, HOST_SUSPEND_MENU = 2 };
 void host_set_suspended(unsigned reason, int on);
 int  host_suspended(void);
 
+/* Lets the held title draw n more frames and then holds it again, so a
+ * setting changed in the menu shows at once behind it. The flip gate takes
+ * one per frame (host_take_released_frame returns 1 while any are left). */
+void host_release_frames(int n);
+int  host_take_released_frame(void);
+
 /* ---- POSIX: which thread the title runs on --------------------------- */
 
 /* A host's main-thread event loop (src/host's recomp_host_loop_run/_quit).

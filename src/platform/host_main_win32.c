@@ -183,6 +183,24 @@ void host_set_suspended(unsigned reason, int on)
     } while (InterlockedCompareExchange(&g_suspended, want, old) != old);
 }
 
+static volatile LONG g_released;
+
+void host_release_frames(int n)
+{
+    if (n > 0)
+        InterlockedExchange(&g_released, n);
+}
+
+int host_take_released_frame(void)
+{
+    LONG n;
+
+    while ((n = InterlockedCompareExchange(&g_released, 0, 0)) > 0)
+        if (InterlockedCompareExchange(&g_released, n - 1, n) == n)
+            return 1;
+    return 0;
+}
+
 int host_suspended(void)
 {
     return InterlockedCompareExchange(&g_suspended, 0, 0) != 0;

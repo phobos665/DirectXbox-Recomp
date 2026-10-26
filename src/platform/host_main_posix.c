@@ -233,6 +233,26 @@ void host_set_suspended(unsigned reason, int on)
         __atomic_fetch_and(&g_suspended, ~reason, __ATOMIC_SEQ_CST);
 }
 
+static volatile int g_released;          /* frames let through while held */
+
+void host_release_frames(int n)
+{
+    if (n > 0)
+        __atomic_store_n(&g_released, n, __ATOMIC_SEQ_CST);
+}
+
+int host_take_released_frame(void)
+{
+    int n = __atomic_load_n(&g_released, __ATOMIC_SEQ_CST);
+
+    while (n > 0) {
+        if (__atomic_compare_exchange_n(&g_released, &n, n - 1, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return 1;
+    }
+    return 0;
+}
+
 int host_suspended(void)
 {
     return __atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST) != 0;

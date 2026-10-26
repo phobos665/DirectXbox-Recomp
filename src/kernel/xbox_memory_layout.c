@@ -2288,22 +2288,32 @@ static void flip_gate_host_paced(void)
  * the game's own logic does, which is what a player coming back expects. */
 static void flip_gate_hold_suspended(void)
 {
+    static int held_said;
     int guest_held;
     LARGE_INTEGER t0, t1, f;
 
-    if (!host_suspended())
+    if (!host_suspended() || host_take_released_frame())
         return;
     guest_held = xbox_GuestLockDrop();
     QueryPerformanceCounter(&t0);
-    fprintf(stderr, "  [NV2A] the title is held at its Swap (the app is in the background, or its menu is open)\n");
-    fflush(stderr);
-    while (host_suspended())
-        Sleep(20);
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&f);
-    fprintf(stderr, "  [NV2A] the title runs again after %.1f s held\n",
-            (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart);
-    fflush(stderr);
+    if (!held_said) {
+        fprintf(stderr, "  [NV2A] the title is held at its Swap (the app is in the background, or its menu is open)\n");
+        fflush(stderr);
+    }
+    /* A frame released (a setting changed in the menu) runs, and the next
+     * Swap holds again: the change is drawn behind the menu. */
+    while (host_suspended() && !host_take_released_frame())
+        Sleep(10);
+    if (host_suspended()) {
+        held_said = 1;                  /* only letting a frame through: quiet */
+    } else {
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&f);
+        fprintf(stderr, "  [NV2A] the title runs again after %.1f s held\n",
+                (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart);
+        fflush(stderr);
+        held_said = 0;
+    }
     xbox_GuestLockRestore(guest_held);
 }
 
