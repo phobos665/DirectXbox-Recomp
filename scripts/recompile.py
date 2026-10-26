@@ -214,7 +214,8 @@ def build_commands(args, xbe: Path, analysis_json: Path, stage_xbe: Path = None)
         lift.append("--trace-all-entries")
     # XDK functions with a name-keyed replacement (tools/recomp/hle.py), used
     # whenever tools.xdk_symbols has been run for this XBE.
-    hle_symbols = (Path(args.hle_symbols) if args.hle_symbols else
+    # getattr: a caller may build the arguments without this option.
+    hle_symbols = (Path(args.hle_symbols) if getattr(args, "hle_symbols", None) else
                    original.with_name(original.stem + "_xdk_symbols.json"))
     if hle_symbols.exists():
         lift += ["--hle-symbols", str(hle_symbols)]
