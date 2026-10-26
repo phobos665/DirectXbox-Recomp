@@ -38,12 +38,11 @@ final class GameMenu {
         void quit();
     }
 
-    private static final int PANEL = 0xF0121519;
-    private static final int ROW = 0x00000000;
-    private static final int ROW_FOCUS = 0x33FFFFFF;
-    private static final int TEXT = 0xFFE8EAED;
-    private static final int MUTED = 0xFF9AA3AD;
-    private static final int ACCENT = 0xFF3FB37A;
+    // The launcher's colours (Theme).
+    private static final int PANEL = 0xF00A1208;
+    private static final int TEXT = Theme.TEXT;
+    private static final int MUTED = Theme.TEXT_DIM;
+    private static final int ACCENT = Theme.GREEN;
 
     private static final String[] CAPS = { "adaptive", "60", "30", "off" };
     private static final String[] CAP_NAMES = { "Adaptive", "60 fps", "30 fps", "Off" };
@@ -72,7 +71,12 @@ final class GameMenu {
         root.setFocusable(false);
         panel = new LinearLayout(activity);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setBackgroundColor(PANEL);
+        {
+            // A launcher slab down the right, rimmed in the green on its open side.
+            GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                                                       new int[] { 0xF0101A0C, PANEL });
+            panel.setBackground(bg);
+        }
         panel.setClickable(true);                    // taps on the panel stay there
         panel.setFocusable(false);
         int pad = dp(20);
@@ -394,31 +398,17 @@ final class GameMenu {
         return t;
     }
 
-    /* A button that looks like one: a filled box, brighter with the focus. */
+    /* A button that looks like one: a launcher panel, lit with the focus. */
     private StateListDrawable boxBackground() {
-        StateListDrawable d = new StateListDrawable();
-        GradientDrawable focus = new GradientDrawable();
-        focus.setColor(0x55FFFFFF);
-        focus.setCornerRadius(dp(10));
-        GradientDrawable rest = new GradientDrawable();
-        rest.setColor(0x1FFFFFFF);
-        rest.setCornerRadius(dp(10));
-        d.addState(new int[] { android.R.attr.state_focused }, focus);
-        d.addState(new int[] { android.R.attr.state_pressed }, focus);
-        d.addState(new int[] { }, rest);
-        return d;
+        return Theme.panel(activity);
     }
 
+    /* A row: nothing at rest, a lit launcher panel with the focus. */
     private StateListDrawable rowBackground() {
         StateListDrawable d = new StateListDrawable();
-        GradientDrawable focus = new GradientDrawable();
-        focus.setColor(ROW_FOCUS);
-        focus.setCornerRadius(dp(10));
-        GradientDrawable rest = new GradientDrawable();
-        rest.setColor(ROW);
-        d.addState(new int[] { android.R.attr.state_focused }, focus);
-        d.addState(new int[] { android.R.attr.state_pressed }, focus);
-        d.addState(new int[] { }, rest);
+        d.addState(new int[] { android.R.attr.state_focused }, Theme.slab(activity, true));
+        d.addState(new int[] { android.R.attr.state_pressed }, Theme.slab(activity, true));
+        d.addState(new int[] { }, new GradientDrawable());
         return d;
     }
 

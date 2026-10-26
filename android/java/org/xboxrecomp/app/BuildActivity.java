@@ -62,21 +62,24 @@ public class BuildActivity extends Activity {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setGravity(Gravity.CENTER);
-        box.setBackgroundColor(0xFF0E1116);
+        box.setBackground(Theme.background());
         int pad = dp(32);
         box.setPadding(pad, pad, pad, pad);
 
         TextView title = text(getApplicationInfo().loadLabel(getPackageManager()).toString(), 26, true);
         box.addView(title);
         stepText = text("Getting ready", 18, false);
+        stepText.setTextColor(Theme.GREEN);
         stepText.setPadding(0, dp(16), 0, dp(8));
         box.addView(stepText);
         bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         bar.setMax(1000);
+        bar.setProgressTintList(android.content.res.ColorStateList.valueOf(Theme.GREEN));
+        bar.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(Theme.GREEN_DIM));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(520), dp(12));
         box.addView(bar, lp);
         detailText = text("", 13, false);
-        detailText.setTextColor(0xFF9AA3AD);
+        detailText.setTextColor(Theme.TEXT_DIM);
         detailText.setPadding(0, dp(8), 0, 0);
         box.addView(detailText);
         buttons = new LinearLayout(this);
@@ -240,13 +243,9 @@ public class BuildActivity extends Activity {
             detailText.setTypeface(Typeface.MONOSPACE);
             detailText.setGravity(Gravity.START);
             buttons.removeAllViews();
-            Button retry = new Button(this);
-            retry.setText("Try again");
-            retry.setOnClickListener(v -> recreate());
+            View retry = button("Try again", v -> recreate());
             buttons.addView(retry);
-            Button other = new Button(this);
-            other.setText("Choose another copy");
-            other.setOnClickListener(v -> {
+            View other = button("Choose another copy", v -> {
                 getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE).edit()
                     .remove(SetupActivity.KEY_GAME).apply();
                 startActivity(new Intent(this, SetupActivity.class));
@@ -291,10 +290,25 @@ public class BuildActivity extends Activity {
         TextView t = new TextView(this);
         t.setText(s);
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
-        t.setTextColor(0xFFE8EAED);
+        t.setTextColor(Theme.TEXT);
         t.setGravity(Gravity.CENTER);
         if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
         return t;
+    }
+
+    /* A launcher panel as a button, lit with the focus or the press. */
+    private View button(String label, View.OnClickListener click) {
+        TextView b = text(label, 16, true);
+        b.setPadding(dp(22), dp(12), dp(22), dp(12));
+        b.setFocusable(true);
+        b.setClickable(true);
+        b.setBackground(Theme.panel(this));
+        b.setOnClickListener(click);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(dp(8), 0, dp(8), 0);
+        b.setLayoutParams(lp);
+        return b;
     }
 
     private int dp(int v) {
