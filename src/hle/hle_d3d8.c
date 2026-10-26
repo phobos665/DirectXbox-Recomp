@@ -66,6 +66,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "platform/host_main.h"   /* host_exe_path: where F11 writes */
+#include "touch_controls.h"        /* the on-screen controls */
+#include "d3d8_touch.h"
 #include "hle.h"
 #include "recomp_config.h"
 
@@ -795,6 +797,10 @@ static HWND shadow_window(UINT width, UINT height)
         fprintf(stderr, "[HLE-D3D8] shadow: no window\n");
         return NULL;
     }
+    /* The on-screen controls (Android's, when there is no pad): fingers in
+     * through src/input, drawn by the renderer over each presented frame. */
+    recomp_touch_init();
+    d3d8_touch_set_source(recomp_touch_shapes);
     target = host_window_present_target(g_shadow_host);
     if (!target) {
         fprintf(stderr, "[HLE-D3D8] shadow: the window has nothing this renderer can "

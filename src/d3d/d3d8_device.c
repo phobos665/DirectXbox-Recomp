@@ -165,6 +165,7 @@ static void up_ring_shutdown(void);
 static void present_resolve(void);
 static void interp_target_destroy(void);
 #include "d3d8_overlay.h"
+#include "d3d8_touch.h"
 #include "d3d8_movie.h"
 
 /* ================================================================
@@ -557,6 +558,7 @@ static void present_scene(void)
         fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
     }
     d3d8_display_resolve(s->rhi_scene_srv, s->width, s->height, rhi_swapchain_view(), fit);
+    d3d8_touch_draw(rhi_swapchain_view(), s->swap_width, s->swap_height);
     keep_presented();
 }
 
@@ -870,6 +872,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         /* Cleanup subsystems first */
         up_ring_shutdown();
         d3d8_overlay_shutdown();
+        d3d8_touch_shutdown();
         d3d8_clear_shutdown();
         d3d8_movie_shutdown();
         xbox_D3D8ScreenCopyShutdown();
