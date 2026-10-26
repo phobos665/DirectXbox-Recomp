@@ -22,7 +22,8 @@ import java.util.Map;
 /*
  * The in-game menu: a panel down the right of the screen, opened with Back.
  * Resume, Settings and Quit game; Settings are the ones the runtime can
- * change while the title runs, plus two read at start, marked as such.
+ * change while the title runs, plus two read at start, named "(requires
+ * restart)".
  *
  * Plain views, built in code (the APK has no layout resources), focusable so
  * a pad's d-pad moves through them, A chooses and B goes back. While it is
@@ -154,8 +155,9 @@ final class GameMenu {
         list.addView(section("Display"));
         View first = toggleRow(list, "Frame rate counter", null, "fps_overlay");
         choiceRow(list, "Frame rate limit", null, "frame_cap", CAPS, CAP_NAMES);
-        toggleRow(list, "Widescreen", "Takes effect the next time the game starts", "widescreen");
-        choiceRow(list, "Resolution", "Takes effect the next time the game starts",
+        // Read when the game starts, so a change shows from the next start.
+        toggleRow(list, "Widescreen (requires restart)", null, "widescreen");
+        choiceRow(list, "Resolution (requires restart)", null,
                   "resolution_scale", new String[] { "1", "2", "3", "4" },
                   new String[] { "Native (1x)", "2x", "3x", "4x" });
 
