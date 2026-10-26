@@ -55,7 +55,7 @@ final class GameMenu {
     private final FrameLayout root;
     private final LinearLayout panel;
     private boolean open;
-    private boolean inSettings;
+    private boolean inSubPage;      // Settings or the quit question: Back returns to the main page
     private Map<String, String> values = new HashMap<>();
 
     GameMenu(Activity activity, Host host) {
@@ -83,7 +83,7 @@ final class GameMenu {
 
     void toggle() {
         if (open) {
-            if (inSettings) showMain();
+            if (inSubPage) showMain();
             else close();
         } else {
             openMenu();
@@ -130,18 +130,34 @@ final class GameMenu {
     // ---- pages ----
 
     private void showMain() {
-        inSettings = false;
+        inSubPage = false;
         panel.removeAllViews();
         panel.addView(title("Paused"));
         View resume = button("Resume", v -> close());
         panel.addView(resume);
         panel.addView(button("Settings", v -> showSettings()));
-        panel.addView(button("Quit game", v -> host.quit()));
+        panel.addView(button("Quit game", v -> showQuit()));
         resume.requestFocus();
     }
 
+    /* Asked first: a quit loses whatever the game has not saved, and Quit
+     * game sits one press below Settings. Keep playing has the focus, so a
+     * stray A press is harmless. */
+    private void showQuit() {
+        inSubPage = true;
+        panel.removeAllViews();
+        panel.addView(title("Quit game?"));
+        TextView why = text("Anything you haven't saved in the game will be lost.", 15, MUTED, false);
+        why.setPadding(dp(12), 0, dp(12), dp(16));
+        panel.addView(why);
+        View keep = button("Keep playing", v -> showMain());
+        panel.addView(keep);
+        panel.addView(button("Quit", v -> host.quit()));
+        keep.requestFocus();
+    }
+
     private void showSettings() {
-        inSettings = true;
+        inSubPage = true;
         values = parse(host.settings());
         panel.removeAllViews();
         panel.addView(title("Settings"));
