@@ -334,6 +334,47 @@ static int probe_compile(const char *files)
     return failed != 0;
 }
 
+/* Python as a program (libpyexec.so): its own executable, spawned workers,
+ * Capstone. */
+static int probe_pyexec(const char *files)
+{
+    char libs[512], exe[600], home[600], from[600];
+    char script[] =
+        "import sys, os, multiprocessing as mp, time\n"
+        "print('executable', sys.executable, sys.version.split()[0])\n"
+        "t = time.time()\n"
+        "try:\n"
+        "    with mp.get_context('spawn').Pool(4) as p: print('pool', p.map(abs, [-1, -2, -3, -4]))\n"
+        "except Exception as e: print('no pool:', type(e).__name__, e)\n"
+        "import subprocess; print('subprocess', subprocess.run([sys.executable, '-c', 'print(6*7)'], capture_output=True, text=True).stdout.strip())\n"
+        "print('spawn pool in %.2f s' % (time.time() - t))\n"
+        "import capstone; md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)\n"
+        "print('capstone', [i.mnemonic for i in md.disasm(bytes([0x55, 0x8b, 0xec, 0xc3]), 0)])\n";
+
+    if (!lib_dir(libs, sizeof libs))
+        return 1;
+    snprintf(exe, sizeof exe, "%s/libpyexec.so", libs);
+    snprintf(home, sizeof home, "%s/python", SDL_GetAndroidInternalStoragePath());
+    snprintf(from, sizeof from, "%s/python", files);
+    if (access(home, F_OK) != 0) {
+        char *argv[] = { "/system/bin/cp", "-r", from, home, NULL };
+        run("/system/bin/cp", argv);
+    }
+    setenv("PYTHONHOME", home, 1);
+    setenv("LD_LIBRARY_PATH", libs, 1);
+    setenv("LIBCAPSTONE_PATH", libs, 1);
+    {
+        char site[700];
+        snprintf(site, sizeof site, "%s/site", files);
+        setenv("PYTHONPATH", site, 1);
+    }
+    unsetenv("RECOMP_IN_PROCESS");
+    {
+        char *argv[] = { exe, "-u", "-c", script, NULL };
+        return run(exe, argv);
+    }
+}
+
 int android_probe(const char *files)
 {
     const char *what = getenv("RECOMP_ANDROID_PROBE");
@@ -345,6 +386,8 @@ int android_probe(const char *files)
         return probe_python(files);
     if (!strcmp(what, "compile"))
         return probe_compile(files);
+    if (!strcmp(what, "pyexec"))
+        return probe_pyexec(files);
     fprintf(stderr, "[BUILD] unknown probe %s\n", what);
     return 1;
 }

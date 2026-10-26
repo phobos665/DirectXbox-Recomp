@@ -24,6 +24,15 @@
 # The engine is compiled with XBOXRECOMP_SPLIT_TITLE (CMakeLists.txt) when
 # XBOXRECOMP_ANDROID_SPLIT is on, the default.
 
+# pyexec: Python as a program, for the on-device build (android/pyexec.c).
+# Named lib*.so so that the APK carries it in its library folder, the one
+# place Android starts programs from.
+if(ANDROID AND NOT TARGET pyexec)
+    add_executable(pyexec ${CMAKE_CURRENT_LIST_DIR}/../android/pyexec.c)
+    set_target_properties(pyexec PROPERTIES OUTPUT_NAME libpyexec SUFFIX ".so")
+    target_link_libraries(pyexec PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
 function(xboxrecomp_android_libraries title_objects)
     set(engine xbox_kernel xbox_d3d8 xbox_dsound xbox_input xbox_usb xbox_apu
                xbox_nv2a xbox_video xbox_hle xbox_host platform xbox_config)

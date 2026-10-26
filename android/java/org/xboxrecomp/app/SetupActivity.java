@@ -28,7 +28,7 @@ import java.util.List;
  *   1. A folder already chosen (and still holding the game) -- start.
  *   2. A copy in the app's own folder (<external files>/game, which is where
  *      `adb push` puts one) -- start.
- *   3. Otherwise ask for all-files access, then look for default.xbe whose
+ *   3. Otherwise ask for all-files access, then look for disc images and for a default.xbe whose
  *      SHA-1 is the one this APK was built from (meta-data xboxrecomp.xbe_sha1)
  *      under the usual places: one match starts, several are listed, none
  *      asks for a path.
@@ -70,8 +70,19 @@ public class SetupActivity extends Activity {
         return null;
     }
 
+    /* A folder holding the game, or a disc image of it. */
     private static boolean hasGame(String dir) {
-        return dir != null && new File(dir, "default.xbe").isFile();
+        if (dir == null)
+            return false;
+        File f = new File(dir);
+        if (f.isFile())
+            return isImage(f);
+        return new File(f, "default.xbe").isFile();
+    }
+
+    private static boolean isImage(File f) {
+        String n = f.getName().toLowerCase();
+        return n.endsWith(".iso") || n.endsWith(".xiso");
     }
 
     private void choose() {
@@ -129,12 +140,14 @@ public class SetupActivity extends Activity {
                 look(c, 0, want, found);       // an SD card
             }
         }
-        if (found.size() == 1) {
+        // One copy found, a folder whose default.xbe is the one: straight in.
+        // A disc image is checked when it is built, so it is always offered.
+        if (found.size() == 1 && !new File(found.get(0)).isFile()) {
             remember(found.get(0));
             start(found.get(0));
         } else if (found.isEmpty()) {
             askForPath("The game was not found under roms/, Download/, games/ or an SD card. "
-                       + "Give the path of the folder holding default.xbe.");
+                       + "Give the path of the folder holding default.xbe, or of a disc image (.iso).");
         } else {
             final String[] items = found.toArray(new String[0]);
             new AlertDialog.Builder(this)
@@ -167,6 +180,8 @@ public class SetupActivity extends Activity {
         for (File k : kids) {
             if (k.isDirectory() && !k.getName().startsWith("."))
                 look(k, depth + 1, want, found);
+            else if (k.isFile() && isImage(k))
+                found.add(k.getPath());
         }
     }
 
@@ -192,7 +207,7 @@ public class SetupActivity extends Activity {
         path.setText(Environment.getExternalStorageDirectory().getPath() + "/");
         new AlertDialog.Builder(this)
             .setTitle("Where is the game?")
-            .setMessage(why != null ? why : "The folder holding default.xbe.")
+            .setMessage(why != null ? why : "The folder holding default.xbe, or a disc image (.iso).")
             .setView(path)
             .setCancelable(false)
             .setPositiveButton("Play", (d, w) -> {
@@ -201,7 +216,7 @@ public class SetupActivity extends Activity {
                     remember(dir);
                     start(dir);
                 } else {
-                    askForPath("There is no default.xbe in " + dir + ".");
+                    askForPath("There is no default.xbe in " + dir + ", and it is not a disc image.");
                 }
             })
             .setNegativeButton("Quit", (d, w) -> finish())
@@ -212,9 +227,11 @@ public class SetupActivity extends Activity {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_GAME, dir).apply();
     }
 
+    /* The game is built from this copy on the device first (BuildActivity),
+     * or found built already, and then started. */
     private void start(String dir) {
-        Intent i = new Intent(this, RecompActivity.class);
-        i.putExtra(KEY_GAME, dir);
+        Intent i = new Intent(this, BuildActivity.class);
+        i.putExtra(BuildActivity.EXTRA_SOURCE, dir);
         startActivity(i);
         finish();
     }

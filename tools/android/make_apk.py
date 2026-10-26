@@ -293,6 +293,8 @@ def main():
     ap.add_argument("--target-sdk", default="34")
     ap.add_argument("--sdk")
     ap.add_argument("--keystore", default=None)
+    ap.add_argument("--asset", action="append", default=[],
+                    help="a file for the APK's assets/, stored as it is (the build kit)")
     ap.add_argument("--strip", action="store_true",
                     help="drop debug sections from the libraries (dynamic symbols stay)")
     a = ap.parse_args()
@@ -354,6 +356,11 @@ def main():
         with zipfile.ZipFile(unaligned, "a") as z:
             z.write(os.path.join(dex, "classes.dex"), "classes.dex",
                     compress_type=zipfile.ZIP_DEFLATED)
+            # Stored, not compressed again: the build kit is a zip of its own,
+            # and the app opens it by file descriptor (openFd needs it stored).
+            for asset in a.asset:
+                z.write(asset, "assets/" + os.path.basename(asset),
+                        compress_type=zipfile.ZIP_STORED)
             for lib in a.lib:
                 src = lib
                 if a.strip:
