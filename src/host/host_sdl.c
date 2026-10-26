@@ -306,6 +306,10 @@ static void open_on_main(void *arg)
 #ifdef __APPLE__
     flags |= SDL_WINDOW_METAL;
 #endif
+#ifdef __ANDROID__
+    /* The whole screen, with the status and navigation bars hidden. */
+    flags |= SDL_WINDOW_FULLSCREEN;
+#endif
     if (background)
         flags |= SDL_WINDOW_NOT_FOCUSABLE;
     w->sdl = SDL_CreateWindow(req->title ? req->title : "xboxrecomp",
@@ -397,9 +401,17 @@ static void layer_on_main(void *arg)
                 SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
             if (w->native.display && w->native.xwindow)
                 w->layer = &w->native;
+        } else if (driver && !strcmp(driver, "android")) {
+            /* The activity's surface. Android replaces it when the app is
+             * paused and resumed. */
+            w->native.kind = RHI_NATIVE_ANDROID;
+            w->native.surface = SDL_GetPointerProperty(props,
+                SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+            if (w->native.surface)
+                w->layer = &w->native;
         }
         if (!w->layer)
-            fprintf(stderr, "[HOST] no X11 or Wayland handles for the window (video driver %s)\n",
+            fprintf(stderr, "[HOST] no native handles for the window (video driver %s)\n",
                     driver ? driver : "none");
     }
 #endif

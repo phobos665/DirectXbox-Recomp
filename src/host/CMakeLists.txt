@@ -20,6 +20,16 @@ target_link_libraries(xbox_host PUBLIC Threads::Threads)
 # runtime, which SDL has loaded, so the link needs nothing SDL does not bring.
 target_compile_options(xbox_host PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
+# Android: SDL_main, which SDL's Java activity calls in libmain.so, and the
+# app's log, switches and folders (android_main.c). An object library, so its
+# SDL_main lands in the title's library though nothing there calls it. The
+# title's main() is renamed recomp_title_main where its main.c is compiled.
+if(ANDROID)
+    add_library(xbox_android_main OBJECT android_main.c)
+    target_link_libraries(xbox_android_main PUBLIC SDL3::SDL3 android log)
+    target_compile_options(xbox_android_main PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
 # ── A macOS application bundle for the title (scripts/make_macos_app.py) ──
 #
 #   cmake -DXBOXRECOMP_MACOS_APP=ON [-DXBOXRECOMP_APP_NAME="TimeSplitters 2"] ...
