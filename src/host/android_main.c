@@ -24,6 +24,7 @@
 #if defined(__ANDROID__)
 
 #include <SDL3/SDL.h>
+#include <jni.h>
 #define SDL_MAIN_HANDLED   /* SDL_main is defined here, by hand */
 #include <SDL3/SDL_main.h>
 #include <android/log.h>
@@ -34,6 +35,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "recomp_config.h"
+#include "hle_settings.h"
+#include "touch_controls.h"
+#include "platform/host_main.h"
 
 /* The title's main(), renamed where its main.c is compiled. */
 extern int recomp_title_main(int argc, char **argv);
@@ -128,6 +134,91 @@ static void default_dir(const char *name, const char *files, const char *leaf)
     snprintf(path, sizeof path, "%s/%s", files, leaf);
     mkdir(path, 0770);
     setenv(name, path, 1);
+}
+
+/* ---- the in-game menu (RecompActivity's side panel) -------------------
+ *
+ * The menu is Android's own views over the game; these are what it calls.
+ * Opening it holds the title at its next Swap (host_set_suspended), as
+ * leaving the app does. A setting is applied at once where the runtime can
+ * change it while the title runs, and written to the title's settings file
+ * either way, so the next start has it too; widescreen and the resolution
+ * scale are read only at start.
+ */
+
+static int settings_file(char *path, size_t n, RecompSettings *s)
+{
+    if (!recomp_settings_path(recomp_config_title_id(), path, n))
+        return 0;
+    recomp_settings_read(path, s);          /* the defaults when there is none */
+    return 1;
+}
+
+JNIEXPORT void JNICALL
+Java_org_xboxrecomp_app_RecompActivity_nativeMenu(JNIEnv *env, jclass cls, jboolean open)
+{
+    (void)env;
+    (void)cls;
+    host_set_suspended(HOST_SUSPEND_MENU, open ? 1 : 0);
+    fprintf(stderr, "[ANDROID] menu %s\n", open ? "open: the title is held" : "closed");
+}
+
+/* key=value;key=value..., what the menu shows. */
+JNIEXPORT jstring JNICALL
+Java_org_xboxrecomp_app_RecompActivity_nativeSettings(JNIEnv *env, jclass cls)
+{
+    char path[1024], out[512];
+    RecompSettings st;
+
+    (void)cls;
+    recomp_settings_defaults(&st);
+    settings_file(path, sizeof path, &st);
+    snprintf(out, sizeof out,
+             "fps_overlay=%d;frame_cap=%s;touch_controls=%s;touch_opacity=%.2f;"
+             "touch_scale=%.2f;widescreen=%d;resolution_scale=%d",
+             hle_fps_overlay(), hle_frame_cap(), recomp_touch_mode(),
+             (double)recomp_touch_opacity(), (double)recomp_touch_scale(),
+             st.widescreen, st.resolution_scale);
+    return (*env)->NewStringUTF(env, out);
+}
+
+JNIEXPORT void JNICALL
+Java_org_xboxrecomp_app_RecompActivity_nativeSet(JNIEnv *env, jclass cls, jstring jkey, jstring jvalue)
+{
+    const char *key = (*env)->GetStringUTFChars(env, jkey, NULL);
+    const char *value = (*env)->GetStringUTFChars(env, jvalue, NULL);
+    char path[1024];
+    RecompSettings st;
+    int have_file;
+
+    (void)cls;
+    recomp_settings_defaults(&st);
+    have_file = settings_file(path, sizeof path, &st);
+    if (!strcmp(key, "fps_overlay")) {
+        hle_set_fps_overlay(atoi(value));
+        st.fps_overlay = atoi(value) ? 1 : 0;
+    } else if (!strcmp(key, "frame_cap")) {
+        hle_set_frame_cap(value);
+        snprintf(st.frame_cap, sizeof st.frame_cap, "%s", !strcmp(value, "off") ? "0" : value);
+    } else if (!strcmp(key, "touch_controls")) {
+        recomp_touch_configure(value, 0.0f, 0.0f);
+        snprintf(st.touch_controls, sizeof st.touch_controls, "%s", value);
+    } else if (!strcmp(key, "touch_opacity")) {
+        recomp_touch_configure(NULL, (float)atof(value), 0.0f);
+        st.touch_opacity = atof(value);
+    } else if (!strcmp(key, "touch_scale")) {
+        recomp_touch_configure(NULL, 0.0f, (float)atof(value));
+        st.touch_scale = atof(value);
+    } else if (!strcmp(key, "widescreen")) {
+        recomp_settings_set_widescreen(&st, atoi(value) ? 1 : 0);
+    } else if (!strcmp(key, "resolution_scale")) {
+        st.resolution_scale = atoi(value) < 1 ? 1 : atoi(value) > 4 ? 4 : atoi(value);
+    }
+    if (have_file && !recomp_settings_write(path, &st))
+        fprintf(stderr, "[ANDROID] could not save %s\n", path);
+    fprintf(stderr, "[ANDROID] setting %s = %s\n", key, value);
+    (*env)->ReleaseStringUTFChars(env, jkey, key);
+    (*env)->ReleaseStringUTFChars(env, jvalue, value);
 }
 
 __attribute__((visibility("default")))

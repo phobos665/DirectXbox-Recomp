@@ -80,10 +80,12 @@ int host_launch_other(const char *exe);
 
 /* ---- the app in the background ---------------------------------------- */
 
-/* Whether the app is in the background (Android: paused), when the title is
- * held at its next frame boundary until it comes back (the flip gate,
- * src/kernel). The host's event loop sets it; any thread reads it. */
-void host_set_suspended(int on);
+/* Whether the title is held at its next frame boundary (the flip gate,
+ * src/kernel), and why: the app is in the background (Android: paused), or
+ * its in-game menu is open. Held while any reason is set. The host sets
+ * them; any thread reads them. */
+enum { HOST_SUSPEND_BACKGROUND = 1, HOST_SUSPEND_MENU = 2 };
+void host_set_suspended(unsigned reason, int on);
 int  host_suspended(void);
 
 /* ---- POSIX: which thread the title runs on --------------------------- */

@@ -226,10 +226,10 @@ static bool SDLCALL app_lifecycle(void *user, SDL_Event *e)
 {
     (void)user;
     if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
-        host_set_suspended(1);
+        host_set_suspended(HOST_SUSPEND_BACKGROUND, 1);
         fprintf(stderr, "[HOST] the app is going into the background\n");
     } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
-        host_set_suspended(0);
+        host_set_suspended(HOST_SUSPEND_BACKGROUND, 0);
         fprintf(stderr, "[HOST] the app is back in the foreground\n");
     }
     return true;

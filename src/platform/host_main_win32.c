@@ -173,14 +173,19 @@ int host_launch_other(const char *exe)
 /* The app in the background: nothing on Windows sets it yet. */
 static volatile LONG g_suspended;
 
-void host_set_suspended(int on)
+void host_set_suspended(unsigned reason, int on)
 {
-    InterlockedExchange(&g_suspended, on ? 1 : 0);
+    LONG old, want;
+
+    do {
+        old = g_suspended;
+        want = on ? (LONG)(old | (LONG)reason) : (LONG)(old & ~(LONG)reason);
+    } while (InterlockedCompareExchange(&g_suspended, want, old) != old);
 }
 
 int host_suspended(void)
 {
-    return (int)InterlockedCompareExchange(&g_suspended, 0, 0);
+    return InterlockedCompareExchange(&g_suspended, 0, 0) != 0;
 }
 
 #endif /* _WIN32 */

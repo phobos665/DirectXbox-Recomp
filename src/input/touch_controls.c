@@ -222,6 +222,8 @@ static bool SDLCALL on_event(void *user, SDL_Event *e)
     if (e->type != SDL_EVENT_FINGER_DOWN && e->type != SDL_EVENT_FINGER_MOTION &&
         e->type != SDL_EVENT_FINGER_UP && e->type != SDL_EVENT_FINGER_CANCELED)
         return true;
+    if (T.mode == MODE_OFF)
+        return true;
     SDL_LockMutex(T.lock);
     x = e->tfinger.x * (float)T.w;
     y = e->tfinger.y * (float)T.h;
@@ -283,29 +285,40 @@ int recomp_touch_enabled(void)
     return T.mode != MODE_OFF;
 }
 
+static int mode_from(const char *v, int fallback)
+{
+    if (!v || !*v)
+        return fallback;
+    if (!strcmp(v, "on") || !strcmp(v, "1"))
+        return MODE_ON;
+    if (!strcmp(v, "off") || !strcmp(v, "0"))
+        return MODE_OFF;
+    if (!strcmp(v, "auto"))
+        return MODE_AUTO;
+    return fallback;
+}
+
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/* auto: shown now only with no pad to play with. */
+static int no_pad(void)
+{
+    int n = 0;
+    SDL_JoystickID *pads = SDL_GetGamepads(&n);
+    SDL_free(pads);
+    return n == 0;
+}
+
 void recomp_touch_init(void)
 {
-    const char *v;
-
     if (T.started)
         return;
     T.started = 1;
-    v = recomp_config_lookup("RECOMP_TOUCH_CONTROLS", "touch_controls");
 #if defined(__ANDROID__)
-    T.mode = MODE_AUTO;
+    T.mode = mode_from(recomp_config_lookup("RECOMP_TOUCH_CONTROLS", "touch_controls"), MODE_AUTO);
 #else
-    T.mode = MODE_OFF;
+    T.mode = mode_from(recomp_config_lookup("RECOMP_TOUCH_CONTROLS", "touch_controls"), MODE_OFF);
 #endif
-    if (v && *v) {
-        if (!strcmp(v, "on") || !strcmp(v, "1"))
-            T.mode = MODE_ON;
-        else if (!strcmp(v, "off") || !strcmp(v, "0"))
-            T.mode = MODE_OFF;
-        else if (!strcmp(v, "auto"))
-            T.mode = MODE_AUTO;
-    }
-    if (T.mode == MODE_OFF)
-        return;
     T.opacity = setting_float("RECOMP_TOUCH_OPACITY", "touch_opacity", 0.45f, 0.1f, 1.0f);
     T.scale = setting_float("RECOMP_TOUCH_SCALE", "touch_scale", 1.0f, 0.5f, 2.0f);
     {
@@ -313,24 +326,51 @@ void recomp_touch_init(void)
         /* Android's density (a dp in pixels); elsewhere the desktop scale. */
         T.density = scale > 0.0f ? scale : 0.0f;
     }
+    /* The lock and the watch exist whatever the mode, so the controls can
+     * be switched on while the title runs (recomp_touch_configure). */
     T.lock = SDL_CreateMutex();
     if (!T.lock) {
         T.mode = MODE_OFF;
         return;
     }
-    {
-        int n = 0;
-        SDL_JoystickID *pads = SDL_GetGamepads(&n);
-        SDL_free(pads);
-        /* auto: shown from the start only with no pad to play with. */
-        T.shown = T.mode == MODE_ON || n == 0;
-    }
+    T.shown = T.mode == MODE_ON || (T.mode == MODE_AUTO && no_pad());
     T.last_touch_ms = SDL_GetTicks();
     SDL_AddEventWatch(on_event, NULL);
-    fprintf(stderr, "[INPUT] touch controls %s (%s), opacity %.2f, scale %.2f\n",
-            T.mode == MODE_ON ? "on" : "auto", T.shown ? "shown" : "hidden until a touch",
-            T.opacity, T.scale);
+    if (T.mode != MODE_OFF)
+        fprintf(stderr, "[INPUT] touch controls %s (%s), opacity %.2f, scale %.2f\n",
+                T.mode == MODE_ON ? "on" : "auto", T.shown ? "shown" : "hidden until a touch",
+                T.opacity, T.scale);
 }
+
+void recomp_touch_configure(const char *mode, float opacity, float scale)
+{
+    recomp_touch_init();
+    if (!T.lock)
+        return;
+    SDL_LockMutex(T.lock);
+    if (mode)
+        T.mode = mode_from(mode, T.mode);
+    if (opacity > 0.0f)
+        T.opacity = clampf(opacity, 0.1f, 1.0f);
+    if (scale > 0.0f && clampf(scale, 0.5f, 2.0f) != T.scale) {
+        T.scale = clampf(scale, 0.5f, 2.0f);
+        T.laid_w = 0;                   /* lay out again */
+    }
+    T.shown = T.mode == MODE_ON || (T.mode == MODE_AUTO && no_pad());
+    if (T.mode == MODE_OFF)
+        T.nfingers = 0;
+    T.last_touch_ms = SDL_GetTicks();
+    SDL_UnlockMutex(T.lock);
+}
+
+const char *recomp_touch_mode(void)
+{
+    recomp_touch_init();
+    return T.mode == MODE_ON ? "on" : T.mode == MODE_OFF ? "off" : "auto";
+}
+
+float recomp_touch_opacity(void) { recomp_touch_init(); return T.opacity; }
+float recomp_touch_scale(void)   { recomp_touch_init(); return T.scale; }
 
 /* What one stick finger says, as a deflection of -32767..32767 a side. */
 static void stick_value(int c, const finger *f, SHORT *sx, SHORT *sy)

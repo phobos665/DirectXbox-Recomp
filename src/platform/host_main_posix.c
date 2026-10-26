@@ -223,16 +223,19 @@ int host_module_range(uintptr_t *lo, uintptr_t *hi)
 
 /* ---- the app in the background ---------------------------------------- */
 
-static volatile int g_suspended;
+static volatile unsigned g_suspended;    /* HOST_SUSPEND_* bits */
 
-void host_set_suspended(int on)
+void host_set_suspended(unsigned reason, int on)
 {
-    __atomic_store_n(&g_suspended, on ? 1 : 0, __ATOMIC_SEQ_CST);
+    if (on)
+        __atomic_fetch_or(&g_suspended, reason, __ATOMIC_SEQ_CST);
+    else
+        __atomic_fetch_and(&g_suspended, ~reason, __ATOMIC_SEQ_CST);
 }
 
 int host_suspended(void)
 {
-    return __atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST);
+    return __atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST) != 0;
 }
 
 /* ---- the title's thread ---------------------------------------------- */

@@ -28,7 +28,11 @@ target_compile_options(xbox_host PRIVATE -Wall -Wextra -Wno-unused-parameter)
 # title's main() is renamed recomp_title_main where its main.c is compiled.
 if(ANDROID)
     add_library(xbox_android_main OBJECT android_main.c)
-    target_link_libraries(xbox_android_main PUBLIC SDL3::SDL3 android log)
+    # The in-game menu's settings: the HLE's live switches, the touch
+    # controls and the settings file.
+    target_link_libraries(xbox_android_main PUBLIC SDL3::SDL3 android log
+                          xbox_hle xbox_input xbox_config platform)
+    target_include_directories(xbox_android_main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../hle)
     target_compile_options(xbox_android_main PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 

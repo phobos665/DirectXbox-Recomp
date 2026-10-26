@@ -2295,13 +2295,13 @@ static void flip_gate_hold_suspended(void)
         return;
     guest_held = xbox_GuestLockDrop();
     QueryPerformanceCounter(&t0);
-    fprintf(stderr, "  [NV2A] the app is in the background: the title is held at its Swap\n");
+    fprintf(stderr, "  [NV2A] the title is held at its Swap (the app is in the background, or its menu is open)\n");
     fflush(stderr);
     while (host_suspended())
         Sleep(20);
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
-    fprintf(stderr, "  [NV2A] the app is back: the title held for %.1f s\n",
+    fprintf(stderr, "  [NV2A] the title runs again after %.1f s held\n",
             (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart);
     fflush(stderr);
     xbox_GuestLockRestore(guest_held);

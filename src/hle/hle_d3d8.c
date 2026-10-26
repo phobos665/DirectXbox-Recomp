@@ -68,6 +68,7 @@
 #include "platform/host_main.h"   /* host_exe_path: where F11 writes */
 #include "touch_controls.h"        /* the on-screen controls */
 #include "d3d8_touch.h"
+#include "hle_settings.h"
 #include "hle.h"
 #include "recomp_config.h"
 
@@ -2862,6 +2863,36 @@ void hle_d3d8_overlay_redraw(void)
         d3d8_overlay_draw(g_overlay_line);
 }
 
+/* hle_settings.h: the same switches as F9 and F10, by value. Set from
+ * another thread; overlay_frame picks them up at its next frame. */
+static volatile int g_overlay_set = -1;   /* -1: nothing asked */
+
+int hle_fps_overlay(void)
+{
+    int asked = g_overlay_set;
+    return asked >= 0 ? asked : g_overlay_shown;
+}
+
+void hle_set_fps_overlay(int on)
+{
+    g_overlay_set = on ? 1 : 0;
+}
+
+const char *hle_frame_cap(void)
+{
+    return xbox_Nv2aFlipGateModeName();
+}
+
+void hle_set_frame_cap(const char *name)
+{
+    int i;
+
+    /* The cap is a cycle (F10); step it round to the one asked for. Four
+     * stops, so five steps always arrive or show the name is not one. */
+    for (i = 0; name && i < 5 && strcmp(xbox_Nv2aFlipGateModeName(), name) != 0; i++)
+        xbox_Nv2aFlipGateCycle();
+}
+
 static void overlay_frame(void)
 {
     static int configured, f9_was_down, f10_was_down, f11_was_down;
@@ -2900,6 +2931,10 @@ static void overlay_frame(void)
     f11_was_down = f11;
     if (f9 && !f9_was_down)
         enabled = !enabled;
+    if (g_overlay_set >= 0) {
+        enabled = g_overlay_set;
+        g_overlay_set = -1;
+    }
     if (f10 && !f10_was_down) {
         xbox_Nv2aFlipGateCycle();
         window_start.QuadPart = 0;           /* the old window straddles the change */

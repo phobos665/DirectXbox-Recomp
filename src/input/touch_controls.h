@@ -40,6 +40,13 @@ extern "C" {
  * once; does nothing when the setting is off. */
 void recomp_touch_init(void);
 
+/* Changes the settings while the title runs: mode "auto", "on" or "off"
+ * (NULL keeps it), and opacity and scale (0 keeps them). */
+void recomp_touch_configure(const char *mode, float opacity, float scale);
+const char *recomp_touch_mode(void);
+float recomp_touch_opacity(void);
+float recomp_touch_scale(void);
+
 /* Whether the controls are switched on at all (not off). */
 int  recomp_touch_enabled(void);
 
