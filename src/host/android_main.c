@@ -41,8 +41,14 @@
 #include "touch_controls.h"
 #include "platform/host_main.h"
 
-/* The title's main(), renamed where its main.c is compiled. */
+/* The title's main(), renamed where its main.c is compiled: in this library,
+ * or, when the title is a library of its own (XBOXRECOMP_SPLIT_TITLE),
+ * found in it when it is loaded (android_title.c). */
+#if defined(XBOXRECOMP_SPLIT_TITLE)
+int (*android_title_load(const char *path))(int, char **);
+#else
 extern int recomp_title_main(int argc, char **argv);
+#endif
 
 static FILE *g_log_file;
 
@@ -255,7 +261,37 @@ int SDL_main(int argc, char *argv[])
         fprintf(stderr, "[ANDROID] probe finished: %d\n", rc);
         return rc;
     }
+#if defined(XBOXRECOMP_SPLIT_TITLE)
+    {
+        char lib[1024];
+        const char *v = getenv("RECOMP_ANDROID_TITLE_LIB");
+        int (*title_main)(int, char **);
+
+        if (v && *v) {
+            snprintf(lib, sizeof lib, "%s", v);
+        } else {
+            /* Development: a libgame.so pushed into the files folder (adb
+             * cannot reach the internal one) is copied in first, since
+             * Android loads code only from the app's internal folder. */
+            char pushed[1024];
+            snprintf(lib, sizeof lib, "%s/libgame.so", SDL_GetAndroidInternalStoragePath());
+            snprintf(pushed, sizeof pushed, "%s/libgame.so", files);
+            if (access(pushed, R_OK) == 0) {
+                char cmd[2200];
+                snprintf(cmd, sizeof cmd, "/system/bin/cp '%s' '%s'", pushed, lib);
+                fprintf(stderr, "[ANDROID] using the pushed %s\n", pushed);
+                if (system(cmd) != 0)
+                    fprintf(stderr, "[ANDROID] could not copy it in\n");
+            }
+        }
+        title_main = android_title_load(lib);
+        if (!title_main)
+            return 1;
+        return title_main(argc, argv);
+    }
+#else
     return recomp_title_main(argc, argv);
+#endif
 }
 
 #endif /* __ANDROID__ */
