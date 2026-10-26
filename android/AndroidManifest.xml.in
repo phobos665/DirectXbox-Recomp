@@ -18,6 +18,11 @@
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
 
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- The player's own copy of the game is read where it is, which on
+         Android 11 and later takes all-files access (SetupActivity). -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
 
     <!-- extractNativeLibs: the libraries are stored uncompressed and
          page-aligned, and mapped from the APK. -->
@@ -29,18 +34,25 @@
         android:appCategory="game"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
         android:hardwareAccelerated="true">
-        <activity android:name="org.xboxrecomp.app.RecompActivity"
+        <!-- The SHA-1 of the default.xbe the APK was built from: the game the
+             setup looks for. -->
+        <meta-data android:name="xboxrecomp.xbe_sha1" android:value="@XBE_SHA1@" />
+        <activity android:name="org.xboxrecomp.app.SetupActivity"
             android:label="@LABEL@"
-            android:alwaysRetainTaskState="true"
-            android:launchMode="singleInstance"
-            android:screenOrientation="sensorLandscape"
-            android:configChanges="layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
-            android:preferMinimalPostProcessing="true"
+            android:theme="@android:style/Theme.DeviceDefault.Dialog.NoActionBar"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name="org.xboxrecomp.app.RecompActivity"
+            android:label="@LABEL@"
+            android:alwaysRetainTaskState="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:exported="true" />
     </application>
 </manifest>

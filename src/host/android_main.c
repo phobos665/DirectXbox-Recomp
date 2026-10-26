@@ -12,8 +12,10 @@
  *   - Switches. An app has no environment to start it with, so the RECOMP_*
  *     switches are read from recomp_env.txt in the same folder, one
  *     KEY=VALUE a line (# starts a comment); `adb push` puts one there.
- *   - Folders. The game in <files>/game and the per-user folder (settings,
- *     saves, caches) in <files>/user, unless the file names others.
+ *   - Folders. The game in <files>/game unless SetupActivity found it
+ *     elsewhere (RECOMP_GAME_DIR, set before this runs), the per-user folder
+ *     (settings, saves, caches) in <files>/user and E: in <files>/hdd,
+ *     unless the file names others.
  *
  * <files> is the app's own external folder,
  * /storage/emulated/0/Android/data/<package>/files: it needs no permission,
@@ -146,6 +148,10 @@ int SDL_main(int argc, char *argv[])
     read_switches(files);
     default_dir("RECOMP_GAME_DIR", files, "game");
     default_dir("RECOMP_USER_DIR", files, "user");
+    /* E: (\Device\Harddisk0\Partition1) is the game's own folder on a
+     * desktop, so a title's UDATA saves land beside it. Here the game may be
+     * the player's ROM folder, shared with other programs: E: is the app's. */
+    default_dir("RECOMP_HDD_DIR", files, "hdd");
     if (chdir(files) != 0)
         fprintf(stderr, "[ANDROID] chdir %s: %s\n", files, strerror(errno));
     return recomp_title_main(argc, argv);

@@ -85,6 +85,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--version-code", default="1")
     ap.add_argument("--version-name", default="1.0")
+    ap.add_argument("--xbe-sha1", default="",
+                    help="SHA-1 of the default.xbe the code was lifted from: the game the "
+                         "app's setup looks for on the device (any default.xbe if empty)")
     ap.add_argument("--min-sdk", default="30")
     ap.add_argument("--target-sdk", default="34")
     ap.add_argument("--sdk")
@@ -121,6 +124,7 @@ def main():
             manifest = f.read()
         for k, v in {"PACKAGE": a.package, "LABEL": a.label, "VERSION_CODE": a.version_code,
                      "VERSION_NAME": a.version_name, "MIN_SDK": a.min_sdk,
+                     "XBE_SHA1": a.xbe_sha1.lower(),
                      "TARGET_SDK": a.target_sdk}.items():
             manifest = manifest.replace("@%s@" % k, v.replace("&", "&amp;").replace('"', "&quot;"))
         man_path = os.path.join(work, "AndroidManifest.xml")
