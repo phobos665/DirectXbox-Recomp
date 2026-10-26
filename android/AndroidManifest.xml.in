@@ -26,7 +26,11 @@
 
     <!-- extractNativeLibs: the libraries are stored uncompressed and
          page-aligned, and mapped from the APK. -->
+    <!-- The icon is the title's own or the toolkit's, scaled to every
+         density by make_apk.py (res/mipmap-*/ic_launcher.png). There is no
+         round variant: a launcher that wants one masks this. -->
     <application android:label="@LABEL@"
+        android:icon="@mipmap/ic_launcher"
         android:hasCode="true"
         android:allowBackup="false"
         android:extractNativeLibs="false"
