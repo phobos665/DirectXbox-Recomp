@@ -10,10 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The controls, in Steam Link's default places for a pad with two sticks
- * (CVirtualController's defaults on a 1280x720 screen, as DroidDeck reads
- * them): x and y as fractions of the screen, r in pixels of that screen.
- * The shoulders are the Xbox pad's White and Black. */
+/* The controls. Where they go is DroidDeck's GamepadGeometry, its layout
+ * for a screen-wide pad on a wide screen: each thumb pivots at a bottom
+ * corner, its stick diagonally in from the corner and the d-pad (left) or
+ * the face buttons (right) a slide inward along the arc, two shoulders above
+ * on each side -- the triggers outside, White and Black inside -- and Back,
+ * the stick clicks and Start between the arcs. What each control looks like
+ * and does follows Steam Link's controller, as DroidDeck draws it. */
 enum {
     C_LSTICK, C_RSTICK, C_DPAD, C_A, C_B, C_X, C_Y,
     C_WHITE, C_BLACK, C_LTRIG, C_RTRIG, C_BACK, C_START, C_LTHUMB, C_RTHUMB,
@@ -22,33 +25,34 @@ enum {
 
 typedef struct {
     int      kind;
-    float    x, y, r;
     unsigned rgb;
     int      analog;            /* bAnalogButtons index, or -1 */
     unsigned bits;              /* wButtons bits */
 } control;
 
 static const control k_controls[C_COUNT] = {
-    [C_LSTICK] = { TOUCH_SHAPE_STICK,  0.137f, 0.76f, 90, 0xE6E9EC, -1, 0 },
-    [C_RSTICK] = { TOUCH_SHAPE_STICK,  0.850f, 0.76f, 90, 0xE6E9EC, -1, 0 },
-    [C_DPAD]   = { TOUCH_SHAPE_DPAD,   0.147f, 0.47f, 112, 0xE6E9EC, -1, 0 },
-    [C_A]      = { TOUCH_SHAPE_BUTTON, 1083.f / 1280, 607.f / 720 - 0.30f, 38, 0x488530, 0, 0 },
-    [C_B]      = { TOUCH_SHAPE_BUTTON, 1163.f / 1280, 527.f / 720 - 0.30f, 38, 0xD34425, 1, 0 },
-    [C_X]      = { TOUCH_SHAPE_BUTTON, 1003.f / 1280, 527.f / 720 - 0.30f, 38, 0x173CB8, 2, 0 },
-    [C_Y]      = { TOUCH_SHAPE_BUTTON, 1083.f / 1280, 447.f / 720 - 0.30f, 38, 0xEBC846, 3, 0 },
-    [C_WHITE]  = { TOUCH_SHAPE_BUTTON, 0.060f, 0.205f, 37, 0xF4F4F4, 5, 0 },
-    [C_BLACK]  = { TOUCH_SHAPE_BUTTON, 0.940f, 0.205f, 37, 0x303236, 4, 0 },
-    [C_LTRIG]  = { TOUCH_SHAPE_PILL,   0.160f, 0.205f, 37, 0xE6E9EC, 6, 0 },
-    [C_RTRIG]  = { TOUCH_SHAPE_PILL,   0.840f, 0.205f, 37, 0xE6E9EC, 7, 0 },
-    [C_BACK]   = { TOUCH_SHAPE_PILL,   516.f / 1280, 75.f / 720, 34, 0xE6E9EC, -1, XBOX_GAMEPAD_BACK },
-    [C_START]  = { TOUCH_SHAPE_PILL,   756.f / 1280, 75.f / 720, 34, 0xE6E9EC, -1, XBOX_GAMEPAD_START },
-    [C_LTHUMB] = { TOUCH_SHAPE_BUTTON, 0.290f, 0.88f, 30, 0xE6E9EC, -1, XBOX_GAMEPAD_LEFT_THUMB },
-    [C_RTHUMB] = { TOUCH_SHAPE_BUTTON, 0.710f, 0.88f, 30, 0xE6E9EC, -1, XBOX_GAMEPAD_RIGHT_THUMB },
+    [C_LSTICK] = { TOUCH_SHAPE_STICK,  0xE6E9EC, -1, 0 },
+    [C_RSTICK] = { TOUCH_SHAPE_STICK,  0xE6E9EC, -1, 0 },
+    [C_DPAD]   = { TOUCH_SHAPE_DPAD,   0xE6E9EC, -1, 0 },
+    [C_A]      = { TOUCH_SHAPE_BUTTON, 0x488530, 0, 0 },
+    [C_B]      = { TOUCH_SHAPE_BUTTON, 0xD34425, 1, 0 },
+    [C_X]      = { TOUCH_SHAPE_BUTTON, 0x173CB8, 2, 0 },
+    [C_Y]      = { TOUCH_SHAPE_BUTTON, 0xEBC846, 3, 0 },
+    [C_WHITE]  = { TOUCH_SHAPE_PILL,   0xF4F4F4, 5, 0 },
+    [C_BLACK]  = { TOUCH_SHAPE_PILL,   0x6A6D72, 4, 0 },
+    [C_LTRIG]  = { TOUCH_SHAPE_PILL,   0xE6E9EC, 6, 0 },
+    [C_RTRIG]  = { TOUCH_SHAPE_PILL,   0xE6E9EC, 7, 0 },
+    [C_BACK]   = { TOUCH_SHAPE_PILL,   0xE6E9EC, -1, XBOX_GAMEPAD_BACK },
+    [C_START]  = { TOUCH_SHAPE_PILL,   0xE6E9EC, -1, XBOX_GAMEPAD_START },
+    [C_LTHUMB] = { TOUCH_SHAPE_PILL,   0xE6E9EC, -1, XBOX_GAMEPAD_LEFT_THUMB },
+    [C_RTHUMB] = { TOUCH_SHAPE_PILL,   0xE6E9EC, -1, XBOX_GAMEPAD_RIGHT_THUMB },
 };
 
-/* A pill's half-extents, as multiples of r: wider than tall. */
-#define PILL_HALF_W 1.25f
-#define PILL_HALF_H 0.75f
+/* Where each control is on the current screen, in pixels: a centre and a
+ * box (a disc's box is its diameter both ways). */
+typedef struct {
+    float x, y, w, h;
+} place;
 
 #define MAX_FINGERS   10
 #define FADE_AFTER_MS 4000
@@ -68,33 +72,99 @@ static struct {
     int        started;
     int        shown;           /* auto: shown now */
     float      opacity, scale;
+    float      density;         /* pixels per dp */
     int        w, h;            /* the screen the shapes were last asked for */
+    int        laid_w, laid_h;  /* the screen `places` is for */
+    place      places[C_COUNT];
     finger     fingers[MAX_FINGERS];
     int        nfingers;
     Uint64     last_touch_ms;
-} T = { NULL, MODE_OFF, 0, 0, 0.45f, 1.0f, 1920, 1080 };
+} T = { NULL, MODE_OFF, 0, 0, 0.45f, 1.0f, 0.0f, 1920, 1080 };
 
-static float unit(void)
+static float minf(float a, float b) { return a < b ? a : b; }
+static float maxf(float a, float b) { return a > b ? a : b; }
+
+static void put(int c, float x, float y, float w, float h)
 {
-    float u = (float)T.w / 1280.0f, v = (float)T.h / 720.0f;
-    return (u < v ? u : v) * T.scale;
+    T.places[c].x = x;
+    T.places[c].y = y;
+    T.places[c].w = w;
+    T.places[c].h = h;
 }
 
-static float cx(int c) { return k_controls[c].x * (float)T.w; }
-static float cy(int c) { return k_controls[c].y * (float)T.h; }
-static float radius(int c) { return k_controls[c].r * unit(); }
+/* GamepadGeometry.layout's wide branch, for a w x h screen. */
+static void lay_out(void)
+{
+    float w = (float)T.w, h = (float)T.h;
+    float d = T.density > 0.0f ? T.density : h / 411.0f;
+    float pad = 8 * d, button_h = 40 * d, row_button = 64 * d, grid_button = 48 * d;
+    float gutter = 8 * d;
+    float reach = minf(h - pad, w * 0.33f) * T.scale;
+    float main = reach * 0.66f, second = reach * 0.54f;
+    float main_top = h - reach * 0.40f - main / 2;
+    float shoulder_w = reach * 0.36f, shoulder_h = maxf(reach * 0.16f, button_h);
+    float shoulder_y = maxf(minf(h - reach * 0.94f + shoulder_h / 2,
+                                 main_top - gutter - shoulder_h / 2), pad + shoulder_h / 2);
+    float face_x = w - reach * 1.03f, face_y = h - reach * 0.30f;
+    float face_r = second * 0.19f, face_off = second * 0.30f;
+    float gap = w - 2 * reach * 1.32f, span, each;
+    int columns, i;
+    /* The middle row, in DroidDeck's order (View, Steam, QAM, Menu), and its
+     * two-by-two places (View and Menu above Steam and QAM). */
+    static const int middle[4] = { C_BACK, C_LTHUMB, C_RTHUMB, C_START };
+    static const int grid[4] = { 0, 2, 3, 1 };
+
+    put(C_LSTICK, reach * 0.40f, h - reach * 0.40f, main, main);
+    put(C_RSTICK, w - reach * 0.40f, h - reach * 0.40f, main, main);
+    put(C_DPAD, reach * 1.03f, h - reach * 0.30f, second, second);
+    put(C_A, face_x, face_y + face_off, 2 * face_r, 2 * face_r);
+    put(C_B, face_x + face_off, face_y, 2 * face_r, 2 * face_r);
+    put(C_X, face_x - face_off, face_y, 2 * face_r, 2 * face_r);
+    put(C_Y, face_x, face_y - face_off, 2 * face_r, 2 * face_r);
+    put(C_LTRIG, reach * 0.22f, shoulder_y, shoulder_w, shoulder_h);
+    put(C_RTRIG, w - reach * 0.22f, shoulder_y, shoulder_w, shoulder_h);
+    put(C_WHITE, reach * 0.62f, shoulder_y, shoulder_w, shoulder_h);
+    put(C_BLACK, w - reach * 0.62f, shoulder_y, shoulder_w, shoulder_h);
+
+    /* Between the arcs: in a row if they fit, else two by two, else one
+     * above another. */
+    columns = gap >= 4 * row_button ? 4 : gap >= 2 * grid_button ? 2 : 1;
+    span = gap - 2 * gutter;
+    each = minf(span / (float)columns, 110 * d);
+    for (i = 0; i < 4; i++) {
+        int index = columns == 2 ? grid[i] : i;
+        float x = w / 2 + ((float)(index % columns) - (float)(columns - 1) / 2) * each;
+        float top = shoulder_y - button_h / 2;
+        put(middle[i], x, top + button_h / 2 + (float)(index / columns) * (button_h + 10 * d),
+            each - gutter, button_h);
+    }
+    T.laid_w = T.w;
+    T.laid_h = T.h;
+}
+
+static const place *at(int c)
+{
+    if (T.laid_w != T.w || T.laid_h != T.h)
+        lay_out();
+    return &T.places[c];
+}
+
+static float cx(int c) { return at(c)->x; }
+static float cy(int c) { return at(c)->y; }
+static float radius(int c) { return at(c)->w * 0.5f; }
 
 /* How far (x, y) is from a control's centre, in multiples of its size: 1 is
  * its edge. A pill measures against its own box. */
 static float reach(int c, float x, float y)
 {
-    float dx = x - cx(c), dy = y - cy(c), r = radius(c);
+    const place *p = at(c);
+    float dx = x - p->x, dy = y - p->y;
 
     if (k_controls[c].kind == TOUCH_SHAPE_PILL) {
-        float ax = fabsf(dx) / (r * PILL_HALF_W), ay = fabsf(dy) / (r * PILL_HALF_H);
+        float ax = fabsf(dx) / (p->w * 0.5f), ay = fabsf(dy) / (p->h * 0.5f);
         return ax > ay ? ax : ay;
     }
-    return sqrtf(dx * dx + dy * dy) / r;
+    return sqrtf(dx * dx + dy * dy) / (p->w * 0.5f);
 }
 
 /* The control under (x, y), the nearest when two overlap; -1 for none. */
@@ -138,6 +208,17 @@ static bool SDLCALL on_event(void *user, SDL_Event *e)
     finger *f;
 
     (void)user;
+    /* auto: a pad that arrives after start-up (enumeration is not done
+     * when this starts) hides the controls as a press on it would. */
+    if (e->type == SDL_EVENT_GAMEPAD_ADDED && T.mode == MODE_AUTO) {
+        SDL_LockMutex(T.lock);
+        if (T.shown && T.nfingers == 0) {
+            T.shown = 0;
+            fprintf(stderr, "[INPUT] touch controls hidden: a pad is connected (a touch brings them back)\n");
+        }
+        SDL_UnlockMutex(T.lock);
+        return true;
+    }
     if (e->type != SDL_EVENT_FINGER_DOWN && e->type != SDL_EVENT_FINGER_MOTION &&
         e->type != SDL_EVENT_FINGER_UP && e->type != SDL_EVENT_FINGER_CANCELED)
         return true;
@@ -227,6 +308,11 @@ void recomp_touch_init(void)
         return;
     T.opacity = setting_float("RECOMP_TOUCH_OPACITY", "touch_opacity", 0.45f, 0.1f, 1.0f);
     T.scale = setting_float("RECOMP_TOUCH_SCALE", "touch_scale", 1.0f, 0.5f, 2.0f);
+    {
+        float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+        /* Android's density (a dp in pixels); elsewhere the desktop scale. */
+        T.density = scale > 0.0f ? scale : 0.0f;
+    }
     T.lock = SDL_CreateMutex();
     if (!T.lock) {
         T.mode = MODE_OFF;
@@ -371,9 +457,10 @@ int recomp_touch_shapes(TouchShape *out, int max, int w, int h, float *opacity)
         s->r = radius(c);
         s->rgb = k->rgb;
         if (k->kind == TOUCH_SHAPE_PILL) {
-            s->w = 2.0f * PILL_HALF_W * s->r;
-            s->h = 2.0f * PILL_HALF_H * s->r;
-            s->r = PILL_HALF_H * s->r;
+            /* Rounded squares, as DroidDeck draws its shoulders. */
+            s->w = at(c)->w;
+            s->h = at(c)->h;
+            s->r = minf(s->w, s->h) * 0.22f;
         }
         for (i = 0; i < T.nfingers; i++) {
             const finger *f = &T.fingers[i];

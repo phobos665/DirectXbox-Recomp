@@ -7,11 +7,14 @@
  * finished frame (src/d3d/d3d8_touch.c), handed it by src/hle; nothing here
  * draws.
  *
- * The layout and its behaviour follow Steam Link's virtual controller, as
- * DroidDeck uses it: positions as fractions of the screen, sizes in pixels of
- * a 1280x720 screen scaled by min(w / 1280, h / 720), a stick read as its
- * offset clamped to the ring, a d-pad of eight 67.5 degree sectors, and a
- * finger that slides from one button onto another.
+ * The layout is DroidDeck's (its GamepadGeometry, for a screen-wide pad):
+ * sticks pivoting at the bottom corners, the d-pad and face buttons inward
+ * along each arc, two large shoulders a side above them (triggers outside,
+ * White and Black inside), and Back, the stick clicks and Start between the
+ * arcs, all sized from the screen and its density. How each control reads
+ * follows Steam Link's controller as DroidDeck uses it: a stick is its
+ * offset clamped to the ring, the d-pad eight 67.5 degree sectors, and a
+ * finger slides from one button onto another.
  *
  *   touch_controls = auto | on | off                    [RECOMP_TOUCH_CONTROLS]
  *   touch_opacity  = 0.1 .. 1.0 (default 0.45)          [RECOMP_TOUCH_OPACITY]
