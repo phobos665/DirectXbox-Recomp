@@ -21,6 +21,12 @@ The signing key is made once and kept (--keystore, default
 <per-user folder>/android/signing.p12): Android refuses an update signed with
 another key, and replacing an app to change its key deletes its data, saves
 included.
+
+A published release is signed with one key that every build uses, so each
+release installs over the last: ANDROID_SIGNING_KEY, the PKCS12 keystore
+base64-encoded (a CI secret), with its password in ANDROID_SIGNING_PASSWORD.
+The password reaches apksigner through the environment, never on its command
+line, so it is never printed.
 """
 import argparse
 import glob
@@ -375,10 +381,28 @@ def main():
         # 5. Align (16 KB pages for the libraries), then sign.
         aligned = os.path.join(work, "aligned.apk")
         run([tool("zipalign"), "-P", "16", "-f", "4", unaligned, aligned])
-        ensure_key(keystore)
-        run([tool("apksigner"), "sign", "--ks", keystore, "--ks-pass", "pass:" + KEY_PASS,
-             "--ks-key-alias", KEY_ALIAS, "--key-pass", "pass:" + KEY_PASS,
-             "--out", a.out, aligned])
+        release_key = os.environ.get("ANDROID_SIGNING_KEY", "").strip()
+        if release_key:
+            # The release's key, from the CI secret: written out only for
+            # apksigner, inside the folder removed below.
+            import base64
+            keystore = os.path.join(work, "release.p12")
+            with open(keystore, "wb") as f:
+                f.write(base64.b64decode(release_key))
+            if not os.environ.get("ANDROID_SIGNING_PASSWORD"):
+                sys.exit("make_apk: ANDROID_SIGNING_KEY is set but ANDROID_SIGNING_PASSWORD is not")
+            print("make_apk: signing with the release key (ANDROID_SIGNING_KEY)", flush=True)
+            # One key in the keystore, so no alias to name; one password for
+            # the store and the key, as keytool makes a PKCS12 one.
+            run([tool("apksigner"), "sign", "--ks", keystore,
+                 "--ks-pass", "env:ANDROID_SIGNING_PASSWORD",
+                 "--key-pass", "env:ANDROID_SIGNING_PASSWORD",
+                 "--out", a.out, aligned])
+        else:
+            ensure_key(keystore)
+            run([tool("apksigner"), "sign", "--ks", keystore, "--ks-pass", "pass:" + KEY_PASS,
+                 "--ks-key-alias", KEY_ALIAS, "--key-pass", "pass:" + KEY_PASS,
+                 "--out", a.out, aligned])
         print("make_apk: %s (%.1f MB)" % (a.out, os.path.getsize(a.out) / 1e6))
     finally:
         shutil.rmtree(work, ignore_errors=True)
