@@ -14,59 +14,122 @@ are SDL3. What is Android's own is below.
 
 ## Building an APK
 
-Once, DXC for Android (nobody publishes one; the renderer compiles HLSL at run
-time):
+An APK carries no game code. The player installs it, chooses their own copy
+of the game (a folder or a disc image), and the app builds the game on the
+device ([Building on the device](#building-on-the-device)). So the APK needs
+no game to make either:
 
 ```bash
-git clone --depth 1 --branch v1.9.2609 --recurse-submodules --shallow-submodules \
-    https://github.com/microsoft/DirectXShaderCompiler.git dxc-src
-tools/android/build_dxc.sh dxc-src dxc-build ~/Library/Android/sdk/ndk/27.3.13750724
-cp -R dxc-build/android/out/* third_party/dxc-android/     # ignored by git
+python3 xboxrecomp/tools/android/fetch_deps.py        # once: into xboxrecomp/third_party/android
+python3 xboxrecomp/tools/android/build_apk.py --package org.xboxrecomp.ts2 \
+    --label "TimeSplitters 2" --recipe release/split2.json
 ```
 
-It builds the host's `llvm-tblgen` and `clang-tblgen` first, then
-`libdxcompiler.so` for arm64 with the NDK (about 28 MB stripped).
-`HLSL_DISABLE_SOURCE_GENERATION` is on: regenerating DXC's headers runs the
-host's clang-format, and a newer one fails the build.
+`fetch_deps.py` fetches what the APK carries besides the engine, at the
+versions it was tried with: python.org's CPython 3.14.8 for Android, zig 0.17.0
+for aarch64 Linux, Capstone 5.0.7 (built with the NDK) and DXC (built by
+`build_dxc.sh`: nobody publishes an Android DXC, and the renderer compiles HLSL
+at run time; `HLSL_DISABLE_SOURCE_GENERATION` is on, because regenerating DXC's
+headers runs the host's clang-format and a newer one fails the build).
 
-Then, from a title repository whose game is already lifted for the desktop (the
-lifted C is the same on every host):
+`build_apk.py` then, like a desktop release (`make_release.py`), configures a
+copy of the title's recipe in `build/android-release` with a placeholder for
+the lifted code, builds the engine (`libmain.so`) and Python's launcher
+(`libpyexec.so`), makes the build kit (`make_kit.py`) from that build's
+compile flags, and packs everything (`make_apk.py`): 37 s from clean, 89 MB.
 
-```bash
-python3 xboxrecomp/tools/android/build_apk.py --package org.xboxrecomp.ts2.dev --label "TS2 (dev)"
-```
+| In the APK | What it is |
+|---|---|
+| `lib/arm64-v8a/libmain.so` | the engine, every library linked whole, compiled with `XBOXRECOMP_SPLIT_TITLE` |
+| `libpython3.14.so`, `libpyexec.so` | Python, and a program that starts it (`android/pyexec.c`) |
+| `libzig.so` | zig: the compiler, named as a library |
+| `libcapstone.so` | Capstone, for the pipeline |
+| `libdxcompiler.so` | DXC, for the renderer |
+| `assets/buildkit.zip` | 18 MB: Python's standard library (no tests, no GUI), the pipeline and the title's recipe as a desktop release takes them, the headers and flags the title's sources compile with, the NDK sysroot, zig's library without other platforms' C libraries |
 
-That configures `build/android` with the NDK (arm64-v8a, API 30, static libc++),
-builds `libmain.so`, and packages it (`tools/android/make_apk.py`). There is no
-Gradle: SDL's Java activity and `android/java` are compiled with javac and d8,
-the manifest (`android/AndroidManifest.xml.in`) is linked with aapt2, and the
-libraries are stored uncompressed, aligned to 16 KB and mapped from the APK. The
-APK is signed with a key made once and kept in the per-user folder
-(`android/signing.p12`): an update signed with another key is refused, and
-replacing the app to change it deletes its saves. The icon is the toolkit's
-unless the title's release recipe names one (`"android": {"icon": ...}`; see
-`self-build-release.md`, "Android"). Needs the Android SDK (build tools,
-platform 34+), an NDK and a JDK.
+Programs and loadable code are libraries because Android starts programs only
+from an app's library folder and loads code only from there or its internal
+folder, never from shared storage. `extractNativeLibs` is on so they are real
+files there (and compressed in the APK). There is no Gradle: SDL's Java
+activity and `android/java` are compiled with javac and d8, the manifest
+(`android/AndroidManifest.xml.in`) is linked with aapt2, and the APK is signed
+with a key made once and kept in the per-user folder (`android/signing.p12`):
+an update signed with another key is refused, and replacing the app to change
+it deletes its saves. The icon is the toolkit's unless the recipe names one
+(`"android": {"icon": ...}`; `self-build-release.md`, "Android"). Needs the
+Android SDK (build tools, platform 34+), an NDK and a JDK.
 
-A title's `CMakeLists.txt` builds a `SHARED` library named `main` on Android,
-compiles its `main.c` with `main=recomp_title_main`, and links
-`xbox_android_main`; split2-recomp's is the example. Nothing else in the title
-changes.
+A title's `CMakeLists.txt`, on Android, makes its sources an object library
+and calls the toolkit's `xboxrecomp_android_libraries` with it
+(`cmake/android.cmake`), compiling its `main.c` with `main=recomp_title_main`;
+split2-recomp's is the example.
 
 Install with `adb install -r <apk>`; `-r` keeps the app's folder and saves.
 
+## Building on the device
+
+`BuildActivity` unpacks the kit into the internal folder once per install,
+then runs `tools/android/device_build.py` with the APK's Python. It does what
+`xboxrecomp-build` does on a desktop, and reports progress the same way, as
+JSON lines (copied to logcat as `xboxrecomp-build`; `build.log` is in the
+internal folder, which adb cannot read):
+
+1. the game: an image extracted once (`tools.xiso`), into the app's external
+   folder; a folder read where it is
+2. the check: `default.xbe`'s SHA-1 against the recipe's images
+3. the lift: the title's own recipe (`scripts/build.py --no-build --relift`
+   for TimeSplitters 2) on a private copy of the XBE, in a copy of the
+   project with `xboxrecomp/` linked to the kit's pipeline
+4. the compile: the lifted C and the title's sources, by zig, eight at a time,
+   with the recorded flags (`{kit}` and `{project}` filled in) and a libc
+   paths file naming the NDK sysroot (`ZIG_LIBC`)
+5. the link: `libgame.so` against the APK's `libmain.so`, with
+   `-Bsymbolic`, into the internal folder, and a stamp (source, kit version)
+
+The next start with the same copy and kit goes straight to the game; an
+updated APK (a new kit) builds again by itself. On the Pocket Fit,
+TimeSplitters 2 from `/sdcard/roms/xbox` builds in 99 s with the screen on
+(lift 39 s, compile 50 s, link 10 s).
+
+**The engine and the title are two libraries.** Android binds every symbol
+when a library loads, so `libmain.so` cannot name what `libgame.so` defines.
+With `XBOXRECOMP_SPLIT_TITLE`, the engine reaches the title only through what
+`src/host/android_title.c` fills in once `libgame.so` is loaded: the
+`HLE_ORIGINAL` / `HLE_IMPORT_VAR` slots (registered by name, `hle.h`),
+trampolines for `recomp_lookup` and `recomp_lookup_manual`, and
+`recomp_title_symbol` for a weak engine default the title overrides
+(`recomp_xbe_patches`: without it TS2 ran on the unpatched image, a white
+front end and a fault at guest `0xFFFFFFFD`). The lifter's output does not
+change. Uncapped, Siberia runs at about 133 fps split against 153 fps as one
+library; the gap is likely the title reaching the engine's thread-local CPU
+state across the library boundary, and does not show at 60.
+
+Two things Python for Android lacks: a program to start (hence `pyexec`), and
+`_multiprocessing` (no named semaphores), so the lifter lifts one function at
+a time there by itself. `scripts/recompile.py` can also run its stages in one
+interpreter (`RECOMP_IN_PROCESS=1`, or when there is no Python executable),
+with output identical to separate processes, and takes `--hle-symbols` for a
+game folder that is only read.
+
+For development, a `libgame.so` built elsewhere can be pushed to
+`<files>/libgame.so`; the app copies it in before loading (adb cannot reach
+the internal folder). `RECOMP_ANDROID_PROBE` (`android_build.c`) runs the
+feasibility probes instead of the title.
+
 ## How the app works
 
-**Two activities.** `SetupActivity` is the launcher entry and finds the game;
-`RecompActivity` is SDL's activity with the engine and title linked into one
-`libmain.so` (SDL is static, so there is no `libSDL3.so`).
+**Three activities.** `SetupActivity` is the launcher entry and finds the
+game; `BuildActivity` builds it (above); `RecompActivity` is SDL's activity
+with the engine in `libmain.so` (SDL is static, so there is no `libSDL3.so`),
+which loads the title's `libgame.so`.
 
 **Finding the game** (`SetupActivity.java`). A folder chosen before, then a copy
 in the app's own folder (`<files>/game`, where `adb push` puts one), then: it
 asks for all-files access and looks under `roms/`, `Download/`, `games/` and SD
-cards for a `default.xbe` whose SHA-1 is the one the APK was built from (the
-manifest's `xboxrecomp.xbe_sha1`). One match starts and is remembered, several
-are listed, none asks for a path. Shared storage ignores case, so `roms/` and
+cards for disc images (`.iso`) and for a `default.xbe` whose SHA-1 is one of
+the release's images (the manifest's `xboxrecomp.xbe_sha1`). One matching
+folder starts and is remembered; otherwise the copies found are listed, and
+none asks for a path. An image is checked when it is built. Shared storage ignores case, so `roms/` and
 `ROMs/` are one folder and matches are de-duplicated by case. The game is read
 where it is and never written to.
 
@@ -187,10 +250,12 @@ handling of a rotated surface (which a desktop never reports).
 
 ## Not done
 
-- **Distribution: not decided.** Today's APK holds the title's lifted code, which
-  `CLAUDE.md` ("Legal") says is never distributed. A release a player installs
-  and then points at their own disc needs the game's code made somewhere other
-  than inside the published APK. There will be no Google Play builds.
+- **A release workflow.** The APK carries no game code and builds the game on
+  the device, so it is a thing that can be published; nothing makes one in CI
+  or on a tag yet. There will be no Google Play builds.
+- **Disc images have not been tried on a device** (the path is written:
+  `tools.xiso`, an extract into the app's external folder).
+- **The split's uncapped cost** (above).
 - **The DXT fallback and the unsupported-GPU notice.** Adreno has BC textures;
   Mali devices are untested and unsupported for now.
 - **An arm64 Linux CI job**, the first CI run of the arm64 fault and memory
