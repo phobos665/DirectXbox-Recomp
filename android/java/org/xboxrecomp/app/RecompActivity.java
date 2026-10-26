@@ -87,7 +87,18 @@ public class RecompActivity extends SDLActivity implements GameMenu.Host {
 
     @Override public String settings() { return nativeSettings(); }
     @Override public void set(String key, String value) { nativeSet(key, value); }
-    @Override public void opened(boolean open) { nativeMenu(open); }
+    @Override
+    public void opened(boolean open) {
+        // The game's surface holds the focus, and takes the d-pad with it, so
+        // it cannot have the focus while the menu is open.
+        if (mSurface != null) {
+            mSurface.setFocusable(!open);
+            mSurface.setFocusableInTouchMode(!open);
+            if (!open)
+                mSurface.requestFocus();
+        }
+        nativeMenu(open);
+    }
 
     @Override
     public void quit() {

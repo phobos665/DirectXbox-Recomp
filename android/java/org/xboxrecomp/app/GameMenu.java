@@ -55,7 +55,9 @@ final class GameMenu {
     private final FrameLayout root;
     private final LinearLayout panel;
     private boolean open;
-    private boolean inSubPage;      // Settings or the quit question: Back returns to the main page
+    private boolean inSubPage;      // Settings: Back returns to the main page
+    private View modal;             // the quit question, over everything; null when not shown
+    private View quitButton;
     private Map<String, String> values = new HashMap<>();
 
     GameMenu(Activity activity, Host host) {
@@ -65,10 +67,14 @@ final class GameMenu {
         root.setBackgroundColor(0x66000000);
         root.setVisibility(View.GONE);
         root.setOnClickListener(v -> close());      // a tap beside the panel closes it
+        // Clickable views take the focus by default (Android 8 on); the
+        // shade and the panel are only there to be tapped, never focused.
+        root.setFocusable(false);
         panel = new LinearLayout(activity);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setBackgroundColor(PANEL);
         panel.setClickable(true);                    // taps on the panel stay there
+        panel.setFocusable(false);
         int pad = dp(20);
         panel.setPadding(pad, pad, pad, pad);
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
@@ -83,7 +89,8 @@ final class GameMenu {
 
     void toggle() {
         if (open) {
-            if (inSubPage) showMain();
+            if (modal != null) closeModal();
+            else if (inSubPage) showMain();
             else close();
         } else {
             openMenu();
@@ -100,31 +107,75 @@ final class GameMenu {
 
     void close() {
         if (!open) return;
+        closeModal();
         open = false;
         root.setVisibility(View.GONE);
         host.opened(false);
     }
 
-    /* A pad, while the menu is open: the d-pad moves focus as Android does,
-     * A presses, B goes back a page. Everything is kept from the game. */
+    /* A key while the menu is open (a pad's, or a keyboard's). The menu moves
+     * its own focus: SDL's activity takes the arrow keys before Android's
+     * focus movement would see them. Up/down (and left/right outside a
+     * slider) go to the next row that way, A or Enter presses the focused
+     * row, B goes back a page or closes, Start closes. Always used here. */
     boolean onKey(KeyEvent e) {
-        if (!open) return false;
         int code = e.getKeyCode();
-        if (code == KeyEvent.KEYCODE_BUTTON_B) {
-            if (e.getAction() == KeyEvent.ACTION_UP) toggle();
+        boolean up = e.getAction() == KeyEvent.ACTION_UP;
+        View focus = root.findFocus();
+
+        switch (code) {
+        case KeyEvent.KEYCODE_BUTTON_B:
+            if (up) toggle();
+            return true;
+        case KeyEvent.KEYCODE_BUTTON_START:
+            if (up) close();
+            return true;
+        case KeyEvent.KEYCODE_BUTTON_A:
+        case KeyEvent.KEYCODE_DPAD_CENTER:
+        case KeyEvent.KEYCODE_ENTER:
+            if (up && focus != null) focus.performClick();
+            else if (up) focusFirst();
+            return true;
+        case KeyEvent.KEYCODE_DPAD_UP:
+        case KeyEvent.KEYCODE_DPAD_DOWN:
+        case KeyEvent.KEYCODE_DPAD_LEFT:
+        case KeyEvent.KEYCODE_DPAD_RIGHT: {
+            if (up) return true;
+            boolean sideways = code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT;
+            if (focus instanceof SeekBar && sideways) {
+                SeekBar bar = (SeekBar)focus;
+                int step = Math.max(1, bar.getMax() / 18);
+                bar.setProgress(bar.getProgress() + (code == KeyEvent.KEYCODE_DPAD_RIGHT ? step : -step), true);
+                return true;
+            }
+            if (focus == null) {
+                focusFirst();
+                return true;
+            }
+            int dir = code == KeyEvent.KEYCODE_DPAD_UP ? View.FOCUS_UP :
+                      code == KeyEvent.KEYCODE_DPAD_DOWN ? View.FOCUS_DOWN :
+                      code == KeyEvent.KEYCODE_DPAD_LEFT ? View.FOCUS_LEFT : View.FOCUS_RIGHT;
+            View next = focus.focusSearch(dir);
+            // Stay inside what is showing: the question while it is up.
+            if (next != null && (modal == null || isInside(next, modal)))
+                next.requestFocus();
             return true;
         }
-        if (code == KeyEvent.KEYCODE_BUTTON_A) {
-            KeyEvent center = new KeyEvent(e.getDownTime(), e.getEventTime(), e.getAction(),
-                                           KeyEvent.KEYCODE_DPAD_CENTER, e.getRepeatCount());
-            return root.dispatchKeyEvent(center) || true;
+        default:
+            return true;                // nothing reaches the game while the menu is open
         }
-        if (code == KeyEvent.KEYCODE_BUTTON_START) {
-            if (e.getAction() == KeyEvent.ACTION_UP) close();
-            return true;
-        }
-        root.dispatchKeyEvent(e);
-        return true;
+    }
+
+    private void focusFirst() {
+        View top = modal != null ? modal : panel;
+        java.util.ArrayList<View> all = top.getFocusables(View.FOCUS_DOWN);
+        if (!all.isEmpty()) all.get(0).requestFocus();
+    }
+
+    private static boolean isInside(View v, View parent) {
+        for (android.view.ViewParent p = v.getParent(); p != null; p = p.getParent())
+            if (p == parent) return true;
+        return false;
     }
 
     // ---- pages ----
@@ -136,24 +187,72 @@ final class GameMenu {
         View resume = button("Resume", v -> close());
         panel.addView(resume);
         panel.addView(button("Settings", v -> showSettings()));
-        panel.addView(button("Quit game", v -> showQuit()));
+        quitButton = button("Quit game", v -> showQuit());
+        panel.addView(quitButton);
         resume.requestFocus();
     }
 
-    /* Asked first: a quit loses whatever the game has not saved, and Quit
-     * game sits one press below Settings. Keep playing has the focus, so a
-     * stray A press is harmless. */
+    /* Asked first, in a box over the middle of the screen: a quit loses
+     * whatever the game has not saved, and Quit game sits one press below
+     * Settings. No has the focus, so a stray A press is harmless; B, Back or
+     * a tap outside the box is No as well. */
     private void showQuit() {
-        inSubPage = true;
-        panel.removeAllViews();
-        panel.addView(title("Quit game?"));
-        TextView why = text("Anything you haven't saved in the game will be lost.", 15, MUTED, false);
-        why.setPadding(dp(12), 0, dp(12), dp(16));
-        panel.addView(why);
-        View keep = button("Keep playing", v -> showMain());
-        panel.addView(keep);
-        panel.addView(button("Quit", v -> host.quit()));
-        keep.requestFocus();
+        if (modal != null) return;
+        FrameLayout shade = new FrameLayout(activity);
+        shade.setBackgroundColor(0x99000000);
+        shade.setClickable(true);
+        shade.setOnClickListener(v -> closeModal());
+        shade.setFocusable(false);
+
+        LinearLayout card = new LinearLayout(activity);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setClickable(true);                     // taps on the box stay there
+        card.setFocusable(false);
+        int pad = dp(24);
+        card.setPadding(pad, pad, pad, dp(16));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(PANEL);
+        bg.setCornerRadius(dp(16));
+        card.setBackground(bg);
+
+        TextView ask = text("Are you sure?", 22, TEXT, true);
+        ask.setGravity(Gravity.CENTER_HORIZONTAL);
+        card.addView(ask);
+        TextView why = text("Quitting loses anything you haven't saved in the game.", 15, MUTED, false);
+        why.setGravity(Gravity.CENTER_HORIZONTAL);
+        why.setPadding(0, dp(8), 0, dp(20));
+        card.addView(why);
+
+        LinearLayout buttons = new LinearLayout(activity);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        View no = button("No", v -> closeModal());
+        View yes = button("Yes", v -> host.quit());
+        ((TextView)no).setGravity(Gravity.CENTER);
+        ((TextView)yes).setGravity(Gravity.CENTER);
+        no.setBackground(boxBackground());
+        yes.setBackground(boxBackground());
+        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        half.setMargins(dp(6), 0, dp(6), 0);
+        buttons.addView(no, half);
+        buttons.addView(yes, new LinearLayout.LayoutParams(half));
+        card.addView(buttons);
+
+        int width = Math.min(dp(440), (int)(activity.getResources().getDisplayMetrics().widthPixels * 0.8f));
+        shade.addView(card, new FrameLayout.LayoutParams(width, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        root.addView(shade, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        // The menu behind cannot take the focus while the question is up.
+        panel.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+        modal = shade;
+        no.requestFocus();
+    }
+
+    private void closeModal() {
+        if (modal == null) return;
+        root.removeView(modal);
+        modal = null;
+        panel.setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
+        if (quitButton != null) quitButton.requestFocus();
     }
 
     private void showSettings() {
@@ -293,6 +392,21 @@ final class GameMenu {
         t.setTextColor(color);
         if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
         return t;
+    }
+
+    /* A button that looks like one: a filled box, brighter with the focus. */
+    private StateListDrawable boxBackground() {
+        StateListDrawable d = new StateListDrawable();
+        GradientDrawable focus = new GradientDrawable();
+        focus.setColor(0x55FFFFFF);
+        focus.setCornerRadius(dp(10));
+        GradientDrawable rest = new GradientDrawable();
+        rest.setColor(0x1FFFFFFF);
+        rest.setCornerRadius(dp(10));
+        d.addState(new int[] { android.R.attr.state_focused }, focus);
+        d.addState(new int[] { android.R.attr.state_pressed }, focus);
+        d.addState(new int[] { }, rest);
+        return d;
     }
 
     private StateListDrawable rowBackground() {
