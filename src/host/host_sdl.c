@@ -364,6 +364,33 @@ host_window *host_window_open(int width, int height, const char *title,
     return req.result;
 }
 
+#ifdef __ANDROID__
+#include <android/native_window.h>
+
+/* RhiNativeWindow.current: the activity's window as SDL has it now, with a
+ * reference for the renderer. Under the properties' lock, because SDL clears
+ * the property (taking that lock) before it releases the window when the
+ * activity pauses: holding it, the window read is either NULL or still
+ * alive when the reference is taken. Any thread. */
+static void *android_window_now(void *self)
+{
+    host_window *w = &g_window;
+    SDL_PropertiesID props;
+    ANativeWindow *win;
+
+    (void)self;
+    if (!w->sdl || !(props = SDL_GetWindowProperties(w->sdl)))
+        return NULL;
+    SDL_LockProperties(props);
+    win = (ANativeWindow *)SDL_GetPointerProperty(props,
+        SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+    if (win)
+        ANativeWindow_acquire(win);
+    SDL_UnlockProperties(props);
+    return win;
+}
+#endif
+
 static void layer_on_main(void *arg)
 {
     host_window *w = arg;
@@ -407,6 +434,9 @@ static void layer_on_main(void *arg)
             w->native.kind = RHI_NATIVE_ANDROID;
             w->native.surface = SDL_GetPointerProperty(props,
                 SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+#ifdef __ANDROID__
+            w->native.current = android_window_now;
+#endif
             if (w->native.surface)
                 w->layer = &w->native;
         }

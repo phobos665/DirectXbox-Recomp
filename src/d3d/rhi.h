@@ -310,6 +310,12 @@ typedef struct {
     void    *surface;       /* Wayland: struct wl_surface *; Android: ANativeWindow *;
                              * X11: unused */
     uint64_t xwindow;       /* X11: the Window (an XID); Wayland: unused */
+    /* Android: the activity's window now, with a reference the caller
+     * releases (ANativeWindow_release), or NULL while the app is in the
+     * background. The surface is destroyed when the app is paused and a new
+     * one made when it resumes; the renderer asks before each frame and
+     * follows it. Called from the rendering thread. */
+    void   *(*current)(void *self);
 } RhiNativeWindow;
 
 /* The device and its swap chain */

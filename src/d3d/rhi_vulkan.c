@@ -61,7 +61,7 @@ struct wl_surface;
 #include <vulkan/vulkan_xlib.h>
 #include <vulkan/vulkan_wayland.h>
 #if defined(__ANDROID__)
-struct ANativeWindow;
+#include <android/native_window.h>
 #include <vulkan/vulkan_android.h>
 #endif
 #endif
@@ -229,6 +229,10 @@ static struct {
     VkInstance               instance;
     VkDebugUtilsMessengerEXT messenger;
     VkSurfaceKHR             surface;
+#if defined(__ANDROID__)
+    const RhiNativeWindow   *native;    /* the host's handles, kept by the host */
+    ANativeWindow           *awin;      /* the window V.surface was made on (a reference) */
+#endif
     VkPhysicalDevice         pd;
     VkPhysicalDeviceProperties props;
     VkDevice                 dev;
@@ -1173,7 +1177,19 @@ static VkResult create_native_surface(const RhiNativeWindow *nw)
             vkGetInstanceProcAddr(V.instance, "vkCreateAndroidSurfaceKHR");
         if (!create)
             return VK_ERROR_EXTENSION_NOT_PRESENT;
-        aci.window = (struct ANativeWindow *)nw->surface;
+        /* A reference of our own: SDL releases the window when the activity
+         * pauses, whether or not a swap chain still presents to it. */
+        if (nw->current) {
+            aci.window = (ANativeWindow *)nw->current((void *)nw);
+        } else {
+            aci.window = (ANativeWindow *)nw->surface;
+            if (aci.window)
+                ANativeWindow_acquire(aci.window);
+        }
+        if (!aci.window)
+            return VK_ERROR_SURFACE_LOST_KHR;
+        V.native = nw;
+        V.awin = aci.window;
         return create(V.instance, &aci, NULL, &V.surface);
 #endif
     } else {
@@ -1913,6 +1929,12 @@ static void v_device_destroy(void)
     vmaDestroyAllocator(V.vma);
     vkDestroyDevice(V.dev, NULL);
     vkDestroySurfaceKHR(V.instance, V.surface, NULL);
+#if defined(__ANDROID__)
+    if (V.awin)
+        ANativeWindow_release(V.awin);
+    V.awin = NULL;
+    V.native = NULL;
+#endif
     if (V.messenger) vkDestroyDebugUtilsMessengerEXT(V.instance, V.messenger, NULL);
     vkDestroyInstance(V.instance, NULL);
     memset(&V, 0, sizeof V);
@@ -1924,8 +1946,72 @@ static int v_device_ready(void)
     return V.dev != VK_NULL_HANDLE;
 }
 
+#if defined(__ANDROID__)
+/* Follows the activity's window (RhiNativeWindow.current): when the app is
+ * paused the window is destroyed and the swap chain and surface go with it,
+ * and frames are not presented; when it resumes, a new surface and swap chain
+ * are made on the new window. 1 when there is a swap chain to present to. */
+static int follow_android_window(void)
+{
+    ANativeWindow *cur;
+
+    if (!V.native || !V.native->current || SC.acquired)
+        return SC.sc != VK_NULL_HANDLE;
+    cur = (ANativeWindow *)V.native->current((void *)V.native);
+    if (cur == V.awin) {
+        if (cur)
+            ANativeWindow_release(cur);
+        return SC.sc != VK_NULL_HANDLE;
+    }
+    {
+        int h = rhi_wait_begin();
+        vkDeviceWaitIdle(V.dev);
+        rhi_wait_end(h);
+    }
+    update_completed();
+    destroy_swapchain_views();
+    if (SC.sc)
+        vkDestroySwapchainKHR(V.dev, SC.sc, NULL);
+    SC.sc = VK_NULL_HANDLE;
+    SC.stale = 0;
+    if (V.surface)
+        vkDestroySurfaceKHR(V.instance, V.surface, NULL);
+    V.surface = VK_NULL_HANDLE;
+    if (V.awin)
+        ANativeWindow_release(V.awin);
+    V.awin = NULL;
+    if (!cur) {
+        fprintf(stderr, "[RHI] vulkan: the window is gone (app in the background); not presenting\n");
+        return 0;
+    }
+    {
+        VkAndroidSurfaceCreateInfoKHR aci = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
+        PFN_vkCreateAndroidSurfaceKHR create = (PFN_vkCreateAndroidSurfaceKHR)
+            vkGetInstanceProcAddr(V.instance, "vkCreateAndroidSurfaceKHR");
+        VkBool32 ok = VK_FALSE;
+
+        aci.window = cur;
+        V.awin = cur;
+        if (!create || create(V.instance, &aci, NULL, &V.surface) != VK_SUCCESS) {
+            fprintf(stderr, "[RHI] vulkan: no surface on the new window\n");
+            V.surface = VK_NULL_HANDLE;
+            return 0;
+        }
+        vkGetPhysicalDeviceSurfaceSupportKHR(V.pd, V.qfamily, V.surface, &ok);
+        if (!ok)
+            fprintf(stderr, "[RHI] vulkan: the new window's surface is not presentable from this queue\n");
+    }
+    fprintf(stderr, "[RHI] vulkan: the window is back; new surface and swap chain\n");
+    return create_swapchain(SC.extent.width, SC.extent.height) == 0;
+}
+#endif
+
 static RhiView *v_swapchain_view(void)
 {
+#if defined(__ANDROID__)
+    if (!follow_android_window())
+        return NULL;
+#endif
     return SC.sc ? &SC.proxy_view : NULL;
 }
 
