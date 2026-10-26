@@ -24,8 +24,11 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
 
-    <!-- extractNativeLibs: the libraries are stored uncompressed and
-         page-aligned, and mapped from the APK. -->
+    <!-- extractNativeLibs: Android unpacks the libraries into the app's
+         library folder at install. The game is compiled on the device by
+         zig, shipped as libzig.so, and a program can only be started from a
+         real file there (mapped from the APK, it has no path to run). It
+         also lets them be compressed in the APK. -->
     <!-- The icon is the title's own or the toolkit's, scaled to every
          density by make_apk.py (res/mipmap-*/ic_launcher.png). There is no
          round variant: a launcher that wants one masks this. -->
@@ -33,7 +36,7 @@
         android:icon="@mipmap/ic_launcher"
         android:hasCode="true"
         android:allowBackup="false"
-        android:extractNativeLibs="false"
+        android:extractNativeLibs="true"
         android:isGame="true"
         android:appCategory="game"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"

@@ -27,7 +27,7 @@ target_compile_options(xbox_host PRIVATE -Wall -Wextra -Wno-unused-parameter)
 # SDL_main lands in the title's library though nothing there calls it. The
 # title's main() is renamed recomp_title_main where its main.c is compiled.
 if(ANDROID)
-    add_library(xbox_android_main OBJECT android_main.c)
+    add_library(xbox_android_main OBJECT android_main.c android_build.c)
     # The in-game menu's settings: the HLE's live switches, the touch
     # controls and the settings file.
     target_link_libraries(xbox_android_main PUBLIC SDL3::SDL3 android log

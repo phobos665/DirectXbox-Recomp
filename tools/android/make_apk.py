@@ -347,8 +347,8 @@ def main():
         run([tool("aapt2"), "link", "-I", android_jar, "--manifest", man_path,
              "-o", base] + sum((["-R", f] for f in flats), []))
 
-        # 4. Code and libraries in. Libraries stored, so they can be mapped
-        # from the APK (extractNativeLibs=false) once zipalign pages them.
+        # 4. Code and libraries in, compressed: Android unpacks the libraries
+        # at install (extractNativeLibs=true, android/AndroidManifest.xml.in).
         unaligned = os.path.join(work, "unaligned.apk")
         shutil.copy(base, unaligned)
         with zipfile.ZipFile(unaligned, "a") as z:
@@ -362,7 +362,7 @@ def main():
                     src = os.path.join(work, os.path.basename(lib))
                     run([strip, "--strip-debug", "-o", src, lib])
                 z.write(src, "lib/arm64-v8a/" + os.path.basename(lib),
-                        compress_type=zipfile.ZIP_STORED)
+                        compress_type=zipfile.ZIP_DEFLATED)
 
         # 5. Align (16 KB pages for the libraries), then sign.
         aligned = os.path.join(work, "aligned.apk")

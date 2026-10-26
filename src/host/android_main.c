@@ -248,6 +248,13 @@ int SDL_main(int argc, char *argv[])
     default_dir("RECOMP_HDD_DIR", files, "hdd");
     if (chdir(files) != 0)
         fprintf(stderr, "[ANDROID] chdir %s: %s\n", files, strerror(errno));
+    if (getenv("RECOMP_ANDROID_PROBE")) {
+        /* The on-device build's feasibility probe (android_build.c). */
+        extern int android_probe(const char *files);
+        int rc = android_probe(files);
+        fprintf(stderr, "[ANDROID] probe finished: %d\n", rc);
+        return rc;
+    }
     return recomp_title_main(argc, argv);
 }
 
