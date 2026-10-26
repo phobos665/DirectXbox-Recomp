@@ -69,6 +69,8 @@
 #include "touch_controls.h"        /* the on-screen controls */
 #include "d3d8_touch.h"
 #include "hle_settings.h"
+
+static void held_redraw(void);   /* with the overlay's switches, below */
 #include "hle.h"
 #include "recomp_config.h"
 
@@ -802,6 +804,8 @@ static HWND shadow_window(UINT width, UINT height)
      * through src/input, drawn by the renderer over each presented frame. */
     recomp_touch_init();
     d3d8_touch_set_source(recomp_touch_shapes);
+    /* A setting changed while the title is held: the held frame again. */
+    xbox_Nv2aFlipGateSetHeldRedraw(held_redraw);
     target = host_window_present_target(g_shadow_host);
     if (!target) {
         fprintf(stderr, "[HLE-D3D8] shadow: the window has nothing this renderer can "
@@ -2857,10 +2861,10 @@ static void swap_timing_report(void)
 static int  g_overlay_shown;
 static char g_overlay_line[96];
 
+/* Every present draws the line now (d3d8_overlay_present), an in-between
+ * frame's included, so there is nothing to draw again here. */
 void hle_d3d8_overlay_redraw(void)
 {
-    if (g_overlay_shown)
-        d3d8_overlay_draw(g_overlay_line);
 }
 
 /* hle_settings.h: the same switches as F9 and F10, by value. Set from
@@ -2881,6 +2885,18 @@ void hle_set_fps_overlay(int on)
 const char *hle_frame_cap(void)
 {
     return xbox_Nv2aFlipGateModeName();
+}
+
+/* The held frame again (xbox_Nv2aFlipGateSetHeldRedraw): the counter as the
+ * menu left it, then the scene re-presented with it and the touch controls. */
+static void held_redraw(void)
+{
+    if (g_overlay_set >= 0) {
+        g_overlay_shown = g_overlay_set;
+        g_overlay_set = -1;
+    }
+    d3d8_overlay_set_text(g_overlay_shown ? g_overlay_line : NULL);
+    xbox_D3D8Represent();
 }
 
 void hle_set_frame_cap(const char *name)
@@ -2968,8 +2984,7 @@ static void overlay_frame(void)
     }
 
     g_overlay_shown = enabled;
-    if (enabled)
-        d3d8_overlay_draw(line);
+    d3d8_overlay_set_text(enabled ? line : NULL);
 }
 
 /* HRESULT D3DDevice_Swap(DWORD Flags)                                       */

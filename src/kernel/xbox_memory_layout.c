@@ -2286,34 +2286,37 @@ static void flip_gate_host_paced(void)
  * it), the title stops at its next Swap and stays there, with the guest
  * lock dropped, until it is back. Only the swapping thread stops; with it
  * the game's own logic does, which is what a player coming back expects. */
+static void (*g_flip_gate_redraw)(void);
+
+void xbox_Nv2aFlipGateSetHeldRedraw(void (*fn)(void))
+{
+    g_flip_gate_redraw = fn;
+}
+
 static void flip_gate_hold_suspended(void)
 {
-    static int held_said;
     int guest_held;
     LARGE_INTEGER t0, t1, f;
 
-    if (!host_suspended() || host_take_released_frame())
+    if (!host_suspended())
         return;
     guest_held = xbox_GuestLockDrop();
     QueryPerformanceCounter(&t0);
-    if (!held_said) {
-        fprintf(stderr, "  [NV2A] the title is held at its Swap (the app is in the background, or its menu is open)\n");
-        fflush(stderr);
-    }
-    /* A frame released (a setting changed in the menu) runs, and the next
-     * Swap holds again: the change is drawn behind the menu. */
-    while (host_suspended() && !host_take_released_frame())
+    fprintf(stderr, "  [NV2A] the title is held at its Swap (the app is in the background, or its menu is open)\n");
+    fflush(stderr);
+    while (host_suspended()) {
+        /* A setting changed in the menu: the held frame again, with it.
+         * The redraw touches the renderer only, never guest memory, which
+         * is why it may run with the guest lock dropped. */
+        if (host_take_redraw() && g_flip_gate_redraw)
+            g_flip_gate_redraw();
         Sleep(10);
-    if (host_suspended()) {
-        held_said = 1;                  /* only letting a frame through: quiet */
-    } else {
-        QueryPerformanceCounter(&t1);
-        QueryPerformanceFrequency(&f);
-        fprintf(stderr, "  [NV2A] the title runs again after %.1f s held\n",
-                (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart);
-        fflush(stderr);
-        held_said = 0;
     }
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    fprintf(stderr, "  [NV2A] the title runs again after %.1f s held\n",
+            (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart);
+    fflush(stderr);
     xbox_GuestLockRestore(guest_held);
 }
 

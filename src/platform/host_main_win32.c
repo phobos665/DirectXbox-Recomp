@@ -183,22 +183,16 @@ void host_set_suspended(unsigned reason, int on)
     } while (InterlockedCompareExchange(&g_suspended, want, old) != old);
 }
 
-static volatile LONG g_released;
+static volatile LONG g_redraw;
 
-void host_release_frames(int n)
+void host_request_redraw(void)
 {
-    if (n > 0)
-        InterlockedExchange(&g_released, n);
+    InterlockedExchange(&g_redraw, 1);
 }
 
-int host_take_released_frame(void)
+int host_take_redraw(void)
 {
-    LONG n;
-
-    while ((n = InterlockedCompareExchange(&g_released, 0, 0)) > 0)
-        if (InterlockedCompareExchange(&g_released, n - 1, n) == n)
-            return 1;
-    return 0;
+    return (int)InterlockedExchange(&g_redraw, 0);
 }
 
 int host_suspended(void)

@@ -214,9 +214,9 @@ Java_org_xboxrecomp_app_RecompActivity_nativeSet(JNIEnv *env, jclass cls, jstrin
     } else if (!strcmp(key, "resolution_scale")) {
         st.resolution_scale = atoi(value) < 1 ? 1 : atoi(value) > 4 ? 4 : atoi(value);
     }
-    /* The title is held while the menu is open: let it draw an eighth of a
-     * second, so the change is seen behind the menu as it is made. */
-    host_release_frames(8);
+    /* The title is held while the menu is open: its frame is presented
+     * again with the change, so it is seen behind the menu as it is made. */
+    host_request_redraw();
     if (have_file && !recomp_settings_write(path, &st))
         fprintf(stderr, "[ANDROID] could not save %s\n", path);
     fprintf(stderr, "[ANDROID] setting %s = %s\n", key, value);
