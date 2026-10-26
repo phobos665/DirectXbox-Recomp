@@ -78,6 +78,14 @@ int host_relaunch_self(void);
  * current environment (the launch data in it) is. Returns only on failure. */
 int host_launch_other(const char *exe);
 
+/* ---- the app in the background ---------------------------------------- */
+
+/* Whether the app is in the background (Android: paused), when the title is
+ * held at its next frame boundary until it comes back (the flip gate,
+ * src/kernel). The host's event loop sets it; any thread reads it. */
+void host_set_suspended(int on);
+int  host_suspended(void);
+
 /* ---- POSIX: which thread the title runs on --------------------------- */
 
 /* A host's main-thread event loop (src/host's recomp_host_loop_run/_quit).

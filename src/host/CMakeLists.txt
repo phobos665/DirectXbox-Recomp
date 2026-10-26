@@ -14,6 +14,8 @@ target_link_libraries(xbox_host PUBLIC SDL3::SDL3)
 # recomp_window_fit: the window's size against the screen, the same rule
 # as the Win32 window in src/hle. xbox_config depends on nothing.
 target_link_libraries(xbox_host PRIVATE xbox_config)
+# host_set_suspended (src/platform/host_main.h), set from Android's lifecycle.
+target_link_libraries(xbox_host PRIVATE platform)
 find_package(Threads REQUIRED)
 target_link_libraries(xbox_host PUBLIC Threads::Threads)
 # No frameworks of its own: host_mac.c reaches AppKit through the Objective-C

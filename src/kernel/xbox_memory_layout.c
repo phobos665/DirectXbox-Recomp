@@ -36,6 +36,8 @@
 #include <string.h>
 #include <setjmp.h>
 
+#include "platform/host_main.h"   /* host_suspended */
+
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #include <time.h>     /* clock_gettime(CLOCK_THREAD_CPUTIME_ID), RECOMP_NV2A_ACK_STATS */
@@ -2280,10 +2282,36 @@ static void flip_gate_host_paced(void)
     next = next && now - next < period ? next + period : now + period;
 }
 
+/* While the app is in the background (host_suspended: Android has paused
+ * it), the title stops at its next Swap and stays there, with the guest
+ * lock dropped, until it is back. Only the swapping thread stops; with it
+ * the game's own logic does, which is what a player coming back expects. */
+static void flip_gate_hold_suspended(void)
+{
+    int guest_held;
+    LARGE_INTEGER t0, t1, f;
+
+    if (!host_suspended())
+        return;
+    guest_held = xbox_GuestLockDrop();
+    QueryPerformanceCounter(&t0);
+    fprintf(stderr, "  [NV2A] the app is in the background: the title is held at its Swap\n");
+    fflush(stderr);
+    while (host_suspended())
+        Sleep(20);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    fprintf(stderr, "  [NV2A] the app is back: the title held for %.1f s\n",
+            (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart);
+    fflush(stderr);
+    xbox_GuestLockRestore(guest_held);
+}
+
 void xbox_Nv2aFlipGateArm(void)
 {
     static int said;
 
+    flip_gate_hold_suspended();
     if (flip_gate_divisor() == 0)
         return;
     if (g_flip_gate_host_hz) {

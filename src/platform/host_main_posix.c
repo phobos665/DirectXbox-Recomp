@@ -221,6 +221,20 @@ int host_module_range(uintptr_t *lo, uintptr_t *hi)
 }
 #endif
 
+/* ---- the app in the background ---------------------------------------- */
+
+static volatile int g_suspended;
+
+void host_set_suspended(int on)
+{
+    __atomic_store_n(&g_suspended, on ? 1 : 0, __ATOMIC_SEQ_CST);
+}
+
+int host_suspended(void)
+{
+    return __atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST);
+}
+
 /* ---- the title's thread ---------------------------------------------- */
 
 typedef struct {
