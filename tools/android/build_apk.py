@@ -175,6 +175,21 @@ def main():
              "-DXBOXRECOMP_DXC_INCLUDE=" + os.path.join(deps, "dxc", "include", "dxc")])
     run(["cmake", "--build", build, "--target", "main", "pyexec"])
 
+    # XbSymbolDatabase's tool, which names the XDK functions in the player's
+    # XBE for a recipe that does not carry them (as a desktop release's
+    # bin/XbSymbolDatabaseCLI does). An executable, shipped as a library for
+    # the same reason as zig below.
+    xbsdb = os.path.join(work, "xbsdb")
+    if not os.path.isfile(os.path.join(xbsdb, "build.ninja")):
+        run(["cmake", "-S", os.path.join(TOOLKIT, "third_party", "XbSymbolDatabase"), "-B", xbsdb,
+             "-G", "Ninja",
+             "-DCMAKE_TOOLCHAIN_FILE=" + os.path.join(ndk, "build", "cmake", "android.toolchain.cmake"),
+             "-DANDROID_ABI=arm64-v8a", "-DANDROID_PLATFORM=android-" + a.api,
+             "-DCMAKE_BUILD_TYPE=Release", "-DXBSDB_BUILD_UNITTEST=OFF"])
+    run(["cmake", "--build", xbsdb, "--target", "XbSymbolDatabaseCLI"])
+    libxbsdb = os.path.join(work, "libxbsdbcli.so")
+    shutil.copy2(os.path.join(xbsdb, "projects", "cli", "XbSymbolDatabaseCLI"), libxbsdb)
+
     # libzig.so: the compiler, named as a library so the APK carries it in
     # its library folder, where Android lets a program be started.
     libzig = os.path.join(work, "libzig.so")
@@ -192,7 +207,7 @@ def main():
     out = a.out or os.path.join(project, "build", a.package + ".apk")
     env = dict(os.environ, ANDROID_HOME=sdk)
     libs = [os.path.join(build, "libmain.so"), os.path.join(build, "xboxrecomp", "libpyexec.so"),
-            need["python"], need["capstone"], libzig, need["dxc"]]
+            need["python"], need["capstone"], libzig, libxbsdb, need["dxc"]]
     cmd = [sys.executable, os.path.join(HERE, "make_apk.py")]
     for lib in libs:
         cmd += ["--lib", lib]
