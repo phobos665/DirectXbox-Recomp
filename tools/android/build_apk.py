@@ -216,6 +216,7 @@ def main():
     for lib in libs:
         cmd += ["--lib", lib]
     cmd += ["--asset", kit, "--package", a.package, "--label", a.label,
+            "--xbe", recipe.get("xbe", "default.xbe"),
             "--xbe-sha1", ",".join(i["sha1"] for i in images),
             "--min-sdk", a.api, "--version-code", a.version_code,
             "--version-name", a.version_name, "--strip", "--out", out]
