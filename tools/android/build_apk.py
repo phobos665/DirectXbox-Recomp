@@ -170,6 +170,10 @@ def main():
              "-DANDROID_ABI=arm64-v8a", "-DANDROID_PLATFORM=android-" + a.api,
              "-DANDROID_STL=c++_static", "-DCMAKE_BUILD_TYPE=Release",
              "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+             # The toolkit linked into the copy: a title whose CMakeLists
+             # looks for it beside its own checkout (../DirectXbox-Recomp)
+             # finds it here, as a desktop release passes its engine.
+             "-DXBOXRECOMP_DIR=" + os.path.join(copy, "xboxrecomp"),
              # The headers of the DXC the APK carries: without them the
              # engine has no renderer (src/d3d/CMakeLists.txt refuses).
              "-DXBOXRECOMP_DXC_INCLUDE=" + os.path.join(deps, "dxc", "include", "dxc")])
