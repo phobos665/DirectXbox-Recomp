@@ -876,10 +876,18 @@ static inline int recomp_parity8(uint32_t x) {
 }
 #define RECOMP_PARITY8(x) recomp_parity8((uint32_t)(x))
 
-/** Pop a 32-bit value from the simulated stack. */
+/**
+ * Pop a 32-bit value from the simulated stack.
+ * Reads the value, bumps sp, and only then writes dst, so `pop esp` -- dst
+ * and sp the same register -- leaves esp at the value popped, as x86 does.
+ * Assigning dst first and then adding 4 left it 4 too high: Spartan: Total
+ * Warrior's round-to-int helper (`push esp ... pop esp`) returned with esp
+ * off by 4 (found upstream, sp00nznet/xboxrecomp#186).
+ */
 #define POP32(sp, dst) do { \
-    (dst) = MEM32(sp); \
+    uint32_t _pop_v = MEM32(sp); \
     (sp) += 4; \
+    (dst) = _pop_v; \
 } while(0)
 
 /* ================================================================
