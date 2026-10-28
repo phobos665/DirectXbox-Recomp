@@ -438,6 +438,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
                  * STATUS_UNSUCCESSFUL and then said the hard disk had failed. */
                 case ERROR_FILE_EXISTS:
                 case ERROR_ALREADY_EXISTS: status = STATUS_OBJECT_NAME_COLLISION; break;
+                case ERROR_TOO_MANY_OPEN_FILES: status = STATUS_TOO_MANY_OPENED_FILES; break;
                 default:                   status = STATUS_UNSUCCESSFUL; break;
             }
             if (IoStatusBlock) {
@@ -1273,6 +1274,8 @@ static NTSTATUS errno_to_status(int e)
         case EPERM:   return STATUS_ACCESS_DENIED;
         case EEXIST:  return STATUS_OBJECT_NAME_COLLISION;
         case ENOMEM:  return STATUS_NO_MEMORY;
+        case EMFILE:
+        case ENFILE:  return STATUS_TOO_MANY_OPENED_FILES;
         default:      return STATUS_UNSUCCESSFUL;
     }
 }
@@ -1394,6 +1397,16 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             }
         }
         g_xbox_last_file_error = (uint32_t)e;
+        /* Not the title's fault, and easy to mistake for a missing file: on
+         * stderr, where a tester's log has it (w32_raise_fd_limit). */
+        if (e == EMFILE || e == ENFILE) {
+            static volatile LONG warned;
+            if (InterlockedExchange(&warned, 1) == 0) {
+                fprintf(stderr, "  [FILE] out of host file descriptors (%s): "
+                        "raise the open-file limit\n", host_path);
+                fflush(stderr);
+            }
+        }
         /* A warning, as on Windows: a failed open is how a title decides a
          * volume or asset is missing. */
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)",
