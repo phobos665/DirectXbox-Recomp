@@ -94,6 +94,10 @@ def reference(m, w, a, b, cf_in):
         r = (a - b - c) & mask
         of = int((a & top) != (b & top) and (r & top) != (a & top))
         return (a if m == "cmp" else r), dict(szp(r), C=int(a < b + c), O=of)
+    if m in ("and", "or", "xor"):
+        b &= mask
+        r = {"and": a & b, "or": a | b, "xor": a ^ b}[m]
+        return r, dict(szp(r), C=0, O=0)
     if m == "neg":
         r = (-a) & mask
         return r, dict(szp(r), C=int(a != 0), O=int(a == top))

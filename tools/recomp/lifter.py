@@ -781,6 +781,60 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return (f"(({_sf_utype})(({_sf_utype})({a}) - ({_sf_utype})({b}))"
                 f" >> {_sf_top})")
 
+    def _top_bit(expr):
+        return f"(({_sf_utype})({expr}) >> {_sf_top})"
+
+    # OF, AS A C EXPRESSION THAT IS NONZERO WHEN IT IS SET, OR None.
+    #
+    # No rule gave jo/jno a meaning after cmp, sub, add, adc, sbb, neg or the
+    # shifts, so each fell back to `_flags`, which nothing assigns: never
+    # taken. Worse, the signed conditions after add, adc, sbb, neg and the
+    # shifts were written as the result's sign alone. That is SF, and jl is
+    # SF != OF, so they were wrong exactly when the arithmetic overflowed --
+    # `add al, bl; jl` with 0x70 + 0x70 wraps to 0xE0, SF set, OF set, and x86
+    # does not branch.
+    #
+    # Subtraction overflows when the operands' signs differ and the result's
+    # sign is not the minuend's; addition when they agree and it is not. sub
+    # and add keep only the result (_fa) and the source (_fb), so the other
+    # operand is rebuilt from them, and everything is done in the unsigned
+    # type of the operand's width so nothing in the C can overflow. adc and
+    # sbb need the carry-in as well, which is gone once they have written, so
+    # they compute OF where they run and leave it in _fb -- the place inc and
+    # dec already leave theirs. neg overflows only on the most negative value,
+    # which it maps to itself. A shift by one defines OF from the result: shr
+    # from the operand's old top bit (now one below the top), shl from the
+    # result's top bit XOR the bit shifted out, sar never. Intel leaves OF
+    # undefined after a longer shift, so the by-one rule is as good an answer
+    # as any there. The logic ops clear it. Setters not listed return None and
+    # keep the fallback: a wrong branch is worse than an unmodelled one.
+    def _overflow_flag():
+        t = _sf_utype
+        if flag_setter == "cmp" and rhs is not None:
+            a, b, r, same_sign = lhs, rhs, f"({lhs}) - ({rhs})", False
+        elif lhs != "_fa":
+            return None
+        elif flag_setter == "sub" and rhs == "_fb":
+            a, b, r, same_sign = "(_fa + _fb)", "_fb", "_fa", False
+        elif flag_setter == "add" and rhs == "_fb":
+            a, b, r, same_sign = "(_fa - _fb)", "_fb", "_fa", True
+        elif flag_setter in ("and", "or", "xor", "sar"):
+            return "0"
+        elif flag_setter == "neg":
+            return f"(_fa == 0x{1 << _sf_top:X}u)"
+        elif flag_setter in ("adc", "sbb"):
+            return "_fb"
+        elif flag_setter == "shr":
+            return _top_bit("_fa << 1")
+        elif flag_setter in ("shl", "sal"):
+            return f"({_top_bit('_fa')} ^ (uint32_t)(_cf != 0))"
+        else:
+            return None
+        signs = f"(({t})({a}) ^ ({t})({b}))"
+        if same_sign:
+            signs = f"(({t})~{signs})"
+        return f"((({t})({signs} & (({t})({a}) ^ ({t})({r})))) >> {_sf_top})"
+
     # ── bsf/bsr: ZF is the only flag they define ──
     #
     # ZF is set when the SOURCE was zero, not from any subtraction, and the
@@ -806,6 +860,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"RECOMP_PARITY8(({lhs}) - ({rhs}))", desc
         if jcc == "jnp":
             return f"(!RECOMP_PARITY8(({lhs}) - ({rhs})))", desc
+        if jcc in ("jo", "jno"):
+            of = _overflow_flag()
+            return (f"({of} != 0)" if jcc == "jo" else f"({of} == 0)"), desc
         return None
 
     # ── test: flags from (a & b), operands unchanged ──
@@ -830,6 +887,37 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc == "jnp":
             return f"(!RECOMP_PARITY8(({lhs}) & ({rhs})))", desc
         return None
+
+    # ── PF, OF and the signed conditions of the result-snapshot setters ──
+    #
+    # _fa is the result at the operand's width, so PF is its low byte's
+    # parity for every one of them; before this only cmp, test, inc and dec
+    # had a jp. OF is _overflow_flag's, and jl/jge/jle/jg are SF != OF for the
+    # setters whose own rules below read the sign alone. sub keeps its own
+    # signed rule, which compares the rebuilt operands and so already
+    # includes OF; and/or/xor and sar clear OF, so theirs need nothing.
+    if flag_setter in _RESULT_SNAPSHOT_SETTERS and lhs == "_fa":
+        if jcc in ("jp", "jpe"):
+            return "RECOMP_PARITY8(_fa)", desc
+        if jcc in ("jnp", "jpo"):
+            return "(!RECOMP_PARITY8(_fa))", desc
+        if jcc in ("jo", "jno", "jl", "jnge", "jge", "jnl", "jle", "jng",
+                   "jg", "jnle"):
+            of = _overflow_flag()
+            if of is not None:
+                if jcc == "jo":
+                    return f"({of} != 0)", desc
+                if jcc == "jno":
+                    return f"({of} == 0)", desc
+                if flag_setter in ("add", "adc", "sbb", "neg",
+                                   "shl", "sal", "shr"):
+                    less = f"((_fas < 0) != ({of} != 0))"
+                    return {"jl": less, "jnge": less,
+                            "jge": f"!{less}", "jnl": f"!{less}",
+                            "jle": f"(_fa == 0 || {less})",
+                            "jng": f"(_fa == 0 || {less})",
+                            "jg": f"(_fa != 0 && !{less})",
+                            "jnle": f"(_fa != 0 && !{less})"}[jcc], desc
 
     # ── carry conditions, from the _cf the arithmetic already produced ──
     #
@@ -861,9 +949,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({slhs} < 0)", desc
         if jcc == "jns":
             return f"({slhs} >= 0)", desc
-        # Ordered: reconstruct original a = result + b
+        # Ordered: reconstruct original a = result + b, AT THE OPERAND'S
+        # WIDTH. CMP_L and friends take the width from sizeof their
+        # arguments, and with both cast to uint32_t an 8- or 16-bit sub was
+        # compared at 32 bits: the rebuilt a was never negative and never
+        # wrapped, so `sub al, bl; jl` with al = 0x80 did not branch. Cast to
+        # the operand's own unsigned type, the sum wraps where the hardware's
+        # does and the macro sign-extends from the right bit.
         if cmp_macro and rhs:
-            return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
+            return (f"{cmp_macro}(({_sf_utype})({lhs} + {rhs}), ({_sf_utype}){rhs})"
+                    if _sf_utype != "uint32_t" else
+                    f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})"), desc
         if jcc in ("jb", "jnae"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb"):
@@ -979,6 +1075,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
+        # CF is "the operand was nonzero" and ZF "the result is zero", and
+        # neg maps zero to zero and nothing else, so exactly one of the two
+        # is set: jbe always branches and ja never does.
+        if jcc in ("jbe", "jna"):
+            return "1", desc
+        if jcc in ("ja", "jnbe"):
+            return "0", desc
         if jcc in ("jb", "jnae", "jc"):
             # CF=1 unless original was 0
             return f"({lhs} != 0)", desc
@@ -2545,15 +2648,34 @@ class Lifter:
         dst = _fmt_operand_read(ops[0])
         src = _narrow_source(ops)
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
+        # Equal operands cannot overflow, so OF (in _fb, below) is 0.
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0")
                     + " /* sbb self (CF extend) */",
+                    "_fb = 0; /* sbb self: OF clear */",
                     self._result_snapshot(ops, "sbb")]
+        return self._carry_arith("-", "sbb", ops, dst, src)
+
+    def _carry_arith(self, c_op, m, ops, dst, src):
+        """adc/sbb: the sum or difference with the carry in, and CF and OF out.
+
+        OF needs both operands and the carry that went in, and all three are
+        gone once the destination is written, so it is computed here and left
+        in _fb -- where inc and dec already leave theirs, and where
+        _make_condition looks for it after these two. The operands are read
+        once, into locals, so a memory destination is not read three times.
+        """
         w = (_operand_width(ops[0]) or 4) * 8
-        return ["{ uint64_t _t = (uint64_t)(%s) - (uint64_t)(%s) - (uint64_t)_cf;"
-                " _cf = (int)((_t >> %d) & 1); %s }  /* sbb */"
-                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
-                self._result_snapshot(ops, "sbb")]
+        # a - b overflows when the signs of a and b differ and the result's
+        # differs from a's; a + b when a and b agree and the result's differs.
+        signs = "(_d ^ _s)" if c_op == "-" else "~(_d ^ _s)"
+        return ["{ uint32_t _d = (uint32_t)(%s), _s = (uint32_t)(%s);"
+                " uint64_t _t = (uint64_t)_d %s (uint64_t)_s %s (uint64_t)_cf;"
+                " _cf = (int)((_t >> %d) & 1);"
+                " _fb = ((%s & (_d ^ (uint32_t)_t)) >> %d) & 1u; %s }  /* %s */"
+                % (dst, src, c_op, c_op, w, signs, w - 1,
+                   _fmt_operand_write(ops[0], "(uint32_t)_t"), m),
+                self._result_snapshot(ops, m)]
 
     def _lift_adc(self, insn, ops):
         """ADC: add with carry."""
@@ -2561,11 +2683,7 @@ class Lifter:
             return ["/* adc: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         src = _narrow_source(ops)
-        w = (_operand_width(ops[0]) or 4) * 8
-        return ["{ uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
-                " _cf = (int)((_t >> %d) & 1); %s }  /* adc */"
-                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
-                self._result_snapshot(ops, "adc")]
+        return self._carry_arith("+", "adc", ops, dst, src)
 
     def _lift_double_shift(self, insn, ops, m):
         """SHLD/SHRD, with x86's count rules rather than C's.
@@ -4815,6 +4933,12 @@ def lift_basic_block(lifter, bb, flag_state=None):
         # did exactly that and walked into unfilled entries.
         if curr.mnemonic == "lahf" and last_flag_setter:
             ah = _make_lahf_value(last_flag_setter, last_flag_ops)
+            # The translator declares _cf where it sees lahf after a carry
+            # setter in address order; one it could not pair (the setter in a
+            # later block, reached by a back edge) keeps the old no-op rather
+            # than reading an undeclared variable.
+            if ah and "_cf" in ah and not lifter.needs_cf:
+                ah = None
             if ah:
                 stmts.append(f"SET_HI8(eax, {ah}); /* lahf */")
                 i += 1

@@ -1207,6 +1207,11 @@ class FunctionTranslator:
     _CARRY_CC = frozenset({
         "b", "nae", "c", "ae", "nb", "nc", "be", "na", "a", "nbe",
     })
+    # shl's OF is the result's top bit XOR the bit shifted out, which is _cf,
+    # so after shl these read the carry too (lifter._make_condition).
+    _OF_CC = frozenset({
+        "o", "no", "l", "nge", "ge", "nl", "le", "ng", "g", "nle",
+    })
 
     @staticmethod
     def _function_needs_cf(instructions):
@@ -1227,10 +1232,14 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
-            if (cc in FunctionTranslator._CARRY_CC
+            # lahf copies CF into AH bit 0, so it is a carry reader wherever a
+            # jb would be one.
+            if ((cc in FunctionTranslator._CARRY_CC or m == "lahf")
                     and (last_setter in CF_TRACKED
                          or last_setter in ("inc", "dec", "rep-cmps")
                          or last_setter in BT_MODIFY)):
+                return True
+            if cc in FunctionTranslator._OF_CC and last_setter in ("shl", "sal"):
                 return True
             if m.startswith("rep") and ("cmps" in m or "scas" in m):
                 # repe cmpsb and friends set CF from the last pair compared
