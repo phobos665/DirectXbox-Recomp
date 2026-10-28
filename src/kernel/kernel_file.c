@@ -1283,9 +1283,10 @@ static NTSTATUS errno_to_status(int e)
 /* An OBJECT_ATTRIBUTES path to a host path: relative to an open directory
  * when RootDirectory is set and the name is not absolute (XDeleteSaveGame
  * opens each child of its save directory this way), else through the guest
- * path table. The POSIX twin of the Win32 translate_obj_path; NtCreateFile
- * and the rename share it so a renamed file lands where a later open of the
- * same name looks. `who` names the caller in the log. */
+ * path table. The POSIX twin of the Win32 translate_obj_path; NtCreateFile,
+ * NtDeleteFile, NtQueryFullAttributesFile and the rename share it, so a
+ * relative name means the same file to each of them. `who` names the caller
+ * in the log. */
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
                                char *host_path, size_t buf_size, const char *who)
 {
@@ -1300,6 +1301,9 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
         }
         for (char *p = host_path; *p; p++)
             if (*p == '\\') *p = '/';
+        /* The name is the title's spelling and the Xbox is case-insensitive;
+         * the root's own path is already the one on disk. */
+        xbox_fold_host_path_case(host_path, strlen(root) + 1);
         return TRUE;
     }
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, (DWORD)buf_size)) {
@@ -1509,8 +1513,11 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     char host_path[MAX_PATH];
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+    /* Through translate_obj_path, as on Windows: XDeleteSaveGame deletes each
+     * child of a save by its bare name relative to the open save folder, and
+     * the path table alone read that name as a path of its own (upstream
+     * #237, bertibertig). */
+    if (!translate_obj_path(ObjectAttributes, host_path, sizeof host_path, "NtDeleteFile"))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
     if (unlink(host_path) == 0) return STATUS_SUCCESS;
@@ -1815,8 +1822,9 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
         FileInformation->FileAttributes = 0x10;   /* FILE_ATTRIBUTE_DIRECTORY */
         return STATUS_SUCCESS;
     }
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+    /* Relative to RootDirectory too, as NtCreateFile is (see NtDeleteFile). */
+    if (!translate_obj_path(ObjectAttributes, host_path, sizeof host_path,
+                            "NtQueryFullAttributesFile"))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     if (stat(host_path, &st) != 0)
         return STATUS_OBJECT_NAME_NOT_FOUND;
