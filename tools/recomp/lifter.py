@@ -323,6 +323,27 @@ def _fmt_operand_read(op):
     return "/* unknown operand */"
 
 
+def _narrow_source(ops):
+    """The source of a two-operand add/sub/adc/sbb, at the destination's width.
+
+    The disassembler hands every immediate over as 32 bits, and for the
+    sign-extended imm8 forms Capstone has already sign-extended it: `add ax,
+    -1` (66 83 C0 FF) arrives as 0xFFFFFFFF. The value written is right
+    anyway, because the store truncates it. The carry is not, because it is
+    computed in a wider type than the operand: (uint64_t)ax + 0xFFFFFFFF
+    carries out of bit 32, not bit 16, so CF came out 0 for every ax where x86
+    gives 1 for any ax but 0, and `sub ax, -1` compared ax against 0xFFFFFFFF
+    and borrowed for every value. A narrow immediate is folded to the width
+    here, as a literal; a register or memory source is already read at its own
+    width and is returned unchanged.
+    """
+    src = ops[1]
+    width = _operand_width(ops[0]) or 4
+    if src.type == "imm" and width < 4:
+        return _fmt_imm(src.imm & ((1 << (width * 8)) - 1))
+    return _fmt_operand_read(src)
+
+
 def _fmt_operand_write(op, value_expr):
     """Format writing to any operand type. Returns a C statement."""
     if op.type == "reg":
@@ -2440,7 +2461,7 @@ class Lifter:
             size = 4
         mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
         if src_too:
-            src = _fmt_operand_read(ops[1])
+            src = _narrow_source(ops)
             return (f"_fb = (uint32_t)({src}) & {mask};"
                     f" _fbs = (int32_t){sx}(_fb);"
                     f" /* {m} source, before the write */")
@@ -2453,7 +2474,10 @@ class Lifter:
             return [f"/* {m}: bad operands */"]
         c_op = {"add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^"}[m]
         dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
+        # The logic ops have no carry to get wrong, so only add and sub take
+        # the source at the destination's width (see _narrow_source).
+        src = (_narrow_source(ops) if m in ("add", "sub")
+               else _fmt_operand_read(ops[1]))
         # XOR reg, reg → zero
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             out = ["_cf = 0; /* xor clears CF */"] if self.needs_cf else []
@@ -2519,7 +2543,7 @@ class Lifter:
         if len(ops) < 2:
             return ["/* sbb: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
+        src = _narrow_source(ops)
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0")
@@ -2536,7 +2560,7 @@ class Lifter:
         if len(ops) < 2:
             return ["/* adc: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
+        src = _narrow_source(ops)
         w = (_operand_width(ops[0]) or 4) * 8
         return ["{ uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
                 " _cf = (int)((_t >> %d) & 1); %s }  /* adc */"
