@@ -1213,6 +1213,35 @@ class FunctionTranslator:
         "o", "no", "l", "nge", "ge", "nl", "le", "ng", "g", "nle",
     })
 
+    # The conditions that have a rule after mul/imul: CF and OF.
+    _MUL_FLAG_CC = frozenset({"o", "no", "b", "nae", "c", "ae", "nb", "nc"})
+
+    @staticmethod
+    def _function_reads_mul_flags(instructions):
+        """True when something in the function could read a multiply's CF/OF.
+
+        Deliberately coarse -- any CF or OF reader anywhere, not one that
+        follows a multiply -- because a reader at a join (the per-edge plan)
+        is not in address order after its setter. It only has to be cheap
+        and never false when the answer is yes; adc/sbb and the other carry
+        readers are covered by needs_cf, which also turns this on. sahf keeps
+        the OF it finds, so it counts.
+        """
+        for insn in instructions:
+            m = insn.mnemonic
+            if m == "sahf":
+                return True
+            cc = None
+            if m.startswith("j") and len(m) > 1:
+                cc = m[1:]
+            elif m.startswith("set"):
+                cc = m[3:]
+            elif m.startswith("cmov") and len(m) > 4:
+                cc = m[4:]
+            if cc in FunctionTranslator._MUL_FLAG_CC:
+                return True
+        return False
+
     @staticmethod
     def _function_needs_cf(instructions):
         """True when something in the function reads CF."""
@@ -1692,8 +1721,10 @@ class FunctionTranslator:
         # because eax may be replaced before the branch reads the result.
         # sahf and the fcomi family leave an EFLAGS image in _fa, and sahf
         # reads the OF before it from _fb.
+        # mul and imul leave "the product did not fit" (CF = OF) in _fa.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
                                  "lock cmpxchg", "inc", "dec", "sahf",
+                                 "mul", "imul",
                                  "fcomi", "fcomip", "fcompi", "fucomi",
                                  "fucomip", "fucompi")
                or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
@@ -1739,6 +1770,8 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
+        self.lifter.needs_mul_flags = (
+            has_carry or self._function_reads_mul_flags(instructions))
         self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
 
         # SSE and MMX are architectural state, declared globally by the

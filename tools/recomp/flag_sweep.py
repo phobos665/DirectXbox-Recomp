@@ -190,10 +190,11 @@ def value_pairs(w, extra=0, seed=1):
     return pairs
 
 
-_PRELUDE = r'''
+PRELUDE_FOR_TESTS = _PRELUDE = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 #include "recomp_types.h"
 
 ptrdiff_t g_xbox_mem_offset;
