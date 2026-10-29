@@ -152,8 +152,21 @@ the dashboard's own library (MACS, AS, TGS, two security gateways):
 - **`verifyvouchergetoffer`**: answer `HTTP/1.1 200 OK` with
   **`X-Err: 00000001`** and no body. Xbox Live carries a request's result in
   `X-Err`; what 1 means here is not known yet.
-- A reply buffer holds the HTTP response's headers (NUL-separated); the
-  body is not in it.
+- A reply buffer first receives the HTTP response's headers
+  (NUL-separated); the body is then written over its start. So
+  `reservename`'s reply began `00 00` followed by the rest of "HTTP/1.1":
+  its 2-byte body is a count of 0 alternatives, **the name is free**.
+- `X-Err` is parsed as hex into the request's web state (`+0x10`), apart
+  from the request's own result (`+0x168`, `0x001500F0` here). The
+  results function (`sub_121C0B`) returns that result and an 8-byte offer
+  ID from the start of the body; the dashboard (`0x5FE4B`) goes on to the
+  next sign-up scene (0x29) whenever the result is not a failure. So an
+  `X-Err: 1` answer with no body is accepted as a console would accept it.
+
+**Owner-record fields confirmed in the dashboard's validators:** the card
+type at `+0x5EA` and card number at `+0x5EC` (`sub_5A49A`), the **e-mail**
+at `+0x624` (`sub_5A8D4`, which searches for `@`). The sign-up state passes
+the record as `state + 0x2C`; the gamertag is at the state's start.
 
 The drive's file (`steps`, `gamertag`, `country`, `code`) and the log both
 hold the player's code: private files, never committed.
