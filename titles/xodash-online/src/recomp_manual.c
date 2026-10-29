@@ -687,7 +687,14 @@ static void xu_load(void)
         xu_trim(v);
         if (!strcmp(k, "steps"))         snprintf(xd.steps, sizeof xd.steps, "%s", v);
         else if (!strcmp(k, "gamertag")) snprintf(xd.gamertag, sizeof xd.gamertag, "%s", v);
-        else if (!strcmp(k, "code"))     snprintf(xd.code, sizeof xd.code, "%s", v);
+        else if (!strcmp(k, "code")) {
+            /* As the dashboard's code screen keeps it: no dashes. */
+            size_t o = 0;
+            for (; *v && o + 1 < sizeof xd.code; v++)
+                if (*v != '-' && *v != ' ')
+                    xd.code[o++] = *v;
+            xd.code[o] = 0;
+        }
         else if (!strcmp(k, "download")) snprintf(xd.download, sizeof xd.download, "%s", v);
         else if (!strcmp(k, "save"))     snprintf(xd.save, sizeof xd.save, "%s", v);
         else if (!strcmp(k, "email"))    snprintf(xd.email, sizeof xd.email, "%s", v);
@@ -838,6 +845,12 @@ static void xu_start_next(uint32_t cxo)
         xu_put_u32(owner + 0x61C, 0xf5fe4000u);            /* expires 1 Dec 2030 */
         xu_put_u32(owner + 0x620, 0x01e1fd35u);
         xu_put_wide(owner + 0x624, xd.email, 129);
+        /* The subscription code, in the record's last text slot: the
+         * dashboard's code screen keeps it at state +0x8D2 (owner +0x8A6),
+         * and the code check reads it from there. 26 characters: the 25
+         * without their dashes. Without it Insignia answers 500, X-Err
+         * 0x80154007. */
+        xu_put_wide(owner + 0x8A6, xd.code, 26);
         args[0] = state;
         args[1] = owner;
         args[2] = 0;
