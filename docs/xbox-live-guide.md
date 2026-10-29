@@ -65,6 +65,10 @@ the Xbox dashboard**, and Insignia gives you the rest.
    `titles/xodash-online` project, see `docs/technical/xbox-live-accounts.md`.)*
 4. **Set your password**: Insignia e-mails you a link. That is for their
    website; the game signs in without it.
+5. **Title updates**: in a self-building release, the launcher's **Updater**
+   row builds the dashboard's online updater from your dashboard, as the game
+   was built from your disc. When Xbox Live says the game needs an update,
+   choosing OK installs it (Step 5).
 
 Then start the game and sign in from its Xbox Live menu. Checked end to end
 on 29 Oct 2026: an account made this way signed in to Rainbow Six 3 (with

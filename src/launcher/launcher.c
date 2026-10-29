@@ -144,6 +144,10 @@ static void live_register(void);
 static void live_refresh(void);
 static void dash_choose(void);
 static void dash_refresh(void);
+static void upd_build(void);
+static void upd_refresh(void);
+static int  upd_offered(void);
+static char g_upd_value[64];            /* what the Updater row says */
 static char           g_dash_value[64];  /* what the Dashboard row says */
 static char           g_dash_note[300];  /* what the panel says about it */
 static volatile long  g_dash_state;      /* 0 idle, 1 copying, 2 finished */
@@ -336,6 +340,15 @@ static void build_link_rows(void)
                    " image it is on: its C: drive is copied out and checked.";
         r->kind  = ROW_ACTION; r->text = g_dash_value; r->action = dash_choose;
         r++;
+
+        if (upd_offered()) {
+            r->label = "Updater";
+            r->help  = "Builds the dashboard's online updater from your dashboard, as the"
+                       " game was built from your disc: the program that installs a title"
+                       " update when Xbox Live says the game needs one.";
+            r->kind  = ROW_ACTION; r->text = g_upd_value; r->action = upd_build;
+            r++;
+        }
     }
     if (g_link_mode == LINK_HOST) {
         r->label = "Open the router";
@@ -1325,8 +1338,10 @@ static void link_tab_tick(void)
     {
         static long dash_seen = -1, files_seen = -1;
         long dash = lhost_read(&g_dash_state), files = lhost_read(&g_dash_files);
-        if (g_link_mode == LINK_LIVE && (dash != dash_seen || (dash == 1 && files != files_seen)))
+        if (g_link_mode == LINK_LIVE && (dash != dash_seen || (dash == 1 && files != files_seen))) {
             dash_refresh();
+            upd_refresh();
+        }
         dash_seen = dash;
         files_seen = files;
     }
@@ -1718,6 +1733,117 @@ static void dash_picked(const char *path)
         snprintf(g_dash_note, sizeof g_dash_note, "Could not start the copy.");
         lhost_publish(&g_dash_state, 2);
     }
+}
+
+/* ---- the online updater, built from the player's own dashboard ---- */
+
+static int    g_upd_building;           /* the job is the updater's */
+static double g_upd_progress;
+
+static int upd_file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f)
+        fclose(f);
+    return f != NULL;
+}
+
+/* A release that carries the updater's recipe (make_release.py, "updater"). */
+static int upd_offered(void)
+{
+    char path[LAUNCHER_PATH + 64];
+
+    if (!g_release)
+        return 0;
+#ifdef _WIN32
+    snprintf(path, sizeof path, "%s\\recipe-updater\\CMakeLists.txt", g_release_dir);
+#else
+    snprintf(path, sizeof path, "%s/recipe-updater/CMakeLists.txt", g_release_dir);
+#endif
+    return upd_file_exists(path);
+}
+
+/* Where the builder puts it: updater/ beside the game, where the game looks. */
+static int upd_built(void)
+{
+    char dir[LAUNCHER_PATH], path[LAUNCHER_PATH + 64];
+
+    if (!release_user_dir(g_title_id, dir, sizeof dir))
+        return 0;
+#ifdef _WIN32
+    snprintf(path, sizeof path, "%s\\updater\\xodash_update_recomp.exe", dir);
+#else
+    snprintf(path, sizeof path, "%s/updater/xodash_update_recomp", dir);
+#endif
+    return upd_file_exists(path);
+}
+
+static void upd_refresh(void)
+{
+    if (g_upd_building)
+        snprintf(g_upd_value, sizeof g_upd_value, "Building... %d%%", (int)(g_upd_progress * 100.0));
+    else if (upd_built())
+        snprintf(g_upd_value, sizeof g_upd_value, "Updater ready");
+    else
+        snprintf(g_upd_value, sizeof g_upd_value, "Build the updater");
+}
+
+/* The Updater row: build it, from the dashboard the Dashboard row copied. */
+static void upd_build(void)
+{
+    char exe[LAUNCHER_PATH + 64], dash[LAUNCHER_PATH], note[300];
+    const char *argv[5];
+
+    if (g_upd_building)
+        return;
+    if (!dash_dir(dash, sizeof dash, "dashboard") || !dash_check(dash, note, sizeof note)) {
+        snprintf(g_dash_note, sizeof g_dash_note,
+                 "The updater is built from your dashboard: copy it first (the Dashboard row).");
+        return;
+    }
+#ifdef _WIN32
+    snprintf(exe, sizeof exe, "%s\\bin\\xboxrecomp-build.exe", g_release_dir);
+#else
+    snprintf(exe, sizeof exe, "%s/bin/xboxrecomp-build", g_release_dir);
+#endif
+    argv[0] = exe; argv[1] = "updater"; argv[2] = "--dashboard"; argv[3] = dash; argv[4] = NULL;
+    if (!lhost_job_start(argv)) {
+        snprintf(g_dash_note, sizeof g_dash_note, "The builder could not be started (%s).", exe);
+        return;
+    }
+    g_upd_building = 1;
+    g_upd_progress = 0.0;
+    snprintf(g_dash_note, sizeof g_dash_note, "Building the online updater from your dashboard...");
+    upd_refresh();
+}
+
+/* While it builds: its progress, then how it went. */
+static void upd_tick(void)
+{
+    char line[4096], ev[24];
+    int n = 0, code;
+
+    while (n++ < 64 && lhost_job_line(line, sizeof line)) {
+        if (!json_str(line, "event", ev, sizeof ev))
+            continue;
+        if (strcmp(ev, "progress") == 0)
+            g_upd_progress = json_num(line, "overall");
+        else if (strcmp(ev, "error") == 0)
+            json_str(line, "message", g_dash_note, sizeof g_dash_note);
+    }
+    code = lhost_job_status();
+    if (code < 0) {
+        upd_refresh();
+        return;
+    }
+    g_upd_building = 0;
+    if (code == 0)
+        snprintf(g_dash_note, sizeof g_dash_note, "The online updater is built. When Xbox"
+                 " Live says the game needs an update, choosing OK installs it.");
+    else if (!g_dash_note[0] || strncmp(g_dash_note, "Building", 8) == 0)
+        snprintf(g_dash_note, sizeof g_dash_note, "The updater's build stopped (exit %d): see"
+                 " updater/build.log in the game's build folder.", code);
+    upd_refresh();
 }
 
 /* After the mode row moved: the list is a different length now. */
@@ -3013,6 +3139,8 @@ void launcher_tick(void)
         link_tab_tick();
     if (g_rel == REL_BUILDING)
         release_tick();
+    if (g_upd_building)
+        upd_tick();
     g_pad_seen = pad_poll(&dx, &dy, &a, &b, &t);
     if (g_capturing)
         capture_tick();             /* the press is the answer, not a move */

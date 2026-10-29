@@ -4,6 +4,7 @@
 //!     xboxrecomp-build build  [--source <iso or folder>] [--release <dir>]
 //!     xboxrecomp-build relink --source <iso or folder> [--release <dir>]
 //!     xboxrecomp-build status [--release <dir>]
+//!     xboxrecomp-build updater --dashboard <folder> [--release <dir>]
 //!
 //! A release (tools/release/make_release.py) carries no game code. It carries
 //! this program, the pipeline and a Python to run it, an engine package, a
@@ -36,6 +37,14 @@
 //! the release itself can be read-only. Progress goes to stdout as one JSON
 //! object a line, for the launcher to draw; everything the tools print goes
 //! to build.log there.
+//!
+//! `updater` builds the 5960 dashboard's online updater from the player's
+//! own dashboard (the C: drive the launcher copied, src/hdd), when
+//! release.json names one: the program a title starts when Xbox Live says
+//! it needs an update. It goes in updater/ in the same folder, beside the
+//! game's executable, with updater/game a mirror of the dashboard whose
+//! default.xbe is xodash/update.xbe -- where the runtime looks for it
+//! (src/kernel/xbox_title_update.c).
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -87,8 +96,35 @@ struct Release {
     /// the one checked against `images` and lifted.
     #[serde(default)]
     xbe: Option<String>,
+    /// The dashboard's online updater, built from the player's own
+    /// dashboard by `updater`.
+    #[serde(default)]
+    updater: Option<Updater>,
     #[serde(skip)]
     dir: PathBuf,
+}
+
+/// release.json's "updater": the recipe folder, the target it builds, and
+/// the SHA-1s of xodash/update.xbe it was made for (the 5960 dashboard's).
+#[derive(Deserialize, Clone)]
+struct Updater {
+    recipe: String,
+    exe: String,
+    sha1: Vec<String>,
+}
+
+/// What lift and build make: the game, or the updater.
+struct Target<'a> {
+    recipe: &'a str,
+    exe: &'a str,
+    xbe: &'a str,
+    hook: Option<&'a Vec<String>>,
+}
+
+impl Release {
+    fn game_target(&self) -> Target<'_> {
+        Target { recipe: "recipe", exe: &self.exe, xbe: self.boot_xbe(), hook: self.lift.as_ref() }
+    }
 }
 
 impl Release {
@@ -736,16 +772,18 @@ fn lift_progress(line: &str) {
     }
 }
 
-fn lift(release: &Release, image: &Image, user: &Path, log: &Path) -> Result<(), Failure> {
+fn lift(release: &Release, t: &Target, image: &Image, user: &Path, log: &Path)
+    -> Result<(), Failure>
+{
     let r = &release.dir;
     let project = user.join("project");
-    sync_tree(&r.join("recipe"), &project)?;
+    sync_tree(&r.join(t.recipe), &project)?;
 
     // The pipeline writes beside the XBE it is given, so it gets its own
     // copy (a hard link where possible), never the one in the player's folder.
     let xdir = user.join("pipe").join("xbe");
     fs::create_dir_all(&xdir).or_else(|e| fail(format!("cannot create {}: {e}", xdir.display())))?;
-    let name = release.boot_xbe();
+    let name = t.xbe;
     let xbe = xdir.join(name);
     let _ = fs::remove_file(&xbe);
     let game_xbe = fs::canonicalize(user.join("game").join(name)).map(plain)
@@ -764,7 +802,7 @@ fn lift(release: &Release, image: &Image, user: &Path, log: &Path) -> Result<(),
     // A title's own lift. It finds the pipeline where its toolkit submodule
     // would be, xboxrecomp/ beside its sources, and is given the private
     // copy of the XBE, so whatever it writes beside it stays here.
-    if let Some(hook) = &release.lift {
+    if let Some(hook) = t.hook {
         // Re-pointed when the release has moved since the last build.
         let toolkit_link = project.join("xboxrecomp");
         let toolkit = r.join("toolkit");
@@ -836,7 +874,7 @@ fn lift(release: &Release, image: &Image, user: &Path, log: &Path) -> Result<(),
     Ok(())
 }
 
-fn build(release: &Release, user: &Path, log: &Path) -> Result<PathBuf, Failure> {
+fn build(release: &Release, t: &Target, user: &Path, log: &Path) -> Result<PathBuf, Failure> {
     let r = &release.dir;
     let tc = r.join("toolchain");
     let bdir = user.join("build");
@@ -891,7 +929,7 @@ fn build(release: &Release, user: &Path, log: &Path) -> Result<PathBuf, Failure>
 
     progress("compile", 0, 1, "");
     let mut c = Command::new(&cmake);
-    c.arg("--build").arg(&bdir).arg("--target").arg(&release.exe);
+    c.arg("--build").arg(&bdir).arg("--target").arg(t.exe);
     with_env(&mut c);
     run(&mut c, log, "the compile", |line| {
         // Ninja: "[12/49] Building C object ..."
@@ -907,7 +945,7 @@ fn build(release: &Release, user: &Path, log: &Path) -> Result<PathBuf, Failure>
             }
         }
     })?;
-    let exe = bdir.join(exe_name(&release.exe));
+    let exe = bdir.join(exe_name(t.exe));
     if !exe.is_file() {
         return fail(format!("the compile finished but made no {}", exe.display()));
     }
@@ -921,21 +959,7 @@ fn install(release: &Release, user: &Path, built: &Path, sha1: &str) -> Result<P
     let tmp = user.join(format!("{}.part", exe_name(&release.exe)));
     fs::copy(built, &tmp).and_then(|_| fs::rename(&tmp, &dest))
         .or_else(|e| fail(format!("cannot install {}: {e}", dest.display())))?;
-    // What the release keeps for beside the game (on a Mac: the SDL dylib the
-    // game links, the Vulkan loader, MoltenVK and its manifest, DXC), copied
-    // rather than linked, so the game still starts after the release is
-    // moved; on APFS a copy is a clone, and costs nothing.
-    let runtime = release.dir.join("runtime");
-    if runtime.is_dir() {
-        sync_tree(&runtime, user)?;
-    }
-    // The renderer looks for the shader compiler beside the executable first.
-    let dxc = release.dir.join("dxc/libdxcompiler.so");
-    if dxc.is_file() {
-        let link = user.join("libdxcompiler.so");
-        let _ = fs::remove_file(&link);
-        symlink_file(&dxc, &link).or_else(|e| fail(format!("cannot link the shader compiler: {e}")))?;
-    }
+    beside_runtime(release, user)?;
     write_json(&user.join("build.json"), &Stamp {
         release_version: release.version.clone(),
         title_id: release.title_id.clone(),
@@ -944,6 +968,25 @@ fn install(release: &Release, user: &Path, built: &Path, sha1: &str) -> Result<P
     })?;
     progress("install", 1, 1, "");
     Ok(dest)
+}
+
+/// What the release keeps for beside an executable (on a Mac: the SDL dylib
+/// it links, the Vulkan loader, MoltenVK and its manifest, DXC), copied
+/// rather than linked, so it still starts after the release is moved; on
+/// APFS a copy is a clone, and costs nothing.
+fn beside_runtime(release: &Release, dir: &Path) -> Result<(), Failure> {
+    let runtime = release.dir.join("runtime");
+    if runtime.is_dir() {
+        sync_tree(&runtime, dir)?;
+    }
+    // The renderer looks for the shader compiler beside the executable first.
+    let dxc = release.dir.join("dxc/libdxcompiler.so");
+    if dxc.is_file() {
+        let link = dir.join("libdxcompiler.so");
+        let _ = fs::remove_file(&link);
+        symlink_file(&dxc, &link).or_else(|e| fail(format!("cannot link the shader compiler: {e}")))?;
+    }
+    Ok(())
 }
 
 // ── one build at a time ─────────────────────────────────────────────────────
@@ -1046,10 +1089,87 @@ fn cmd_build(release: &Release, source: Option<PathBuf>) -> Result<(), Failure> 
 
     prepare_game(&source, &user)?;
     let image = check_disc(release, &user)?;
-    lift(release, &image, &user, &log)?;
-    let built = build(release, &user, &log)?;
+    let target = release.game_target();
+    lift(release, &target, &image, &user, &log)?;
+    let built = build(release, &target, &user, &log)?;
     let exe = install(release, &user, &built, &image.sha1)?;
     emit(json!({"event": "done", "exe": exe, "game_dir": user.join("game")}));
+    Ok(())
+}
+
+/// The updater's game folder: the dashboard mirrored with links, and
+/// default.xbe its xodash/update.xbe, which is the image the updater runs.
+fn prepare_updater_game(dashboard: &Path, work: &Path) -> Result<(), Failure> {
+    let game = work.join("game");
+    let partial = work.join("game.partial");
+    progress("game", 0, 1, "");
+    remove_owned(&partial)?;
+    mirror_folder(dashboard, &partial)?;
+    let update = fs::canonicalize(dashboard.join("xodash").join("update.xbe")).map(plain)
+        .or_else(|e| fail(format!("no xodash/update.xbe in {}: {e}", dashboard.display())))?;
+    let boot = partial.join("default.xbe");
+    let _ = fs::remove_file(&boot);
+    fs::hard_link(&update, &boot).or_else(|_| symlink_file(&update, &boot))
+        .or_else(|e| fail(format!("cannot link the updater's image: {e}")))?;
+    remove_owned(&game)?;
+    fs::rename(&partial, &game)
+        .or_else(|e| fail(format!("cannot move the updater's files into place: {e}")))?;
+    progress("game", 1, 1, "");
+    Ok(())
+}
+
+fn cmd_updater(release: &Release, dashboard: Option<PathBuf>) -> Result<(), Failure> {
+    let Some(u) = release.updater.clone() else {
+        return fail("this release has no updater to build");
+    };
+    let Some(dashboard) = dashboard else {
+        return fail("no dashboard given: pass --dashboard <folder>");
+    };
+    let dashboard = fs::canonicalize(&dashboard).map(plain)
+        .or_else(|e| fail(format!("{}: {e}", dashboard.display())))?;
+    let work = user_dir(&release.title_id)?.join("updater");
+    fs::create_dir_all(&work).or_else(|e| fail(format!("cannot create {}: {e}", work.display())))?;
+    let _lock = BuildLock::take(&work)?;
+    let log = work.join("build.log");
+    let _ = fs::write(&log, format!("xboxrecomp-build {} for {}'s updater {}\n",
+                                    env!("CARGO_PKG_VERSION"), release.title_name, release.version));
+    emit(json!({"event": "start", "title": "the online updater", "user_dir": work,
+                "source": dashboard, "log": log}));
+
+    progress("check", 0, 1, "");
+    let update = dashboard.join("xodash").join("update.xbe");
+    let sha1 = sha1_file(&update)
+        .or_else(|_| fail::<String>(format!("{} has no xodash/update.xbe: it is not a \
+                                             dashboard's C: drive", dashboard.display())))?;
+    if !u.sha1.iter().any(|s| s.eq_ignore_ascii_case(&sha1)) {
+        return Err(Failure {
+            message: format!("That dashboard's updater is not the 5960 one this release \
+                              builds (SHA-1 {sha1}); Insignia needs dashboard 5960."),
+            code: 2,
+        });
+    }
+    progress("check", 1, 1, "5960");
+    prepare_updater_game(&dashboard, &work)?;
+
+    let target = Target { recipe: &u.recipe, exe: &u.exe, xbe: "default.xbe", hook: None };
+    let image = Image { sha1: sha1.clone(), name: "5960".into(), config: None };
+    lift(release, &target, &image, &work, &log)?;
+    let built = build(release, &target, &work, &log)?;
+
+    progress("install", 0, 1, "");
+    let dest = work.join(exe_name(&u.exe));
+    let tmp = work.join(format!("{}.part", exe_name(&u.exe)));
+    fs::copy(&built, &tmp).and_then(|_| fs::rename(&tmp, &dest))
+        .or_else(|e| fail(format!("cannot install {}: {e}", dest.display())))?;
+    beside_runtime(release, &work)?;
+    write_json(&work.join("build.json"), &Stamp {
+        release_version: release.version.clone(),
+        title_id: "FFFE0000".into(),
+        xbe_sha1: sha1,
+        exe: dest.display().to_string(),
+    })?;
+    progress("install", 1, 1, "");
+    emit(json!({"event": "done", "exe": dest, "game_dir": work.join("game")}));
     Ok(())
 }
 
@@ -1135,19 +1255,21 @@ fn cmd_status(release: &Release) -> Result<(), Failure> {
 fn usage() -> ExitCode {
     eprintln!("usage: xboxrecomp-build build [--source <iso or folder>] [--release <dir>]\n       \
                xboxrecomp-build relink --source <iso or folder> [--release <dir>]\n       \
-               xboxrecomp-build status [--release <dir>]");
+               xboxrecomp-build status [--release <dir>]\n       \
+               xboxrecomp-build updater --dashboard <folder> [--release <dir>]");
     ExitCode::from(64)
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first().cloned() else { return usage() };
-    let (mut source, mut release_dir) = (None, None);
+    let (mut source, mut release_dir, mut dashboard) = (None, None, None);
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--source" => source = it.next().map(PathBuf::from),
             "--release" => release_dir = it.next().map(PathBuf::from),
+            "--dashboard" => dashboard = it.next().map(PathBuf::from),
             _ => return usage(),
         }
     }
@@ -1162,6 +1284,7 @@ fn main() -> ExitCode {
             "build" => cmd_build(&release, source),
             "relink" => cmd_relink(&release, source),
             "status" => cmd_status(&release),
+            "updater" => cmd_updater(&release, dashboard),
             _ => fail(format!("unknown command {command}")),
         });
     match result {
@@ -1183,6 +1306,26 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn the_updater_runs_the_dashboards_update_xbe() {
+        let root = scratch("updater");
+        let dash = root.join("dashboard");
+        fs::create_dir_all(dash.join("xodash/media")).unwrap();
+        fs::write(dash.join("xodash/update.xbe"), b"the updater").unwrap();
+        fs::write(dash.join("xboxdash.xbe"), b"the dashboard").unwrap();
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+        prepare_updater_game(&dash, &work).unwrap();
+        let game = work.join("game");
+        assert_eq!(fs::read(game.join("default.xbe")).unwrap(), b"the updater");
+        assert_eq!(fs::read(game.join("xboxdash.xbe")).unwrap(), b"the dashboard");
+        assert!(game.join("xodash/media").is_dir());
+        // Again over the first: the folder is laid out afresh, the dashboard untouched.
+        prepare_updater_game(&dash, &work).unwrap();
+        assert_eq!(fs::read(game.join("default.xbe")).unwrap(), b"the updater");
+        assert!(!dash.join("default.xbe").exists());
     }
 
     #[test]
