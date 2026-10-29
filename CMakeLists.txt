@@ -213,6 +213,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_subdirectory(tests/net_nat)             # portable: the router behind syslink = nat, on 127.0.0.1
     add_subdirectory(tests/console_id)          # portable: the console identity loader, on a made-up EEPROM
     add_subdirectory(tests/insignia_register)   # portable: Insignia registration, against 127.0.0.1
+    add_subdirectory(tests/xbox_hdd)            # portable: xemu's qcow2 and FATX, on images made here
     add_subdirectory(tests/title_update)        # portable: title updates, the launch defaults
     add_subdirectory(tests/mmio_decode)         # x86-64 decoder; skips on other CPUs
     add_subdirectory(tests/kernel_file_rename)  # FileRenameInformation, either file backend
