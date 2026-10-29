@@ -255,12 +255,23 @@ int xbox_console_generate(const char *dir)
     return 0;
 }
 
+static int s_generate = -1;  /* xbox_console_id_generate: -1 settings, 0 never, 1 asked */
+
+void xbox_console_id_generate(int allow)
+{
+    s_generate = allow;
+}
+
 static int want_generated(void)
 {
     const char *v = recomp_config_lookup("RECOMP_CONSOLE_IDENTITY", "console_identity");
 
+    if (s_generate == 0)
+        return 0;
     if (v && *v)
         return _stricmp(v, "generate") == 0;
+    if (s_generate == 1)
+        return 1;
     v = recomp_config_lookup("RECOMP_SYSLINK", "syslink");
     return v && _stricmp(v, "nat") == 0;
 }

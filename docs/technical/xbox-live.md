@@ -114,8 +114,22 @@ Its setup assistant
 an nxdk program, not an XDK title) does that with one HTTPS request,
 `POST https://insignia.live/api/v1/xbox`, a JSON body of `serial_number`,
 `hdd_key` and `online_key` (the keys as 32 upper-case hex digits); it
-refuses a zero HDD key and an EEPROM whose checksums fail. The launcher's
-registration is built on that.
+refuses a zero HDD key and an EEPROM whose checksums fail.
+`src/net/insignia_register.c` makes the same request from the host (WinHTTP;
+libcurl loaded at run time elsewhere) and reads the answers as the assistant
+does: 200 registered, 422 with Laravel's `errors` ("The serial number has
+already been taken."), 429 too often. Its User-Agent is
+`DirectXbox-Recomp/<version>` (`RECOMP_INSIGNIA_UA`), and
+`RECOMP_INSIGNIA_URL` points it at a test server (`tests/insignia_register`).
+
+The launcher's System Link tab has an **Xbox Live (Insignia)** choice
+(`syslink = nat`; before it a hand-set `nat` was rewritten to `off` on Play)
+with a **Register this console** row. It builds `xbox_console_id.c` in, so it
+finds the console the game will be; looking never makes one
+(`xbox_console_id_generate(0)`), pressing Register does. A 200 for a
+generated console leaves `registered` in its folder and the row says so; a
+backup's folder is never written to. `RECOMP_LAUNCHER_TAB=link` and
+`RECOMP_LAUNCHER_ROW=1` open the launcher there for `RECOMP_LAUNCHER_SHOT`.
 
 ## Accounts
 

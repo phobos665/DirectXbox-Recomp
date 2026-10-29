@@ -59,7 +59,13 @@ extern const uint8_t xbox_console_generated_hd_key[16];
  * xbox_ConsoleId calls it itself; exposed for tests. */
 int xbox_console_generate(const char *dir);
 
-/* Forget the identity loaded, so the next xbox_ConsoleId looks again. Tests. */
+/* Forget the identity loaded, so the next xbox_ConsoleId looks again. Tests,
+ * and the launcher. */
 void xbox_console_id_reset(void);
+
+/* Whether a load may generate a console: -1 as the settings say (the
+ * default), 0 never (the launcher only looking), 1 yes unless the settings
+ * say console_identity = backup (the player asked, from the launcher). */
+void xbox_console_id_generate(int allow);
 
 #endif /* XBOX_CONSOLE_ID_H */

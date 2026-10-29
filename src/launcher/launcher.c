@@ -42,6 +42,8 @@
 #include "recomp_config.h"
 #include "recomp_pad.h"
 #include "net_upnp.h"
+#include "insignia_register.h"
+#include "xbox_console_id.h"
 #include "platform/host_main.h"
 
 #ifndef LAUNCHER_GAME_EXE
@@ -80,7 +82,7 @@ static int g_cw = LAUNCHER_WINDOW_W, g_ch = LAUNCHER_WINDOW_H;
 
 /* ------------------------------------------------------------- settings */
 
-typedef enum { ROW_INT, ROW_BOOL, ROW_CHOICE, ROW_TEXT } RowKind;
+typedef enum { ROW_INT, ROW_BOOL, ROW_CHOICE, ROW_TEXT, ROW_ACTION } RowKind;
 
 typedef struct Row {
     const char *label;
@@ -93,6 +95,8 @@ typedef struct Row {
     size_t      text_len;
     const char *empty;                  /* ROW_TEXT: shown while there is no text */
     int         digits;                 /* ROW_TEXT: only 0-9 may be typed */
+    void      (*action)(void);          /* ROW_ACTION: A or a click does it; text
+                                         * is what the row says */
 } Row;
 
 static const char *const k_frame_caps_console[] = { "adaptive", "60", "30", "0", NULL };
@@ -114,11 +118,13 @@ static int  g_video_count;
 /* ---- System Link ---- */
 
 /* The rows depend on the mode: a host is not asked for an address, and a
- * joining copy is not asked about its router. */
-static const char *const k_link_modes[] = { "off", "host", "join", NULL };
+ * joining copy is not asked about its router. "nat" is Xbox Live: the card
+ * cabled to the internet through the runtime's router. */
+static const char *const k_link_modes[] = { "off", "host", "join", "nat", NULL };
 #define LINK_OFF   0
 #define LINK_HOST  1
 #define LINK_JOIN  2
+#define LINK_LIVE  3
 #define LINK_BY_HAND (-1)               /* "udp", set in the file; kept as it is */
 
 static int           g_link_mode;
@@ -129,6 +135,16 @@ static char          g_lan_addr[64];    /* this PC on its network */
 static NetUpnpResult g_probe;           /* what the router said */
 static volatile long g_probe_state;     /* 0 not asked, 1 asking, 2 answered */
 static uint64_t      g_copied_until;    /* "copied" shown until then */
+
+/* ---- Xbox Live ---- */
+
+static void live_register(void);
+static void live_refresh(void);
+static char           g_live_value[64];  /* what the Register row says */
+static char           g_live_console[200]; /* which console this PC is */
+static int            g_live_stale = 1;  /* look at the console again */
+static volatile long  g_live_state;      /* 0 idle, 1 asking Insignia, 2 answered */
+static InsigniaResult g_live_result;
 
 /* ---- input ---- */
 
@@ -254,6 +270,7 @@ static const char *link_mode_label(int i)
     switch (i) {
     case LINK_HOST: return "Host a session";
     case LINK_JOIN: return "Join a session";
+    case LINK_LIVE: return "Xbox Live (Insignia)";
     case LINK_BY_HAND: return "udp (set in the settings file)";
     default: return "Off";
     }
@@ -294,6 +311,14 @@ static void build_link_rows(void)
                    " anyone who has the address. Not case-sensitive.";
         r->kind  = ROW_TEXT; r->text = g_settings.syslink_code;
         r->text_len = sizeof g_settings.syslink_code; r->empty = "none";
+        r++;
+    }
+    if (g_link_mode == LINK_LIVE) {
+        r->label = "Insignia";
+        r->help  = "Tell Insignia this console's serial number and keys, as its"
+                   " setup assistant does on a real console. Once per console;"
+                   " the game can sign in after it.";
+        r->kind  = ROW_ACTION; r->text = g_live_value; r->action = live_register;
         r++;
     }
     if (g_link_mode == LINK_HOST) {
@@ -414,7 +439,8 @@ static int row_can(const Row *r, int delta)
     case ROW_INT:
         return delta < 0 ? *r->ival > r->lo : *r->ival < r->hi;
     case ROW_TEXT:
-        return 0;                       /* typed, not stepped: no arrows */
+    case ROW_ACTION:
+        return 0;                       /* typed, or done: no arrows */
     default:
         return 1;
     }
@@ -1274,6 +1300,12 @@ static void probe_thread(void)
  * to say so. Nothing is opened from here; the game does that while it hosts. */
 static void link_tab_tick(void)
 {
+    static long live_seen;
+    long live = lhost_read(&g_live_state);
+
+    if (g_link_mode == LINK_LIVE && (g_live_stale || live != live_seen))
+        live_refresh();
+    live_seen = live;
     if (!g_lan_addr[0] && !net_local_address(g_lan_addr, sizeof g_lan_addr))
         snprintf(g_lan_addr, sizeof g_lan_addr, "?");
     /* Only this thread moves it off 0, so asking and starting are one. */
@@ -1302,9 +1334,152 @@ static void copy_text(const char *s)
         g_copied_until = lhost_ticks() + 1500;
 }
 
+/* ---- the Xbox Live tab's console and its registration ---- */
+
+/* The console identity code is the game's own (src/kernel/xbox_console_id.c,
+ * built in here), so the launcher finds the console the game will be: a
+ * backup beside the game folder, then the per-user one. It asks for the game
+ * folder through this, as the runtime answers it. */
+int xbox_path_game_dir_utf8(char *out, size_t n)
+{
+    char *slash;
+
+    if (!g_xbe_found[0])
+        return 0;
+    snprintf(out, n, "%s", g_xbe_found);
+    slash = strrchr(out, '/');
+#ifdef _WIN32
+    {
+        char *bs = strrchr(out, '\\');
+        if (bs && (!slash || bs > slash))
+            slash = bs;
+    }
+#endif
+    if (!slash)
+        return 0;
+    *slash = '\0';
+    return 1;
+}
+
+/* Whether the launcher may make a console when there is none: not when the
+ * settings name one (console_dir: that folder is the game's console, made or
+ * not) or say only a backup is wanted. */
+static int live_may_generate(void)
+{
+    const char *dir = recomp_config_lookup("RECOMP_CONSOLE_DIR", "console_dir");
+    const char *how = recomp_config_lookup("RECOMP_CONSOLE_IDENTITY", "console_identity");
+
+    return !(dir && *dir) && !(how && strcasecmp(how, "backup") == 0);
+}
+
+/* The console as the game will find it, looked at afresh. Looking never
+ * makes one; with make, one is generated for this install when there is
+ * none, where the game would make it. */
+static const XboxConsoleId *live_console(int make)
+{
+    xbox_console_id_generate(make ? 1 : 0);
+    xbox_console_id_reset();
+    return xbox_ConsoleId();
+}
+
+/* What the tab says about the console, after a change or an answer. Reads
+ * a few small files, so only then, not every frame. */
+static void live_refresh(void)
+{
+    const XboxConsoleId *id = live_console(0);
+    long state = lhost_read(&g_live_state);
+
+    if (!id)
+        snprintf(g_live_console, sizeof g_live_console, live_may_generate()
+                 ? "None yet. Registering makes one for this PC, kept for good;"
+                   " so does starting the game."
+                 : "None: the settings name a console folder (console_dir) with no"
+                   " eeprom.bin in it, or ask for a backup only.");
+    else if (id->generated)
+        snprintf(g_live_console, sizeof g_live_console,
+                 "Made for this PC, and kept: every game here signs in as it.");
+    else
+        snprintf(g_live_console, sizeof g_live_console,
+                 "Your own console's backup, in %s.", id->dir);
+
+    if (state == 1)
+        snprintf(g_live_value, sizeof g_live_value, "Registering...");
+    else if (id && id->generated && insignia_is_registered(id->dir))
+        snprintf(g_live_value, sizeof g_live_value, "Registered");
+    else
+        snprintf(g_live_value, sizeof g_live_value, "Register this console");
+    g_live_stale = 0;
+}
+
+static struct {
+    char    serial[12];
+    uint8_t hd_key[16], online_key[16];
+    char    dir[LAUNCHER_PATH];
+    int     generated;
+} g_live_ask;
+
+static void live_thread(void)
+{
+    InsigniaResult r;
+
+    insignia_register(g_live_ask.serial, g_live_ask.hd_key, g_live_ask.online_key, &r);
+    /* Remembered only for a console made here: a backup's folder is the
+     * player's, and is not written to. */
+    if (r.outcome == INSIGNIA_REGISTERED && g_live_ask.generated)
+        insignia_mark_registered(g_live_ask.dir);
+    memset(&g_live_ask, 0, sizeof g_live_ask);
+    g_live_result = r;
+    lhost_publish(&g_live_state, 2);
+}
+
+/* The Register row. Sent only when asked, once at a time, and never again
+ * for a console already registered from here: to Insignia a request is a
+ * console turning up. */
+static void live_register(void)
+{
+    const XboxConsoleId *id;
+
+    if (lhost_read(&g_live_state) == 1)
+        return;
+    id = live_console(1);
+    if (!id) {
+        memset(&g_live_result, 0, sizeof g_live_result);
+        g_live_result.outcome = INSIGNIA_BAD_CONSOLE;
+        snprintf(g_live_result.message, sizeof g_live_result.message,
+                 "There is no console to register, and none could be made.");
+        lhost_publish(&g_live_state, 2);
+        g_live_stale = 1;
+        return;
+    }
+    if (id->generated && insignia_is_registered(id->dir)) {
+        g_live_stale = 1;
+        return;
+    }
+    if (!id->have_hd_key) {
+        memset(&g_live_result, 0, sizeof g_live_result);
+        g_live_result.outcome = INSIGNIA_BAD_CONSOLE;
+        snprintf(g_live_result.message, sizeof g_live_result.message,
+                 "The backup has no HDD key (hddinfo.txt or hd_key.txt beside eeprom.bin).");
+        lhost_publish(&g_live_state, 2);
+        return;
+    }
+    memcpy(g_live_ask.serial, id->serial, 12);
+    memcpy(g_live_ask.hd_key, id->hd_key, 16);
+    memcpy(g_live_ask.online_key, id->online_key, 16);
+    snprintf(g_live_ask.dir, sizeof g_live_ask.dir, "%s", id->dir);
+    g_live_ask.generated = id->generated;
+    lhost_publish(&g_live_state, 1);
+    if (!lhost_thread(live_thread)) {
+        memset(&g_live_ask, 0, sizeof g_live_ask);
+        lhost_publish(&g_live_state, 0);
+    }
+    g_live_stale = 1;
+}
+
 /* After the mode row moved: the list is a different length now. */
 static void link_rows_changed(void)
 {
+    g_live_stale = 1;
     build_link_rows();
     if (g_sel >= g_link_count)
         g_sel = g_link_count - 1;
@@ -1511,8 +1686,16 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
                 link_rows_changed();
         }
     }
-    if (accept)
-        do_play();
+    if (accept) {
+        int count;
+        Row *rows = tab_rows(&count);
+
+        /* A on an action row does it; anywhere else it plays. */
+        if (rows && g_sel < count && rows[g_sel].kind == ROW_ACTION)
+            rows[g_sel].action();
+        else
+            do_play();
+    }
     if (cancel)
         lhost_close();
 }
@@ -1622,6 +1805,30 @@ static void draw_link(void)
                  lhost_ticks() < g_copied_until ? "Copied."
                                                 : LAUNCHER_COPY_KEY " or a click here copies it.");
         theme_text_wrapped(line, text, 11, THEME_TEXT_DIM);
+    } else if (g_link_mode == LINK_LIVE) {
+        long state = lhost_read(&g_live_state);
+
+        theme_text(line, "XBOX LIVE", 10, 700, THEME_GREEN, THEME_LEFT);
+        line.y += 30; line.h = 60;
+        snprintf(text, sizeof text, "Console      %s", g_live_console);
+        theme_text_wrapped(line, text, 12, THEME_TEXT);
+        line.y += 64; line.h = 100;
+        if (state == 2 && g_live_result.message[0]) {
+            snprintf(text, sizeof text, "%s%s", g_live_result.message,
+                     g_live_result.outcome == INSIGNIA_REGISTERED
+                         ? " Start the game and sign in from its Xbox Live menu."
+                         : "");
+            theme_text_wrapped(line, text, 12,
+                               g_live_result.outcome == INSIGNIA_REGISTERED
+                                   ? THEME_GREEN : THEME_TEXT);
+        } else {
+            theme_text_wrapped(line,
+                "The game connects to the internet through this PC and signs in to"
+                " Insignia, the revived Xbox Live, as the console above. Register it"
+                " once first. Making an account (a gamertag) still needs the Xbox"
+                " dashboard: see the Xbox Live guide.",
+                12, THEME_TEXT_DIM);
+        }
     } else if (g_link_mode == LINK_JOIN) {
         theme_text(line, "JOINING", 10, 700, THEME_GREEN, THEME_LEFT);
         line.y += 30; line.h = 120;
@@ -2322,10 +2529,30 @@ void launcher_init(void)
 
     release_init();
     read_title();
+    /* Lookups by name (console_dir, console_identity) then read this game's
+     * settings file, as they do in the game. */
+    recomp_config_set_title(g_title_id);
     settings_load();
     bindings_load();
     build_rows();
+    /* RECOMP_LAUNCHER_TAB=video|input|link|about, and RECOMP_LAUNCHER_ROW=<n>
+     * on it: open there, so RECOMP_LAUNCHER_SHOT can show any tab. */
+    {
+        const char *tab = getenv("RECOMP_LAUNCHER_TAB"), *row = getenv("RECOMP_LAUNCHER_ROW");
+        static const char *const names[TAB_COUNT] = { "video", "input", "link", "about" };
+        int i;
+
+        for (i = 0; tab && i < TAB_COUNT; i++)
+            if (strcasecmp(tab, names[i]) == 0) {
+                set_tab((Tab)i);
+                g_tab_t = 1.0;
+            }
+        if (row && *row)
+            g_sel = atoi(row);
+    }
     rows_for_tab();
+    if (g_sel >= g_rows_on_tab)
+        g_sel = 0;
     /* RECOMP_LAUNCHER_BUILD=<image or folder>: build from it straight away,
      * for a front end that already knows where the disc is, and for a
      * script checking the whole path. */
@@ -2454,8 +2681,12 @@ void launcher_click(int mx, int my)
         g_sel = i;
         /* Back or forward on the arrows; anywhere else on the row steps
          * it forward, which is how a toggle is clicked. A text row only
-         * takes the selection, to be typed into. */
-        row_move(&rows[i], dir ? dir : 1);
+         * takes the selection, to be typed into; an action row does its
+         * action. */
+        if (rows[i].kind == ROW_ACTION)
+            rows[i].action();
+        else
+            row_move(&rows[i], dir ? dir : 1);
         if (g_tab == TAB_LINK)
             link_rows_changed();
     } else if (g_tab == TAB_LINK && g_link_mode == LINK_HOST &&

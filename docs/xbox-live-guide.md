@@ -26,6 +26,24 @@ installs it, and the updated game signs in and plays online.
 | Windows, Linux | written, not yet run with Xbox Live |
 | Other titles | not yet tried; each may need its own steps (a Live block, a title update build) |
 
+## Without a console (29 Oct 2026, being built)
+
+A player with no Xbox can have a console made for them instead, as the hakuX
+emulator does:
+
+1. In the launcher's **System Link** tab choose **Xbox Live (Insignia)**.
+2. Select **Register this console**. A console is made for this PC once and
+   kept for good (in `console/` in the per-user settings folder), and
+   Insignia is told its serial number and keys, as its setup assistant does
+   on a real console. Every game on this PC is then that console.
+
+Still needed, and not yet solved without a console: **an account**. Making a
+gamertag happens in the Xbox dashboard, and a title update (Step 5) uses the
+dashboard's updater. Both are being worked on.
+
+`console_identity = backup` (or `RECOMP_CONSOLE_IDENTITY=backup`) turns this
+off: only a backup is used, as below.
+
 ## What you need
 
 - **Your own original Xbox, softmodded** (running homebrew such as the EvoX
