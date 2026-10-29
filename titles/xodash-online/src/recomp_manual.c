@@ -614,6 +614,10 @@ void sub_00120CB6(void)
  *     email    = <address>         create: the one the code was sent to
  *     confirm_create = yes         create runs only with this: it spends
  *                                  the subscription code
+ *     exit     = yes               end the process when the steps are done,
+ *                                  with "[XUACS] RESULT ok" or "[XUACS] RESULT
+ *                                  failed <step> 0x<hresult>" (exit 0 or 2):
+ *                                  how the launcher runs it
  *     start_ms = 25000             wait this long after the first call, so
  *                                  the dashboard's own sign-in has finished
  *
@@ -643,7 +647,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 static struct {
     int      loaded, on, busy;
     char     steps[64], gamertag[32], code[48], download[128], save[512], email[130];
-    int      confirm_create;
+    int      confirm_create, exit_when_done;
     uint32_t dl_buf;
     uint32_t country, start_ms;
     uint64_t first, began;
@@ -651,6 +655,19 @@ static struct {
     uint32_t task, ptask, last_hr;
     char     name[16];        /* the step running, "" when none */
 } xd;
+
+/* The run's outcome, on its own line, and the end of the process when the
+ * file asked for it. */
+static void xu_finish(int ok, const char *step, uint32_t hr)
+{
+    if (ok)
+        fprintf(stderr, "[XUACS] RESULT ok\n");
+    else
+        fprintf(stderr, "[XUACS] RESULT failed %s 0x%08X\n", step, hr);
+    fflush(stderr);
+    if (xd.exit_when_done)
+        exit(ok ? 0 : 2);
+}
 
 static uint64_t xu_now_ms(void)
 {
@@ -699,6 +716,7 @@ static void xu_load(void)
         else if (!strcmp(k, "save"))     snprintf(xd.save, sizeof xd.save, "%s", v);
         else if (!strcmp(k, "email"))    snprintf(xd.email, sizeof xd.email, "%s", v);
         else if (!strcmp(k, "confirm_create")) xd.confirm_create = !strcmp(v, "yes");
+        else if (!strcmp(k, "exit"))     xd.exit_when_done = !strcmp(v, "yes");
         else if (!strcmp(k, "country"))  xd.country = (uint32_t)strtoul(v, NULL, 0);
         else if (!strcmp(k, "start_ms")) xd.start_ms = (uint32_t)strtoul(v, NULL, 0);
     }
@@ -786,6 +804,7 @@ static void xu_start_next(uint32_t cxo)
         if (f) fprintf(f, "DRIVE: all steps done\n");
         fprintf(stderr, "[XUACS] all steps done\n");
         xd.on = 0;
+        xu_finish(1, "", 0);
         return;
     }
     if (!xd.ptask)
@@ -805,6 +824,7 @@ static void xu_start_next(uint32_t cxo)
             xd.dl_buf = xbox_HeapAlloc(0x100000, 16);
         if (!path || !xd.dl_buf) {
             xd.on = 0;
+            xu_finish(0, "download", 0x8007000Eu);
             return;
         }
         for (i = 0; i <= strlen(xd.download); i++)
@@ -824,6 +844,7 @@ static void xu_start_next(uint32_t cxo)
             fprintf(stderr, "[XUACS] create: needs gamertag, email and confirm_create = yes; stopping\n");
             xd.on = 0;
             xd.name[0] = 0;
+            xu_finish(0, "create", 0x80070057u);
             return;
         }
         memset((void *)((uintptr_t)state + g_xbox_mem_offset), 0, 0x100);
@@ -865,6 +886,7 @@ static void xu_start_next(uint32_t cxo)
     } else {
         fprintf(stderr, "[XUACS] no step called '%s'; stopping\n", xd.name);
         xd.on = 0;
+        xu_finish(0, xd.name, 0x80070057u);
         return;
     }
     xd.task = XU_MEM32(xd.ptask);
@@ -873,10 +895,15 @@ static void xu_start_next(uint32_t cxo)
     fprintf(stderr, "[XUACS] %s started: 0x%08X, task 0x%08X\n", xd.name, hr, xd.task);
     if (f) { fprintf(f, "DRIVE: %s started: 0x%08X, task 0x%08X\n", xd.name, hr, xd.task); fflush(f); }
     if ((int32_t)hr < 0 || !xd.task) {
+        char step[16];
+        snprintf(step, sizeof step, "%s", xd.name);
         xd.on = 0;
         xd.name[0] = 0;
+        xu_finish(0, step, (int32_t)hr < 0 ? hr : 0x80004005u);
     }
 }
+
+static char xd_failed_step[16];
 
 static void xu_drive(void)
 {
@@ -908,6 +935,17 @@ static void xu_drive(void)
         xd.last_hr = hr;
     }
     if ((int32_t)hr < 0 || hr == 0x001500F0u || now - xd.began > 60000u) {
+        snprintf(xd_failed_step, sizeof xd_failed_step, "%s", xd.name);
+        if ((int32_t)hr >= 0 && hr != 0x001500F0u) {
+            /* Sixty seconds with no answer: as good as a failure. */
+            fprintf(stderr, "[XUACS] %s: no answer in 60 s\n", xd.name);
+            xu_call(sub_00117720, cxo, 1, &xd.task);
+            xd.task = 0;
+            xd.name[0] = 0;
+            xd.on = 0;
+            xu_finish(0, xd_failed_step, 0x80004005u);
+            return;
+        }
         if (!strcmp(xd.name, "download") && xd.dl_buf && xd.save[0]) {
             uint32_t used = xu_used(xd.dl_buf, 0x100000);
             FILE *out = fopen(xd.save, "wb");
@@ -923,6 +961,7 @@ static void xu_drive(void)
         if ((int32_t)hr < 0) {
             fprintf(stderr, "[XUACS] stopping after a failure\n");
             xd.on = 0;
+            xu_finish(0, xd_failed_step, hr);
         } else {
             xd.step++;
         }
