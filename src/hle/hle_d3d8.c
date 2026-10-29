@@ -4637,6 +4637,14 @@ HLE_EXPORT(D3DDevice_End)
     if (original_missing(hle_original_D3DDevice_End, "D3DDevice_End"))
         return;
     g_inline_end++;
+    /* The vertices since Begin, when the title's SetVertexData* are not
+     * replaced: they are in the push buffer, written by the title's own
+     * code. The 5960 online dashboard draws every screen into a target and
+     * puts it up with one such quad; skipped with End's own writes below,
+     * it collected no vertices and every frame stayed black. Walked here,
+     * while the group is open, they reach inline_vertex_data. */
+    if (g_inline_on)
+        hle_d3d8_push_constants_sync();
     HLE_CALL_ORIGINAL(D3DDevice_End);
     hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_inline_on) {
