@@ -40,7 +40,9 @@ title whose lift does more than the pipeline names its own script as
 `"updater": true` also carries the toolkit's titles/xodash-update as
 recipe-updater/, so the player's launcher can build the 5960 dashboard's
 online updater from their own dashboard (xboxrecomp-build updater) and the
-game installs its title updates from Insignia.
+game installs its title updates from Insignia. `title_update` (exe, sha1,
+lift, cmake) names how the title's own update is built once installed
+(xboxrecomp-build title-update).
 
 Run it where the toolkit builds (the Freedesktop SDK on SteamOS, with the
 rust-stable extension for the builder): the engine and launcher compile
@@ -517,6 +519,10 @@ def main():
     if recipe.get("updater"):
         release["updater"] = {"recipe": "recipe-updater", "exe": UPDATER_EXE,
                               "sha1": UPDATER_SHA1}
+    # The title's own update, built once the updater has installed it: its
+    # target, the update XBE's SHA-1s, its lift and CMake switches.
+    if recipe.get("title_update"):
+        release["title_update"] = recipe["title_update"]
     (rel / "release.json").write_text(json.dumps(release, indent=2) + "\n")
     shutil.copy2(ROOT / "LICENSE", rel / "LICENSE")
     notice = NOTICE.format(

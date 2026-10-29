@@ -529,6 +529,11 @@ static char g_xbe_found[LAUNCHER_PATH]; /* empty: the game's files were not foun
 static int  g_release;
 static char g_release_dir[LAUNCHER_PATH];
 static char g_release_exe[128];
+/* release.json's title_update: the update's build, made once the updater has
+ * installed the update (xboxrecomp-build title-update). */
+static char g_release_update_exe[128];
+static int  g_rel_update_pending;       /* installed, not built */
+static int  g_rel_updating;             /* the build running is the update's */
 static char g_release_version[96];
 static char g_user_dir[LAUNCHER_PATH];   /* where the builder builds it */
 
@@ -740,6 +745,26 @@ static void release_status(void)
         g_rel = REL_SETUP;
         g_rel_stale = 1;
     }
+    /* An update the updater installed, with no build of it yet: the game
+     * would hand over to nothing. */
+    g_rel_update_pending = 0;
+    if (g_rel == REL_READY && g_release_update_exe[0]) {
+        char xbe[LAUNCHER_PATH + 64];
+        FILE *x;
+        snprintf(xbe, sizeof xbe, "%s/game/TDATA/%08X/$u/default.xbe", g_user_dir, g_title_id);
+        if (!(x = fopen(xbe, "rb"))) {
+            snprintf(xbe, sizeof xbe, "%s/game/TDATA/%08x/$u/default.xbe", g_user_dir, g_title_id);
+            x = fopen(xbe, "rb");
+        }
+        if (x) {
+            fclose(x);
+            snprintf(exe, sizeof exe, "%s/%s", g_user_dir, g_release_update_exe);
+            if (!(x = fopen(exe, "rb")))
+                g_rel_update_pending = 1;
+            else
+                fclose(x);
+        }
+    }
 }
 
 #if defined(__APPLE__)
@@ -822,6 +847,15 @@ static void release_init(void)
     if (strlen(g_release_exe) + 5 <= sizeof g_release_exe)
         strcat(g_release_exe, ".exe");
 #endif
+    {
+        const char *tu = strstr(text, "\"title_update\"");
+        if (tu && json_str(tu, "exe", g_release_update_exe, sizeof g_release_update_exe)) {
+#ifdef _WIN32
+            if (strlen(g_release_update_exe) + 5 <= sizeof g_release_update_exe)
+                strcat(g_release_update_exe, ".exe");
+#endif
+        }
+    }
     g_title_id = (uint32_t)strtoul(id, NULL, 16);
     json_str(text, "title_name", g_title_name, sizeof g_title_name);
     json_str(text, "version", g_release_version, sizeof g_release_version);
@@ -2408,6 +2442,30 @@ static void release_start_build(void)
     g_rel = REL_BUILDING;
 }
 
+/* The title's update, installed by the updater: built as the game was. */
+static void release_start_update(void)
+{
+    char exe[LAUNCHER_PATH + 64];
+    const char *argv[3];
+
+#ifdef _WIN32
+    snprintf(exe, sizeof exe, "%s\\bin\\xboxrecomp-build.exe", g_release_dir);
+#else
+    snprintf(exe, sizeof exe, "%s/bin/xboxrecomp-build", g_release_dir);
+#endif
+    argv[0] = exe; argv[1] = "title-update"; argv[2] = NULL;
+    g_rel_error[0] = g_rel_note[0] = '\0';
+    g_rel_unsupported = g_build_cancelled = 0;
+    g_build_progress = 0.0;
+    snprintf(g_build_label, sizeof g_build_label, "Building the game's update");
+    g_build_detail[0] = '\0';
+    g_build_started = lhost_ticks();
+    if (!lhost_job_start(argv))
+        return;                          /* the game still plays, without its update */
+    g_rel_updating = 1;
+    g_rel = REL_BUILDING;
+}
+
 /* One line of the builder's progress (tools/builder: one JSON object a line). */
 static void release_line(const char *line)
 {
@@ -2440,6 +2498,7 @@ static void release_tick(void)
     if (code < 0)
         return;
     if (code == 0 && !g_rel_error[0]) {
+        g_rel_updating = 0;
         /* Built: the game's own files now name it, and the settings are
          * its; then the ordinary launcher, Play and all. */
         g_rel_stale = 0;
@@ -2458,6 +2517,16 @@ static void release_tick(void)
         /* Say so, rather than swapping screens under the player. */
         g_build_ms = lhost_ticks() - g_build_started;
         g_rel = REL_DONE;
+        return;
+    }
+    if (g_rel_updating) {
+        /* The game is still built and plays; only its update is not. */
+        g_rel_updating = 0;
+        g_rel = REL_READY;
+        snprintf(g_dash_note, sizeof g_dash_note, "The game's update did not build (%s)."
+                 " Its log is %s/update/build.log.", g_rel_error[0] ? g_rel_error : "stopped",
+                 g_user_dir);
+        g_rel_error[0] = '\0';
         return;
     }
     g_rel = REL_SETUP;
@@ -3063,6 +3132,8 @@ void launcher_init(void)
     /* RECOMP_LAUNCHER_BUILD=<image or folder>: build from it straight away,
      * for a front end that already knows where the disc is, and for a
      * script checking the whole path. */
+    if (g_release && g_rel == REL_READY && g_rel_update_pending)
+        release_start_update();
     build = getenv("RECOMP_LAUNCHER_BUILD");
     if (g_release && build && *build && g_rel == REL_SETUP) {
         snprintf(g_source, sizeof g_source, "%s", build);

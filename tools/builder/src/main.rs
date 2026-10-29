@@ -5,6 +5,7 @@
 //!     xboxrecomp-build relink --source <iso or folder> [--release <dir>]
 //!     xboxrecomp-build status [--release <dir>]
 //!     xboxrecomp-build updater --dashboard <folder> [--release <dir>]
+//!     xboxrecomp-build title-update [--release <dir>]
 //!
 //! A release (tools/release/make_release.py) carries no game code. It carries
 //! this program, the pipeline and a Python to run it, an engine package, a
@@ -45,6 +46,11 @@
 //! game's executable, with updater/game a mirror of the dashboard whose
 //! default.xbe is xodash/update.xbe -- where the runtime looks for it
 //! (src/kernel/xbox_title_update.c).
+//!
+//! `title-update` builds the title's update once the updater has installed
+//! it in the game folder (TDATA/<TITLEID>/$u/default.xbe), when release.json
+//! names a "title_update": its own lift and CMake switches, in update/, the
+//! executable beside the game's, where the game hands over to it.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -100,6 +106,9 @@ struct Release {
     /// dashboard by `updater`.
     #[serde(default)]
     updater: Option<Updater>,
+    /// The title's own update, built from the copy the updater installed.
+    #[serde(default)]
+    title_update: Option<TitleUpdate>,
     #[serde(skip)]
     dir: PathBuf,
 }
@@ -113,17 +122,33 @@ struct Updater {
     sha1: Vec<String>,
 }
 
-/// What lift and build make: the game, or the updater.
+/// release.json's "title_update": the target, the SHA-1s of the update's
+/// default.xbe it was made for, the title's lift for it, and the CMake
+/// switches that make the recipe build it.
+#[derive(Deserialize, Clone)]
+struct TitleUpdate {
+    exe: String,
+    sha1: Vec<String>,
+    lift: Vec<String>,
+    #[serde(default)]
+    cmake: Vec<String>,
+}
+
+/// What lift and build make: the game, the updater, or the title's update.
 struct Target<'a> {
     recipe: &'a str,
     exe: &'a str,
     xbe: &'a str,
     hook: Option<&'a Vec<String>>,
+    cmake: &'a [String],
+    /// The XBE to lift when it is not game/<xbe> in the work folder.
+    source: Option<PathBuf>,
 }
 
 impl Release {
     fn game_target(&self) -> Target<'_> {
-        Target { recipe: "recipe", exe: &self.exe, xbe: self.boot_xbe(), hook: self.lift.as_ref() }
+        Target { recipe: "recipe", exe: &self.exe, xbe: self.boot_xbe(), hook: self.lift.as_ref(),
+                 cmake: &[], source: None }
     }
 }
 
@@ -786,7 +811,8 @@ fn lift(release: &Release, t: &Target, image: &Image, user: &Path, log: &Path)
     let name = t.xbe;
     let xbe = xdir.join(name);
     let _ = fs::remove_file(&xbe);
-    let game_xbe = fs::canonicalize(user.join("game").join(name)).map(plain)
+    let game_xbe = fs::canonicalize(t.source.clone().unwrap_or_else(|| user.join("game").join(name)))
+        .map(plain)
         .or_else(|e| fail(format!("cannot find {name}: {e}")))?;
     fs::hard_link(&game_xbe, &xbe).or_else(|_| fs::copy(&game_xbe, &xbe).map(|_| ()))
         .or_else(|e| fail(format!("cannot copy {name}: {e}")))?;
@@ -917,6 +943,7 @@ fn build(release: &Release, t: &Target, user: &Path, log: &Path) -> Result<PathB
             .arg(format!("-DCMAKE_AR={}", cmake_path(&tool(&tc, "bin/zar"))))
             .arg(format!("-DCMAKE_RANLIB={}", cmake_path(&tool(&tc, "bin/zranlib"))))
             .arg(format!("-DXBOXRECOMP_DIR={}", cmake_path(&r.join("engine"))));
+        c.args(t.cmake);
         // zig rc, for the game's icon (cmake/title_icon.cmake).
         if cfg!(windows) {
             c.arg(format!("-DCMAKE_RC_COMPILER={}", cmake_path(&tool(&tc, "bin/zrc"))));
@@ -1151,7 +1178,8 @@ fn cmd_updater(release: &Release, dashboard: Option<PathBuf>) -> Result<(), Fail
     progress("check", 1, 1, "5960");
     prepare_updater_game(&dashboard, &work)?;
 
-    let target = Target { recipe: &u.recipe, exe: &u.exe, xbe: "default.xbe", hook: None };
+    let target = Target { recipe: &u.recipe, exe: &u.exe, xbe: "default.xbe", hook: None,
+                          cmake: &[], source: None };
     let image = Image { sha1: sha1.clone(), name: "5960".into(), config: None };
     lift(release, &target, &image, &work, &log)?;
     let built = build(release, &target, &work, &log)?;
@@ -1170,6 +1198,64 @@ fn cmd_updater(release: &Release, dashboard: Option<PathBuf>) -> Result<(), Fail
     })?;
     progress("install", 1, 1, "");
     emit(json!({"event": "done", "exe": dest, "game_dir": work.join("game")}));
+    Ok(())
+}
+
+/// The update the updater installed: TDATA/<TITLEID>/$u/default.xbe in the
+/// game folder, the ID in either case (the updater writes it as asked).
+fn installed_update(release: &Release, user: &Path) -> Option<PathBuf> {
+    let tdata = user.join("game").join("TDATA");
+    [release.title_id.to_uppercase(), release.title_id.to_lowercase()].iter()
+        .map(|id| tdata.join(id).join("$u").join("default.xbe"))
+        .find(|p| p.is_file())
+}
+
+fn cmd_title_update(release: &Release) -> Result<(), Failure> {
+    let Some(tu) = release.title_update.clone() else {
+        return fail("this release builds no title update");
+    };
+    let user = user_dir(&release.title_id)?;
+    let Some(xbe) = installed_update(release, &user) else {
+        return fail("no title update is installed yet: sign in to Xbox Live in the game \
+                     and choose OK when it says an update is needed");
+    };
+    let work = user.join("update");
+    fs::create_dir_all(&work).or_else(|e| fail(format!("cannot create {}: {e}", work.display())))?;
+    let _lock = BuildLock::take(&work)?;
+    let log = work.join("build.log");
+    let _ = fs::write(&log, format!("xboxrecomp-build {} for {}'s title update {}\n",
+                                    env!("CARGO_PKG_VERSION"), release.title_name, release.version));
+    emit(json!({"event": "start", "title": format!("{}'s update", release.title_name),
+                "user_dir": work, "source": xbe, "log": log}));
+    progress("check", 0, 1, "");
+    let sha1 = sha1_file(&xbe)?;
+    if !tu.sha1.iter().any(|s| s.eq_ignore_ascii_case(&sha1)) {
+        return Err(Failure {
+            message: format!("The installed update is not one this release builds (SHA-1 {sha1})."),
+            code: 2,
+        });
+    }
+    progress("check", 1, 1, "");
+    let target = Target { recipe: "recipe", exe: &tu.exe, xbe: "default.xbe", hook: Some(&tu.lift),
+                          cmake: &tu.cmake, source: Some(xbe) };
+    let image = Image { sha1: sha1.clone(), name: "title update".into(), config: None };
+    lift(release, &target, &image, &work, &log)?;
+    let built = build(release, &target, &work, &log)?;
+
+    progress("install", 0, 1, "");
+    // Beside the game's executable: the game hands over to it from there.
+    let dest = user.join(exe_name(&tu.exe));
+    let tmp = user.join(format!("{}.part", exe_name(&tu.exe)));
+    fs::copy(&built, &tmp).and_then(|_| fs::rename(&tmp, &dest))
+        .or_else(|e| fail(format!("cannot install {}: {e}", dest.display())))?;
+    write_json(&work.join("build.json"), &Stamp {
+        release_version: release.version.clone(),
+        title_id: release.title_id.clone(),
+        xbe_sha1: sha1,
+        exe: dest.display().to_string(),
+    })?;
+    progress("install", 1, 1, "");
+    emit(json!({"event": "done", "exe": dest, "game_dir": user.join("game")}));
     Ok(())
 }
 
@@ -1256,7 +1342,8 @@ fn usage() -> ExitCode {
     eprintln!("usage: xboxrecomp-build build [--source <iso or folder>] [--release <dir>]\n       \
                xboxrecomp-build relink --source <iso or folder> [--release <dir>]\n       \
                xboxrecomp-build status [--release <dir>]\n       \
-               xboxrecomp-build updater --dashboard <folder> [--release <dir>]");
+               xboxrecomp-build updater --dashboard <folder> [--release <dir>]\n       \
+               xboxrecomp-build title-update [--release <dir>]");
     ExitCode::from(64)
 }
 
@@ -1285,6 +1372,7 @@ fn main() -> ExitCode {
             "relink" => cmd_relink(&release, source),
             "status" => cmd_status(&release),
             "updater" => cmd_updater(&release, dashboard),
+            "title-update" => cmd_title_update(&release),
             _ => fail(format!("unknown command {command}")),
         });
     match result {
