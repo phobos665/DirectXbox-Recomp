@@ -591,3 +591,246 @@ void sub_00120CB6(void)
     }
     sub_00120CB6_gen();
 }
+
+
+/* ── Account requests made directly (RECOMP_XUACS_DRIVE=<file>) ──────────
+ *
+ * The dashboard's own sign-up screens close at once when it is started
+ * straight into NEW ACCOUNT, so the requests are made here instead, through
+ * the same Xbox Live library, on the console it has already signed in, from
+ * inside XOnlineTaskContinue (sub_0011770B, the library object's method),
+ * which the dashboard calls on its main thread every frame.
+ *
+ * The file names what to do, one key = value a line, and is the player's
+ * own (it holds their subscription code): never commit one.
+ *
+ *     steps    = reserve,offer     in order; nothing else exists here
+ *     gamertag = <name>            reserve: the name to hold
+ *     country  = <id>              the country byte both requests carry
+ *     code     = <code>            offer: the subscription code to check
+ *     start_ms = 25000             wait this long after the first call, so
+ *                                  the dashboard's own sign-in has finished
+ *
+ * reserve is reservename (sub_00121DBC: name, 5 alternatives, country,
+ * event, &task); offer is verifyvouchergetoffer (sub_00121B61: code,
+ * country, event, &task). Neither makes the account: creating one is a step
+ * this file does not have. Each task is pumped (sub_0011770B) until it
+ * fails, succeeds (0x001500F0) or 60 s pass, then closed (sub_00117720),
+ * and the close hooks above write its answer to RECOMP_XUACS_LOG. */
+extern void sub_0011770B_gen(void);
+extern void sub_00117720(void);
+extern void sub_00121DBC(void);
+extern void sub_00121B61(void);
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+
+#include <time.h>
+
+#define XU_CXO 0x00194E0Cu   /* the library object, as every wrapper loads it */
+
+static struct {
+    int      loaded, on, busy;
+    char     steps[64], gamertag[32], code[48];
+    uint32_t country, start_ms;
+    uint64_t first, began;
+    int      step;            /* index into steps */
+    uint32_t task, ptask, last_hr;
+    char     name[16];        /* the step running, "" when none */
+} xd;
+
+static uint64_t xu_now_ms(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void xu_trim(char *s)
+{
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t'))
+        s[--n] = 0;
+}
+
+static void xu_load(void)
+{
+    const char *path = getenv("RECOMP_XUACS_DRIVE");
+    char line[160];
+    FILE *f;
+
+    xd.loaded = 1;
+    xd.start_ms = 25000;
+    if (!path || !*path || !(f = fopen(path, "r")))
+        return;
+    while (fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '='), *k = line, *v;
+        if (!eq || line[0] == '#')
+            continue;
+        *eq = 0;
+        v = eq + 1;
+        while (*v == ' ' || *v == '\t') v++;
+        xu_trim(k);
+        xu_trim(v);
+        if (!strcmp(k, "steps"))         snprintf(xd.steps, sizeof xd.steps, "%s", v);
+        else if (!strcmp(k, "gamertag")) snprintf(xd.gamertag, sizeof xd.gamertag, "%s", v);
+        else if (!strcmp(k, "code"))     snprintf(xd.code, sizeof xd.code, "%s", v);
+        else if (!strcmp(k, "country"))  xd.country = (uint32_t)strtoul(v, NULL, 0);
+        else if (!strcmp(k, "start_ms")) xd.start_ms = (uint32_t)strtoul(v, NULL, 0);
+    }
+    fclose(f);
+    xd.on = xd.steps[0] != 0;
+    if (xd.on)
+        fprintf(stderr, "[XUACS] driving: steps %s, country %u, start after %u ms\n",
+                xd.steps, xd.country, xd.start_ms);
+}
+
+/* A guest string as UTF-16, in guest memory. */
+static uint32_t xu_wide(const char *s)
+{
+    size_t n = strlen(s), i;
+    uint32_t va = xbox_HeapAlloc((uint32_t)(n * 2 + 2), 16);
+    if (!va)
+        return 0;
+    for (i = 0; i <= n; i++) {
+        *(volatile uint16_t *)((uintptr_t)(va + 2 * i) + g_xbox_mem_offset) =
+            (uint16_t)(unsigned char)s[i];
+    }
+    return va;
+}
+
+/* Call a lifted thiscall/stdcall function with these stack arguments, the
+ * registers the caller had put back afterwards. */
+static uint32_t xu_call(void (*fn)(void), uint32_t ecx, int n, const uint32_t *args)
+{
+    uint32_t eax = g_eax, oecx = g_ecx, edx = g_edx, esp = g_esp, r;
+    int i;
+
+    for (i = n - 1; i >= 0; i--) {
+        g_esp -= 4;
+        XU_MEM32(g_esp) = args[i];
+    }
+    g_esp -= 4;
+    XU_MEM32(g_esp) = 0;             /* the return address; ret pops it */
+    g_ecx = ecx;
+    fn();
+    r = g_eax;
+    g_esp = esp;
+    g_eax = eax;
+    g_ecx = oecx;
+    g_edx = edx;
+    return r;
+}
+
+/* The n-th name in the comma list, or 0 when there is none. */
+static int xu_step_name(int n, char *out, size_t size)
+{
+    const char *p = xd.steps;
+    size_t k;
+
+    while (n-- > 0) {
+        p = strchr(p, ',');
+        if (!p)
+            return 0;
+        p++;
+    }
+    for (k = 0; p[k] && p[k] != ',' && k + 1 < size; k++)
+        out[k] = p[k];
+    out[k] = 0;
+    xu_trim(out);
+    return out[0] != 0;
+}
+
+static void xu_start_next(uint32_t cxo)
+{
+    FILE *f = xu_log();
+    uint32_t args[5], hr;
+
+    xd.name[0] = 0;
+    if (!xu_step_name(xd.step, xd.name, sizeof xd.name)) {
+        if (f) fprintf(f, "DRIVE: all steps done\n");
+        fprintf(stderr, "[XUACS] all steps done\n");
+        xd.on = 0;
+        return;
+    }
+    if (!xd.ptask)
+        xd.ptask = xbox_HeapAlloc(4, 4);
+    XU_MEM32(xd.ptask) = 0;
+    if (!strcmp(xd.name, "reserve")) {
+        args[0] = xu_wide(xd.gamertag);
+        args[1] = 5;                  /* alternatives, as the dashboard asks */
+        args[2] = xd.country;
+        args[3] = 0;                  /* no event: pumped */
+        args[4] = xd.ptask;
+        hr = xu_call(sub_00121DBC, cxo, 5, args);
+    } else if (!strcmp(xd.name, "offer")) {
+        args[0] = xu_wide(xd.code);
+        args[1] = xd.country;
+        args[2] = 0;
+        args[3] = xd.ptask;
+        hr = xu_call(sub_00121B61, cxo, 4, args);
+    } else {
+        fprintf(stderr, "[XUACS] no step called '%s'; stopping\n", xd.name);
+        xd.on = 0;
+        return;
+    }
+    xd.task = XU_MEM32(xd.ptask);
+    xd.began = xu_now_ms();
+    xd.last_hr = 0xFFFFFFFFu;
+    fprintf(stderr, "[XUACS] %s started: 0x%08X, task 0x%08X\n", xd.name, hr, xd.task);
+    if (f) { fprintf(f, "DRIVE: %s started: 0x%08X, task 0x%08X\n", xd.name, hr, xd.task); fflush(f); }
+    if ((int32_t)hr < 0 || !xd.task) {
+        xd.on = 0;
+        xd.name[0] = 0;
+    }
+}
+
+static void xu_drive(void)
+{
+    uint32_t cxo, hr;
+    uint64_t now = xu_now_ms();
+
+    if (!xd.loaded)
+        xu_load();
+    if (!xd.on)
+        return;
+    if (!xd.first)
+        xd.first = now;
+    if (now - xd.first < xd.start_ms)
+        return;
+    cxo = XU_MEM32(XU_CXO);
+    if (!cxo)
+        return;
+    if (!xd.name[0]) {
+        xu_start_next(cxo);
+        return;
+    }
+    hr = xu_call(sub_0011770B_gen, cxo, 1, &xd.task);
+    if (hr != xd.last_hr) {
+        FILE *f = xu_log();
+        fprintf(stderr, "[XUACS] %s: 0x%08X after %llu ms\n", xd.name, hr,
+                (unsigned long long)(now - xd.began));
+        if (f) { fprintf(f, "DRIVE: %s: 0x%08X after %llu ms\n", xd.name, hr,
+                         (unsigned long long)(now - xd.began)); fflush(f); }
+        xd.last_hr = hr;
+    }
+    if ((int32_t)hr < 0 || hr == 0x001500F0u || now - xd.began > 60000u) {
+        xu_call(sub_00117720, cxo, 1, &xd.task);   /* the close hooks log the answer */
+        xd.task = 0;
+        xd.name[0] = 0;
+        if ((int32_t)hr < 0) {
+            fprintf(stderr, "[XUACS] stopping after a failure\n");
+            xd.on = 0;
+        } else {
+            xd.step++;
+        }
+    }
+}
+
+void sub_0011770B(void)
+{
+    sub_0011770B_gen();
+    if (!xd.busy) {
+        xd.busy = 1;
+        xu_drive();
+        xd.busy = 0;
+    }
+}
