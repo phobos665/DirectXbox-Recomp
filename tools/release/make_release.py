@@ -139,6 +139,11 @@ This release works from these images of the game's default.xbe (SHA-1):
 {hashes}
 Any other is refused, because it has not been tested.
 
+Xbox Live (Insignia): in the settings' System Link tab choose Xbox Live, then
+register this computer's console there. Making an account and installing title
+updates need your own copy of the Xbox dashboard (5960), from an Xbox you own:
+dashboard-files.md, beside this file, says how to get it.
+
 {shortcut}
 
 This is an independent project, not affiliated with, endorsed by or sponsored
@@ -541,6 +546,7 @@ def main():
         start=start, shortcut=shortcut, userdir=userdir,
         hashes="".join(f"  {i['sha1']}  {i.get('name', '')}\n" for i in images))
     (rel / "README.txt").write_text(readme)
+    shutil.copy2(ROOT / "docs/dashboard-files.md", rel / "dashboard-files.md")
     # The toolkit's icon, for a desktop entry or a Steam shortcut; on a Mac,
     # the application's.
     shutil.copy2(ROOT / "assets/icon/png/256.png", rel / "icon.png")
@@ -565,6 +571,7 @@ def main():
             }, f)
         # Beside the application in the archive, where a player sees it first.
         (out / "README.txt").write_text(readme)
+        shutil.copy2(ROOT / "docs/dashboard-files.md", out / "dashboard-files.md")
         # An ad-hoc signature over the whole bundle, last, once nothing in it
         # changes. The linker signs each executable, but alone that leaves
         # the bundle with no Info.plist bound and no resources sealed, which

@@ -143,6 +143,7 @@ static uint64_t      g_copied_until;    /* "copied" shown until then */
 static void live_register(void);
 static void live_refresh(void);
 static void dash_choose(void);
+static void dash_choose_folder(void);
 static void dash_refresh(void);
 static void upd_build(void);
 static void upd_refresh(void);
@@ -339,6 +340,11 @@ static void build_link_rows(void)
                    " account and installs title updates. Choose the xemu hard disk"
                    " image it is on: its C: drive is copied out and checked.";
         r->kind  = ROW_ACTION; r->text = g_dash_value; r->action = dash_choose;
+        r++;
+
+        r->label = "";
+        r->help  = "A C: drive you copied off your Xbox over FTP: choose that folder.";
+        r->kind  = ROW_ACTION; r->text = (char *)"...or choose a folder"; r->action = dash_choose_folder;
         r++;
 
         if (upd_offered()) {
@@ -1594,7 +1600,8 @@ static int dash_progress(const char *path, void *ctx)
     return 0;
 }
 
-static char g_dash_image[LAUNCHER_PATH];
+static char g_dash_image[LAUNCHER_PATH];   /* the image, or the folder */
+static int  g_dash_from_folder;
 
 /* Whether path is one of the two folders this job makes and may delete. */
 static int dash_ours(const char *path)
@@ -1661,6 +1668,94 @@ static void dash_remove(const char *path)
         remove_tree(path, 0);
 }
 
+static int copy_one(const char *from, const char *to)
+{
+    char buf[65536];
+    size_t got;
+    int ok = 1;
+    FILE *in = fopen(from, "rb"), *out = in ? fopen(to, "wb") : NULL;
+
+    if (!in || !out)
+        ok = 0;
+    while (ok && (got = fread(buf, 1, sizeof buf, in)) > 0)
+        ok = fwrite(buf, 1, got, out) == got;
+    if (in)
+        fclose(in);
+    if (out && fclose(out) != 0)
+        ok = 0;
+    return ok;
+}
+
+/* Copy a folder's tree (files and folders; links are followed, as a copy of
+ * a C: drive is plain files). -1 on a failure, else the files copied. */
+static long copy_tree(const char *from, const char *to, int depth)
+{
+    long files = 0;
+#ifdef _WIN32
+    char pat[LAUNCHER_PATH + 8], a[LAUNCHER_PATH + 300], b[LAUNCHER_PATH + 300];
+    WIN32_FIND_DATAA fd;
+    HANDLE f;
+
+    if (depth > 40)
+        return -1;
+    CreateDirectoryA(to, NULL);
+    snprintf(pat, sizeof pat, "%s\\*", from);
+    f = FindFirstFileA(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE)
+        return -1;
+    do {
+        long k;
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+            continue;
+        snprintf(a, sizeof a, "%s\\%s", from, fd.cFileName);
+        snprintf(b, sizeof b, "%s\\%s", to, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            k = copy_tree(a, b, depth + 1);
+        else
+            k = copy_one(a, b) ? 1 : -1;
+        if (k < 0) {
+            FindClose(f);
+            return -1;
+        }
+        files += k;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            lhost_publish(&g_dash_files, lhost_read(&g_dash_files) + 1);
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+#else
+    char a[LAUNCHER_PATH + 300], b[LAUNCHER_PATH + 300];
+    struct dirent *e;
+    struct stat st;
+    DIR *d;
+
+    if (depth > 40)
+        return -1;
+    mkdir(to, 0755);
+    d = opendir(from);
+    if (!d)
+        return -1;
+    while ((e = readdir(d)) != NULL) {
+        long k;
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        snprintf(a, sizeof a, "%s/%s", from, e->d_name);
+        snprintf(b, sizeof b, "%s/%s", to, e->d_name);
+        if (stat(a, &st) != 0)
+            continue;
+        k = S_ISDIR(st.st_mode) ? copy_tree(a, b, depth + 1) : (copy_one(a, b) ? 1 : -1);
+        if (k < 0) {
+            closedir(d);
+            return -1;
+        }
+        files += k;
+        if (!S_ISDIR(st.st_mode))
+            lhost_publish(&g_dash_files, lhost_read(&g_dash_files) + 1);
+    }
+    closedir(d);
+#endif
+    return files;
+}
+
 static void dash_thread(void)
 {
     char err[300], fresh[LAUNCHER_PATH], dest[LAUNCHER_PATH], old[LAUNCHER_PATH];
@@ -1672,6 +1767,12 @@ static void dash_thread(void)
     if (!dash_dir(fresh, sizeof fresh, "dashboard.new") || !dash_dir(dest, sizeof dest, "dashboard") ||
         !dash_dir(old, sizeof old, "dashboard.old")) {
         snprintf(err, sizeof err, "No settings folder to copy the dashboard into.");
+    } else if (g_dash_from_folder) {
+        recomp_make_dirs(fresh);
+        dash_remove(fresh);
+        n = copy_tree(g_dash_image, fresh, 0);
+        if (n < 0)
+            snprintf(err, sizeof err, "Could not copy %s.", g_dash_image);
     } else if (!(h = xbox_hdd_open(g_dash_image, err, sizeof err))) {
         /* err says why */
     } else if (!(v = xbox_fatx_open(h, XBOX_HDD_C_OFFSET, XBOX_HDD_C_SIZE, err, sizeof err))) {
@@ -1688,8 +1789,9 @@ static void dash_thread(void)
         rename(dest, old);                 /* the one before, if any */
         if (rename(fresh, dest) == 0) {
             dash_remove(old);
-            snprintf(g_dash_note, sizeof g_dash_note, "Copied %ld files from the image's"
-                     " C: drive: dashboard 5960, ready.", n);
+            snprintf(g_dash_note, sizeof g_dash_note, "Copied %ld files from %s:"
+                     " dashboard 5960, ready.", n,
+                     g_dash_from_folder ? "the folder" : "the image's C: drive");
         } else {
             rename(old, dest);
             snprintf(g_dash_note, sizeof g_dash_note, "Could not put the dashboard in place (%s).", dest);
@@ -1702,13 +1804,13 @@ static void dash_thread(void)
     lhost_publish(&g_dash_state, 2);
 }
 
-/* The Dashboard row: ask for the image. */
-static void dash_choose(void)
+/* The Dashboard rows: ask for the image, or a folder. */
+static void dash_ask(int folder)
 {
     if (lhost_read(&g_dash_state) == 1)
         return;
-    g_pick_dash = 1;
-    if (!lhost_pick(0)) {
+    g_pick_dash = folder ? 2 : 1;
+    if (!lhost_pick(folder)) {
         g_pick_dash = 0;
         snprintf(g_dash_note, sizeof g_dash_note, "No file dialog here. Copy your dashboard"
                  " into the settings folder's dashboard/ by hand (docs/dashboard-files.md).");
@@ -1716,9 +1818,13 @@ static void dash_choose(void)
     }
 }
 
-/* What the dialog gave for the Dashboard row. */
+static void dash_choose(void) { dash_ask(0); }
+static void dash_choose_folder(void) { dash_ask(1); }
+
+/* What the dialog gave for a Dashboard row. */
 static void dash_picked(const char *path)
 {
+    g_dash_from_folder = g_pick_dash == 2;
     g_pick_dash = 0;
     if (!path) {
         snprintf(g_dash_note, sizeof g_dash_note, "Nothing chosen.");
@@ -1728,7 +1834,8 @@ static void dash_picked(const char *path)
     snprintf(g_dash_image, sizeof g_dash_image, "%s", path);
     lhost_publish(&g_dash_files, 0);
     lhost_publish(&g_dash_state, 1);
-    snprintf(g_dash_note, sizeof g_dash_note, "Copying the C: drive off %s...", path);
+    snprintf(g_dash_note, sizeof g_dash_note, g_dash_from_folder ? "Copying %s..."
+             : "Copying the C: drive off %s...", path);
     if (!lhost_thread(dash_thread)) {
         snprintf(g_dash_note, sizeof g_dash_note, "Could not start the copy.");
         lhost_publish(&g_dash_state, 2);
@@ -2188,7 +2295,18 @@ static void draw_link(void)
             line.y += 40;
             line.h = 60;
         }
-        if (state == 2 && g_live_result.message[0]) {
+        if (g_sel < g_link_count && (g_link_rows[g_sel].action == dash_choose ||
+                                     g_link_rows[g_sel].action == dash_choose_folder) &&
+            lhost_read(&g_dash_state) != 1) {
+            /* The short guide; dashboard-files.md beside the launcher is the long one. */
+            theme_text_wrapped(line,
+                "Your dashboard comes from your own Xbox: its C: drive, running dashboard"
+                " 5960 (System Info shows D:1.00.5960.01). From an Xbox: softmod it, copy C:"
+                " over FTP (EvoX, UnleashX, XBMC), then choose that folder. In xemu: if"
+                " you installed your dashboard there, choose its disk image. Step by"
+                " step: dashboard-files.md, beside this launcher.",
+                12, THEME_TEXT_DIM);
+        } else if (state == 2 && g_live_result.message[0]) {
             snprintf(text, sizeof text, "%s%s", g_live_result.message,
                      g_live_result.outcome == INSIGNIA_REGISTERED
                          ? " Start the game and sign in from its Xbox Live menu."
