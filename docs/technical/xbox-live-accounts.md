@@ -95,13 +95,14 @@ Sent as a fixed 0x4E bytes; reply buffer 0x208. No machine ID.
 | Offset | Size | Field |
 | --- | --- | --- |
 | 0x00 | 8 | machine ID |
+| 0x08 | 4 | zero |
 | 0x0C | 4+4 | two dwords from the caller's `+0x24`/`+0x28` *(to confirm)* |
 | 0x14 | 1, 1 | owner record `+0x8DA`, `+0x8DB` *(language, opt-in?)* |
 | 0x16 | 1 | owner `+0x500` *(country?)* |
 | 0x17 | 2 | from `sub_7CADD` *(a locale or time-zone word?)* |
 | 0x19 | 1 | owner `+0x5EA` *(card type?)* |
 | 0x1A | 4+4 | owner `+0x61C`, `+0x620` *(a FILETIME: card expiry?)* |
-| 0x22 | text x 19 | owner `+0x0` (64 chars), `+0x80` (64), `+0x100` (128), `+0x200` (128), `+0x300` (128), `+0x400` (64), `+0x480` (64), `+0x502` (16), `+0x522` (12), `+0x53A` (12), `+0x552` (12), `+0x56A` (64), `+0x5EC` (24), `+0x624` (129), `+0x726` (64), `+0x7A6` (64), `+0x826` (64), `+0x8A6` (26), then the gamertag *(the owner fields: names, street lines, city, state, postal code, phone, card holder, card number, e-mail, bank fields?)* |
+| 0x22 | text x 19 | the gamertag (the caller's argument), then 18 owner-record fields: `+0x0` (64 chars), `+0x80` (64), `+0x100` (128), `+0x200` (128), `+0x300` (128), `+0x400` (64), `+0x480` (64), `+0x502` (16), `+0x522` (12), `+0x53A` (12), `+0x552` (12), `+0x56A` (64), `+0x5EC` (24), `+0x624` (129), `+0x726` (64), `+0x7A6` (64), `+0x826` (64), `+0x8A6` (26) *(names, street lines, city, state, postal code, phone, card holder, card number, e-mail, bank fields?)* |
 
 Field sizes are the widths of the owner record's text slots, in UTF-16
 characters. **The reply** (0x244 bytes, read by `sub_121F40`) is the account:
