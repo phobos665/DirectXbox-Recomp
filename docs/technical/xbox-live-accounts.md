@@ -163,6 +163,12 @@ the dashboard's own library (MACS, AS, TGS, two security gateways):
   next sign-up scene (0x29) whenever the result is not a failure. So an
   `X-Err: 1` answer with no body is accepted as a console would accept it.
 
+- **Insignia checks the code at `createowneracct`, not before.**
+  `verifyvouchergetoffer` answers `X-Err: 00000001` for a made-up code
+  exactly as for a real one. `createowneracct` with a code and e-mail that
+  do not match answers `HTTP/1.1 500` with `X-Err: 80154007`, and the task
+  fails with that HRESULT.
+
 **Owner-record fields confirmed in the dashboard's validators:** the card
 type at `+0x5EA` and card number at `+0x5EC` (`sub_5A49A`), the **e-mail**
 at `+0x624` (`sub_5A8D4`, which searches for `@`). The sign-up state passes
