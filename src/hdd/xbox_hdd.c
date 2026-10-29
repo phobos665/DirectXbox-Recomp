@@ -565,3 +565,99 @@ uint8_t *xbox_fatx_read_file(XboxFatx *v, const char *path, uint32_t *size)
         }
     }
 }
+
+/* ---- SHA-1 -------------------------------------------------------------- */
+
+typedef struct { uint32_t h[5]; uint64_t n; uint8_t buf[64]; size_t used; } Sha1;
+
+static uint32_t rol(uint32_t x, int k) { return x << k | x >> (32 - k); }
+
+static void sha1_block(Sha1 *s, const uint8_t *p)
+{
+    uint32_t w[80], a, b, c, d, e, t;
+    int i;
+
+    for (i = 0; i < 16; i++)
+        w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 |
+               (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+    for (i = 16; i < 80; i++)
+        w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3]; e = s->h[4];
+    for (i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20)      { f = (b & c) | (~b & d);           k = 0x5A827999u; }
+        else if (i < 40) { f = b ^ c ^ d;                    k = 0x6ED9EBA1u; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d);  k = 0x8F1BBCDCu; }
+        else             { f = b ^ c ^ d;                    k = 0xCA62C1D6u; }
+        t = rol(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = rol(b, 30); b = a; a = t;
+    }
+    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d; s->h[4] += e;
+}
+
+static void sha1_init(Sha1 *s)
+{
+    static const uint32_t h0[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u };
+    memcpy(s->h, h0, sizeof h0);
+    s->n = 0;
+    s->used = 0;
+}
+
+static void sha1_update(Sha1 *s, const uint8_t *p, size_t len)
+{
+    s->n += len;
+    while (len) {
+        size_t take = 64 - s->used < len ? 64 - s->used : len;
+        memcpy(s->buf + s->used, p, take);
+        s->used += take;
+        p += take;
+        len -= take;
+        if (s->used == 64) {
+            sha1_block(s, s->buf);
+            s->used = 0;
+        }
+    }
+}
+
+static void sha1_final(Sha1 *s, uint8_t out[20])
+{
+    uint64_t bits = s->n * 8u;
+    uint8_t pad = 0x80, zero = 0, len[8];
+    int i;
+
+    sha1_update(s, &pad, 1);
+    while (s->used != 56)
+        sha1_update(s, &zero, 1);
+    for (i = 0; i < 8; i++)
+        len[i] = (uint8_t)(bits >> (56 - 8 * i));
+    sha1_update(s, len, 8);
+    for (i = 0; i < 20; i++)
+        out[i] = (uint8_t)(s->h[i / 4] >> (24 - 8 * (i % 4)));
+}
+
+void xbox_hdd_sha1(const void *data, size_t len, uint8_t out[20])
+{
+    Sha1 s;
+    sha1_init(&s);
+    sha1_update(&s, data, len);
+    sha1_final(&s, out);
+}
+
+int xbox_hdd_sha1_file(const char *path, uint8_t out[20], uint64_t *size)
+{
+    uint8_t buf[65536];
+    size_t got;
+    Sha1 s;
+    FILE *f = fopen(path, "rb");
+
+    if (!f)
+        return 0;
+    sha1_init(&s);
+    while ((got = fread(buf, 1, sizeof buf, f)) > 0)
+        sha1_update(&s, buf, got);
+    fclose(f);
+    if (size)
+        *size = s.n;
+    sha1_final(&s, out);
+    return 1;
+}

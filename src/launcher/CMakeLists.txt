@@ -126,6 +126,10 @@ function(recomp_add_launcher TARGET GAME_EXE)
     # finds the console the game will be (launcher.c, live_console).
     target_sources(${TARGET} PRIVATE ${_dir}/../kernel/xbox_console_id.c)
     target_include_directories(${TARGET} PRIVATE ${_dir}/../kernel ${_dir}/..)
+    # The player's own dashboard, copied off their xemu disk image
+    # (launcher.c, dash_choose).
+    target_sources(${TARGET} PRIVATE ${_dir}/../hdd/xbox_hdd.c)
+    target_include_directories(${TARGET} PRIVATE ${_dir}/../hdd)
     if(WIN32)
         # The rest is in every Windows.
         # ole32 for the open dialog a self-building release asks with;

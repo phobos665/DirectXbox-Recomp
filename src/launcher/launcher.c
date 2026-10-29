@@ -30,6 +30,7 @@
 #include <dirent.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>         /* unlink, rmdir: a dashboard copy redone */
 #endif
 #if defined(__APPLE__)
 #include <ftw.h>
@@ -44,6 +45,7 @@
 #include "net_upnp.h"
 #include "insignia_register.h"
 #include "xbox_console_id.h"
+#include "xbox_hdd.h"
 #include "platform/host_main.h"
 
 #ifndef LAUNCHER_GAME_EXE
@@ -140,6 +142,13 @@ static uint64_t      g_copied_until;    /* "copied" shown until then */
 
 static void live_register(void);
 static void live_refresh(void);
+static void dash_choose(void);
+static void dash_refresh(void);
+static char           g_dash_value[64];  /* what the Dashboard row says */
+static char           g_dash_note[300];  /* what the panel says about it */
+static volatile long  g_dash_state;      /* 0 idle, 1 copying, 2 finished */
+static volatile long  g_dash_files;      /* copied so far */
+static int            g_pick_dash;       /* the open dialog is the Dashboard row's */
 static char           g_live_value[64];  /* what the Register row says */
 static char           g_live_console[200]; /* which console this PC is */
 static int            g_live_stale = 1;  /* look at the console again */
@@ -319,6 +328,13 @@ static void build_link_rows(void)
                    " setup assistant does on a real console. Once per console;"
                    " the game can sign in after it.";
         r->kind  = ROW_ACTION; r->text = g_live_value; r->action = live_register;
+        r++;
+
+        r->label = "Dashboard";
+        r->help  = "Your own copy of the Xbox dashboard (5960) makes your Xbox Live"
+                   " account and installs title updates. Choose the xemu hard disk"
+                   " image it is on: its C: drive is copied out and checked.";
+        r->kind  = ROW_ACTION; r->text = g_dash_value; r->action = dash_choose;
         r++;
     }
     if (g_link_mode == LINK_HOST) {
@@ -1306,6 +1322,14 @@ static void link_tab_tick(void)
     if (g_link_mode == LINK_LIVE && (g_live_stale || live != live_seen))
         live_refresh();
     live_seen = live;
+    {
+        static long dash_seen = -1, files_seen = -1;
+        long dash = lhost_read(&g_dash_state), files = lhost_read(&g_dash_files);
+        if (g_link_mode == LINK_LIVE && (dash != dash_seen || (dash == 1 && files != files_seen)))
+            dash_refresh();
+        dash_seen = dash;
+        files_seen = files;
+    }
     if (!g_lan_addr[0] && !net_local_address(g_lan_addr, sizeof g_lan_addr))
         snprintf(g_lan_addr, sizeof g_lan_addr, "?");
     /* Only this thread moves it off 0, so asking and starting are one. */
@@ -1474,6 +1498,226 @@ static void live_register(void)
         lhost_publish(&g_live_state, 0);
     }
     g_live_stale = 1;
+}
+
+/* ---- the player's own dashboard, copied off their xemu disk image ---- */
+
+/* The 5960 online dashboard (xodash\xonlinedash.xbe), by size and SHA-1: the
+ * build docs/technical/xbox-live-accounts.md describes. */
+static const uint8_t k_dash_sha1[20] = {
+    0x6b, 0x9d, 0x11, 0x91, 0x85, 0xdc, 0xab, 0x48, 0xb6, 0x2d,
+    0xb7, 0xf5, 0xaf, 0xdc, 0xfd, 0x74, 0x52, 0xfb, 0x4b, 0x39,
+};
+#define DASH_ONLINE_SIZE 2617344u
+
+static int dash_dir(char *out, size_t n, const char *leaf)
+{
+    char dir[LAUNCHER_PATH];
+
+    if (!recomp_config_user_dir(dir, sizeof dir))
+        return 0;
+#ifdef _WIN32
+    snprintf(out, n, "%s\\%s", dir, leaf);
+#else
+    snprintf(out, n, "%s/%s", dir, leaf);
+#endif
+    return 1;
+}
+
+/* 1 when folder holds the 5960 online dashboard; 0 with why in note. */
+static int dash_check(const char *folder, char *note, size_t n)
+{
+    char path[LAUNCHER_PATH + 64];
+    uint8_t sha[20];
+    uint64_t size = 0;
+
+#ifdef _WIN32
+    snprintf(path, sizeof path, "%s\\xodash\\xonlinedash.xbe", folder);
+#else
+    snprintf(path, sizeof path, "%s/xodash/xonlinedash.xbe", folder);
+#endif
+    if (!xbox_hdd_sha1_file(path, sha, &size)) {
+        snprintf(note, n, "No online dashboard (xodash\\xonlinedash.xbe) on that C: drive:"
+                 " install the 5960 dashboard in xemu first.");
+        return 0;
+    }
+    if (size != DASH_ONLINE_SIZE || memcmp(sha, k_dash_sha1, sizeof sha) != 0) {
+        snprintf(note, n, "That dashboard is not version 5960, the one Insignia needs"
+                 " (System Info should show D:1.00.5960.01).");
+        return 0;
+    }
+    return 1;
+}
+
+static void dash_refresh(void)
+{
+    char dir[LAUNCHER_PATH];
+    long state = lhost_read(&g_dash_state);
+
+    if (state == 1) {
+        snprintf(g_dash_value, sizeof g_dash_value, "Copying... %ld files",
+                 lhost_read(&g_dash_files));
+        return;
+    }
+    if (dash_dir(dir, sizeof dir, "dashboard") && dash_check(dir, g_dash_note, sizeof g_dash_note)) {
+        snprintf(g_dash_value, sizeof g_dash_value, "Dashboard 5960 ready");
+        if (state != 2)
+            snprintf(g_dash_note, sizeof g_dash_note,
+                     "Your dashboard is ready. Choose the row again to copy another.");
+    } else {
+        snprintf(g_dash_value, sizeof g_dash_value, "Choose your xemu disk image");
+        if (state != 2)
+            g_dash_note[0] = '\0';
+    }
+}
+
+static int dash_progress(const char *path, void *ctx)
+{
+    (void)path;
+    (void)ctx;
+    lhost_publish(&g_dash_files, lhost_read(&g_dash_files) + 1);
+    return 0;
+}
+
+static char g_dash_image[LAUNCHER_PATH];
+
+/* Whether path is one of the two folders this job makes and may delete. */
+static int dash_ours(const char *path)
+{
+    size_t n = strlen(path);
+    return (n > 13 && strcmp(path + n - 13, "dashboard.new") == 0) ||
+           (n > 13 && strcmp(path + n - 13, "dashboard.old") == 0);
+}
+
+static void remove_tree(const char *path, int depth)
+{
+#ifdef _WIN32
+    char pat[LAUNCHER_PATH + 8], sub[LAUNCHER_PATH + 300];
+    WIN32_FIND_DATAA fd;
+    HANDLE f;
+
+    if (depth > 40)
+        return;
+    snprintf(pat, sizeof pat, "%s\\*", path);
+    f = FindFirstFileA(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+                continue;
+            snprintf(sub, sizeof sub, "%s\\%s", path, fd.cFileName);
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                remove_tree(sub, depth + 1);
+            else
+                DeleteFileA(sub);
+        } while (FindNextFileA(f, &fd));
+        FindClose(f);
+    }
+    RemoveDirectoryA(path);
+#else
+    char sub[LAUNCHER_PATH + 300];
+    struct dirent *e;
+    struct stat st;
+    DIR *d;
+
+    if (depth > 40 || lstat(path, &st) != 0)
+        return;
+    if (!S_ISDIR(st.st_mode)) {
+        unlink(path);
+        return;
+    }
+    d = opendir(path);
+    while (d && (e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        snprintf(sub, sizeof sub, "%s/%s", path, e->d_name);
+        remove_tree(sub, depth + 1);      /* lstat: a link is unlinked, not followed */
+    }
+    if (d)
+        closedir(d);
+    rmdir(path);
+#endif
+}
+
+/* Remove a folder this job made, and nothing else. */
+static void dash_remove(const char *path)
+{
+    if (dash_ours(path))
+        remove_tree(path, 0);
+}
+
+static void dash_thread(void)
+{
+    char err[300], fresh[LAUNCHER_PATH], dest[LAUNCHER_PATH], old[LAUNCHER_PATH];
+    XboxHdd *h = NULL;
+    XboxFatx *v = NULL;
+    long n = -1;
+
+    err[0] = '\0';
+    if (!dash_dir(fresh, sizeof fresh, "dashboard.new") || !dash_dir(dest, sizeof dest, "dashboard") ||
+        !dash_dir(old, sizeof old, "dashboard.old")) {
+        snprintf(err, sizeof err, "No settings folder to copy the dashboard into.");
+    } else if (!(h = xbox_hdd_open(g_dash_image, err, sizeof err))) {
+        /* err says why */
+    } else if (!(v = xbox_fatx_open(h, XBOX_HDD_C_OFFSET, XBOX_HDD_C_SIZE, err, sizeof err))) {
+        /* not an Xbox disk, or C: is not formatted */
+    } else {
+        recomp_make_dirs(fresh);
+        dash_remove(fresh);
+        n = xbox_fatx_extract(v, fresh, dash_progress, NULL, err, sizeof err);
+    }
+    xbox_fatx_close(v);
+    xbox_hdd_close(h);
+    if (n >= 0 && dash_check(fresh, err, sizeof err)) {
+        dash_remove(old);
+        rename(dest, old);                 /* the one before, if any */
+        if (rename(fresh, dest) == 0) {
+            dash_remove(old);
+            snprintf(g_dash_note, sizeof g_dash_note, "Copied %ld files from the image's"
+                     " C: drive: dashboard 5960, ready.", n);
+        } else {
+            rename(old, dest);
+            snprintf(g_dash_note, sizeof g_dash_note, "Could not put the dashboard in place (%s).", dest);
+        }
+    } else {
+        if (n >= 0)
+            dash_remove(fresh);
+        snprintf(g_dash_note, sizeof g_dash_note, "%s", err[0] ? err : "The copy did not finish.");
+    }
+    lhost_publish(&g_dash_state, 2);
+}
+
+/* The Dashboard row: ask for the image. */
+static void dash_choose(void)
+{
+    if (lhost_read(&g_dash_state) == 1)
+        return;
+    g_pick_dash = 1;
+    if (!lhost_pick(0)) {
+        g_pick_dash = 0;
+        snprintf(g_dash_note, sizeof g_dash_note, "No file dialog here. Copy your dashboard"
+                 " into the settings folder's dashboard/ by hand (docs/dashboard-files.md).");
+        lhost_publish(&g_dash_state, 2);
+    }
+}
+
+/* What the dialog gave for the Dashboard row. */
+static void dash_picked(const char *path)
+{
+    g_pick_dash = 0;
+    if (!path) {
+        snprintf(g_dash_note, sizeof g_dash_note, "Nothing chosen.");
+        lhost_publish(&g_dash_state, 2);
+        return;
+    }
+    snprintf(g_dash_image, sizeof g_dash_image, "%s", path);
+    lhost_publish(&g_dash_files, 0);
+    lhost_publish(&g_dash_state, 1);
+    snprintf(g_dash_note, sizeof g_dash_note, "Copying the C: drive off %s...", path);
+    if (!lhost_thread(dash_thread)) {
+        snprintf(g_dash_note, sizeof g_dash_note, "Could not start the copy.");
+        lhost_publish(&g_dash_state, 2);
+    }
 }
 
 /* After the mode row moved: the list is a different length now. */
@@ -1813,6 +2057,11 @@ static void draw_link(void)
         snprintf(text, sizeof text, "Console      %s", g_live_console);
         theme_text_wrapped(line, text, 12, THEME_TEXT);
         line.y += 64; line.h = 100;
+        if (g_dash_note[0]) {
+            theme_text_wrapped(line, g_dash_note, 12, THEME_TEXT);
+            line.y += 40;
+            line.h = 60;
+        }
         if (state == 2 && g_live_result.message[0]) {
             snprintf(text, sizeof text, "%s%s", g_live_result.message,
                      g_live_result.outcome == INSIGNIA_REGISTERED
@@ -2214,6 +2463,10 @@ static void setup_char(unsigned ch)
 
 void launcher_picked(const char *path)
 {
+    if (g_pick_dash) {
+        dash_picked(path);
+        return;
+    }
     if (!path) {
         snprintf(g_rel_note, sizeof g_rel_note,
                  "Nothing chosen. If no dialog appeared, type or paste the path in the box.");

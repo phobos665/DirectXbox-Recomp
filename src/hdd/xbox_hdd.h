@@ -54,6 +54,11 @@ long xbox_fatx_extract(XboxFatx *v, const char *dest,
  * case-insensitively. malloc'd; NULL when it is not there. */
 uint8_t *xbox_fatx_read_file(XboxFatx *v, const char *path, uint32_t *size);
 
+/* SHA-1 (FIPS 180-4), for telling a file is the one expected. */
+void xbox_hdd_sha1(const void *data, size_t len, uint8_t out[20]);
+/* The same of a host file; 1 when it was read. */
+int xbox_hdd_sha1_file(const char *path, uint8_t out[20], uint64_t *size);
+
 #ifdef __cplusplus
 }
 #endif

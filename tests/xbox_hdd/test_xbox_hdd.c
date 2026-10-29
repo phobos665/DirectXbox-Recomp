@@ -212,6 +212,18 @@ int main(int argc, char **argv)
           "no volume: '%s'", err);
     xbox_hdd_close(h);
 
+    {   /* SHA-1's known answers (FIPS 180 examples). */
+        uint8_t d[20];
+        static const uint8_t abc[20] = { 0xa9,0x99,0x3e,0x36,0x47,0x06,0x81,0x6a,0xba,0x3e,
+                                         0x25,0x71,0x78,0x50,0xc2,0x6c,0x9c,0xd0,0xd8,0x9d };
+        static const uint8_t two[20] = { 0x84,0x98,0x3e,0x44,0x1c,0x3b,0xd2,0x6e,0xba,0xae,
+                                         0x4a,0xa1,0xf9,0x51,0x29,0xe5,0xe5,0x46,0x70,0xf1 };
+        xbox_hdd_sha1("abc", 3, d);
+        CHECK(!memcmp(d, abc, 20), "SHA-1 of abc");
+        xbox_hdd_sha1("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56, d);
+        CHECK(!memcmp(d, two, 20), "SHA-1 of the two-block example");
+    }
+
     free(g_vol);
     if (failures) {
         printf("%d failure(s)\n", failures);
