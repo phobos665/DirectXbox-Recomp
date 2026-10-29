@@ -6,9 +6,15 @@ is written onto the game's disk, so no dashboard is needed. Registering the
 console is done (`docs/technical/xbox-live.md`, "With no backup"); this is the
 step after it.
 
-**Status (29 Oct 2026):** the protocol's shape is read out of the 5960 online
-dashboard (`xodash/xonlinedash.xbe`, from a console's C: drive; studied only,
-never shipped). The core requests are mapped (below). Nothing has been sent.
+**Status (29 Oct 2026): an Insignia account made with no dashboard UI and no
+console backup.** A generated console, registered with `insignia_register.c`,
+signed in by the recompiled 5960 online dashboard's own Xbox Live library;
+then `reservename`, `verifyvouchergetoffer` and `createowneracct` made from
+`titles/xodash-online` (`RECOMP_XUACS_DRIVE`). Insignia answered with the
+account, and the library wrote it to the disk image: the user in sector 12
+(domain `insignia.live`, realm `PASSPORT.NET`) beside the machine account in
+sector 9. The terms of use are not accepted yet, and no game has signed in
+with it yet.
 
 ## What the dashboard does
 
