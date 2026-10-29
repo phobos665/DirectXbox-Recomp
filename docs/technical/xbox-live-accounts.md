@@ -8,7 +8,7 @@ step after it.
 
 **Status (29 Oct 2026):** the protocol's shape is read out of the 5960 online
 dashboard (`xodash/xonlinedash.xbe`, from a console's C: drive; studied only,
-never shipped). Request bodies are being mapped. Nothing has been sent.
+never shipped). The core requests are mapped (below). Nothing has been sent.
 
 ## What the dashboard does
 
@@ -58,15 +58,82 @@ Binary, little-endian, built field by field into the request buffer:
   65001), preceded by its length as a **16-bit** count; an empty field is
   just a zero length.
 
-`createowneracct` (`sub_12248A`): a 0x1688-byte request; copies dwords from
-the caller's `+0x24`/`+0x28`, bytes and words from the owner record
-(`+0x500`, `+0x5EA`, `+0x61C`, `+0x620`, `+0x8DA`, `+0x8DB`), then about twenty
-text fields from the owner record (`+0x0`, `+0x80`, `+0x100`, `+0x200`,
-`+0x300`, `+0x400`, `+0x480`, `+0x502`, `+0x522`, `+0x53A`, `+0x552`, `+0x56A`,
-`+0x5EC`, `+0x624`, `+0x726`, `+0x7A6`, `+0x826`, `+0x8A6`), a last one from the
-request itself, and an optional flag and dword from the caller's `+0x20`. Its
-answer is read into a 0x244-byte buffer by `sub_121F40`. Which field is which
-(names, address, email, the code) is the next thing to map.
+Every request goes out through `sub_1152B4` (service, path, reply buffer and
+size, body and size, a timeout of 180 000 ms), directly or by way of the
+request object `sub_12CF6D` sets up. Most bodies start with the console's
+**machine ID**, 8 bytes the library keeps at `+0x24` of its state
+(`sub_10ED3B`): the machine account's ID.
+
+## The requests, field by field
+
+Offsets are into the body. "Text" is a 16-bit length and UTF-8. What a field
+*means* is marked *(to confirm)* where only its place is known; the live
+capture settles those.
+
+**`reservename`** (near `0x121DBC`): hold a gamertag, and get alternatives.
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0x00 | 8 | machine ID |
+| 0x08 | 1 | a flag from the caller *(to confirm)* |
+| 0x09 | 2 | how many alternative names to send back |
+| 0x0B | text | the gamertag |
+
+Reply buffer: `count * 20 + 0x202` bytes, room for the alternatives.
+
+**`verifyvouchergetoffer`** (`sub_121B61`): check the subscription code.
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0x00 | 1 | a byte from the caller: the country *(to confirm)* |
+| 0x01 | text | the subscription code |
+
+Sent as a fixed 0x4E bytes; reply buffer 0x208. No machine ID.
+
+**`createowneracct`** (`sub_12248A`): create the account.
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0x00 | 8 | machine ID |
+| 0x0C | 4+4 | two dwords from the caller's `+0x24`/`+0x28` *(to confirm)* |
+| 0x14 | 1, 1 | owner record `+0x8DA`, `+0x8DB` *(language, opt-in?)* |
+| 0x16 | 1 | owner `+0x500` *(country?)* |
+| 0x17 | 2 | from `sub_7CADD` *(a locale or time-zone word?)* |
+| 0x19 | 1 | owner `+0x5EA` *(card type?)* |
+| 0x1A | 4+4 | owner `+0x61C`, `+0x620` *(a FILETIME: card expiry?)* |
+| 0x22 | text x 19 | owner `+0x0` (64 chars), `+0x80` (64), `+0x100` (128), `+0x200` (128), `+0x300` (128), `+0x400` (64), `+0x480` (64), `+0x502` (16), `+0x522` (12), `+0x53A` (12), `+0x552` (12), `+0x56A` (64), `+0x5EC` (24), `+0x624` (129), `+0x726` (64), `+0x7A6` (64), `+0x826` (64), `+0x8A6` (26), then the gamertag *(the owner fields: names, street lines, city, state, postal code, phone, card holder, card number, e-mail, bank fields?)* |
+
+Field sizes are the widths of the owner record's text slots, in UTF-16
+characters. **The reply** (0x244 bytes, read by `sub_121F40`) is the account:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0x00 | 8 | the user's ID (XUID) |
+| 0x08 | 16 | the account key |
+| 0x18 | 20 | Kerberos domain |
+| 0x2C | 24 | Kerberos realm |
+
+from which the library builds the stored account record (ID, gamertag at
+0x0C, options and PIN from the caller, domain at 0x24, realm at 0x38, key at
+0x50, the time at 0x60) and writes it to the disk (`sub_119A79`). That is the
+108-byte record of the config area's user sectors, so once Insignia answers
+this request the account can be written exactly as the console writes it.
+
+**`accepttou`** (`sub_12180E`): 16 bytes, the user's ID (from the signed-in
+users, `0x70` bytes each) and the machine ID. So the new account is signed in
+before the terms are accepted. Reply buffer 0x200.
+
+**`setuserpin`** (`sub_122746`): 8 bytes, the user's ID. **The PIN is not
+sent**: it stays in the record (options bit 0, the passcode at 0x20). The
+reply (0x210, `sub_121FFD`) carries a new 16-byte account key, which goes into
+the record at 0x50 before it is written again.
+
+## The order
+
+From the dependencies above: sign in as the machine; `reservename`;
+`verifyvouchergetoffer`; (`setpaymentinfo`, Insignia's test card); 
+`createowneracct`, write the account; sign in as the new user; `accepttou`;
+`setuserpin` if a PIN is wanted. To check against the live capture.
 
 ## Plan
 
