@@ -13,8 +13,11 @@ then `reservename`, `verifyvouchergetoffer` and `createowneracct` made from
 `titles/xodash-online` (`RECOMP_XUACS_DRIVE`). Insignia answered with the
 account, and the library wrote it to the disk image: the user in sector 12
 (domain `insignia.live`, realm `PASSPORT.NET`) beside the machine account in
-sector 9. The terms of use are not accepted yet, and no game has signed in
-with it yet.
+sector 9. **Rainbow Six 3 (with update 0x501) then signed in with it**: AS
+and TGS with Insignia and a security-gateway session, the console named with
+`console_dir` and the disk with `RECOMP_SAVE_DIR`. Insignia did not ask for
+the terms of use first (`accepttou` was never sent). Nothing in the chain came
+from a real console.
 
 ## What the dashboard does
 
