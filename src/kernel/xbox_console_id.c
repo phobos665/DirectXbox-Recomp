@@ -1,21 +1,34 @@
 /**
- * The console's own identity, from the player's backup of a real console.
+ * The console's own identity, from the player's backup of a real console, or
+ * generated once for this install.
  *
- * Without one, every install is the same made-up console: serial
+ * Without either, every install is the same made-up console: serial
  * 100000000000, a random Ethernet address per save folder, and zeroed online
  * and hard disk keys. That is enough for System Link between recompiled
  * builds. Xbox Live is not: the title's own XOnline code creates the
  * console's machine account from the serial and the online key, and
  * Insignia registers a console by its keys and refuses one whose hard disk
- * key is zero. So the identity has to be a real console's, the player's own,
- * which they back up from their console (EvoX, UnleashX, XBMC: an
- * eeprom.bin, and the HDD key the same tools show).
+ * key is zero. The player's own console's identity works (they back it up
+ * with EvoX, UnleashX or XBMC: an eeprom.bin, and the HDD key the same tools
+ * show), and so does one made up properly, as hakuX makes its consoles:
+ *
+ *     console_identity = generate | backup      [RECOMP_CONSOLE_IDENTITY]
+ *
+ * generate (the default when syslink = nat, Xbox Live) makes a console in the
+ * settings folder's console/ when no backup is found anywhere below: twelve
+ * random digits for the serial, 00:50:F2 and three random bytes for the
+ * Ethernet address, sixteen random bytes for the online key, and hakuX's HDD
+ * key, which every generated console shares (see xbox_console_generate).
+ * Made once and kept: to Insignia a new identity is a new console, and a
+ * stream of them looks like ban evasion, so nothing here ever replaces one.
+ * backup (the default otherwise) only ever uses a backup.
  *
  * Where it is looked for, first found wins:
  *
  *     console_dir = <folder>        [RECOMP_CONSOLE_DIR]   (off: none at all)
  *     <the game folder>/../xboxbackup/
  *     <the per-user settings folder>/console/
+ *     ... and, with console_identity = generate, a new console made there
  *
  * In that folder:
  *
@@ -24,10 +37,12 @@
  *     hddinfo.txt   EvoX's, read for its "XboxHDKey" line and the drive's
  *                   serial and model.
  *     hd_key.txt    or the HDD key alone, 32 hex digits.
+ *     generated     only in a generated console's folder, saying it is one.
  *
- * and the HDD key from keys.ini (hd_key = ...) or RECOMP_XBOX_HD_KEY wins
- * over both. The key in eeprom.bin itself is encrypted with the BIOS's
- * EEPROM key, which is not needed when the decrypted key is given.
+ * and for a backup the HDD key from keys.ini (hd_key = ...) or
+ * RECOMP_XBOX_HD_KEY wins over both. The key in eeprom.bin itself is
+ * encrypted with the BIOS's EEPROM key, which is not needed when the
+ * decrypted key is given.
  *
  * And disk.bin, the first 512 KB of the console's drive (EvoX), whose
  * Xbox Live accounts are copied onto the runtime's disk image once
@@ -54,6 +69,8 @@
 #include "recomp_config.h"
 
 #ifdef _WIN32
+#include <windows.h>
+#include <bcrypt.h>
 #define SEP "\\"
 #define strtok_r strtok_s
 #else
@@ -70,6 +87,7 @@
 #define EE_SERIAL        0x34
 #define EE_MAC           0x40
 #define EE_ONLINE_KEY    0x48
+#define EE_VIDEO_STD     0x58
 #define EE_USER_SUM      0x60
 #define EE_USER          0x64
 #define EE_USER_END      0xC0
@@ -95,17 +113,156 @@ static uint32_t le32(const uint8_t *p)
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
-static int is_dir_with_eeprom(const char *dir)
+static int file_in_dir(const char *dir, const char *name)
 {
     char path[1100];
     FILE *f;
 
-    snprintf(path, sizeof path, "%s" SEP "eeprom.bin", dir);
+    snprintf(path, sizeof path, "%s" SEP "%s", dir, name);
     f = fopen(path, "rb");
     if (!f)
         return 0;
     fclose(f);
     return 1;
+}
+
+static int is_dir_with_eeprom(const char *dir)
+{
+    return file_in_dir(dir, "eeprom.bin");
+}
+
+/* ---- a console of this install's own ---------------------------------- */
+
+/* hakuX's (native/kernel/ex.c, k_legacy_hd_key; GPL-3.0-or-later): the ASCII
+ * digits 0000000001, then 00 50 F2 00 00 01. Shared by every generated
+ * console, on purpose. The machine key is the online key under a keystream
+ * from the HDD key, so a unique online key still makes a unique console to
+ * Insignia, which finds a console by its serial; hakuX players sign in with
+ * this key; and one key everywhere lets console-bound saves move between
+ * hakuX and these builds. What it costs: every install is one console to
+ * content locked to a console, and an account key on the disk is protected
+ * only by a key anyone can read here. Non-zero, which Insignia requires. */
+const uint8_t xbox_console_generated_hd_key[16] = {
+    '0', '0', '0', '0', '0', '0', '0', '0', '0', '1',
+    0x00, 0x50, 0xF2, 0x00, 0x00, 0x01,
+};
+
+static int random_bytes(uint8_t *p, size_t n)
+{
+#ifdef _WIN32
+    return BCryptGenRandom(NULL, p, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+#else
+    FILE *f = fopen("/dev/urandom", "rb");
+    size_t got = 0;
+    if (f) {
+        got = fread(p, 1, n, f);
+        fclose(f);
+    }
+    return got == n;
+#endif
+}
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+/* Write a file whole or not at all: into name.new, then renamed over. */
+static int write_whole(const char *dir, const char *name, const void *data, size_t len)
+{
+    char path[1100], tmp[1110];
+    FILE *f;
+    int ok;
+
+    snprintf(path, sizeof path, "%s" SEP "%s", dir, name);
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    f = fopen(tmp, "wb");
+    if (!f)
+        return 0;
+    ok = fwrite(data, 1, len, f) == len;
+    ok = fflush(f) == 0 && ok;
+    ok = fclose(f) == 0 && ok;
+    if (ok)
+        ok = rename(tmp, path) == 0;
+    if (!ok)
+        remove(tmp);
+    return ok;
+}
+
+int xbox_console_generate(const char *dir)
+{
+    uint8_t ee[256], r[64];
+    char hex[40];
+    size_t used = 0;
+    int i, n;
+
+    /* Anything of a console's already here is the player's, or an identity
+     * Insignia may know: never written over. */
+    if (file_in_dir(dir, "eeprom.bin") || file_in_dir(dir, "hd_key.txt") ||
+        file_in_dir(dir, "hddinfo.txt"))
+        return 0;
+    if (!recomp_make_dirs(dir))
+        return 0;
+    memset(ee, 0, sizeof ee);
+    if (!random_bytes(r, sizeof r))
+        return 0;
+
+    /* Twelve digits, each from a byte below 250 so none is likelier. */
+    for (n = 0; n < 12; ) {
+        if (used == sizeof r) {
+            if (!random_bytes(r, sizeof r))
+                return 0;
+            used = 0;
+        }
+        if (r[used] < 250)
+            ee[EE_SERIAL + n++] = (uint8_t)('0' + r[used] % 10);
+        used++;
+    }
+    /* Microsoft's prefix, as a real console's, then 24 random bits, unicast. */
+    ee[EE_MAC + 0] = 0x00; ee[EE_MAC + 1] = 0x50; ee[EE_MAC + 2] = 0xF2;
+    if (!random_bytes(ee + EE_MAC + 3, 3) || !random_bytes(ee + EE_ONLINE_KEY, 16))
+        return 0;
+    put_le32(ee + EE_VIDEO_STD, 0x00400100u);         /* NTSC-M; the kernel
+                                                       * answers the title's own */
+    put_le32(ee + EE_FACTORY_SUM, xbox_eeprom_checksum(ee + EE_FACTORY,
+                                                       EE_FACTORY_END - EE_FACTORY));
+    /* The user section is the runtime's to fill (kernel_xbox.c lays its
+     * settings over it on every read); only its checksum is needed here. */
+    put_le32(ee + EE_USER_SUM, xbox_eeprom_checksum(ee + EE_USER, EE_USER_END - EE_USER));
+    /* The security section (0x00-0x2F) stays zero: a real one is encrypted
+     * with the BIOS's EEPROM key, which this runtime does not have, and the
+     * HDD key it would hold is read from hd_key.txt instead. */
+
+    for (i = 0; i < 16; i++)
+        snprintf(hex + 2 * i, 3, "%02X", xbox_console_generated_hd_key[i]);
+    hex[32] = '\n';
+    /* eeprom.bin last: it is what makes the folder a console, so a failure
+     * before it leaves nothing that is used. `generated` marks the console as
+     * one of these rather than a backup (XboxConsoleId.generated). */
+    if (write_whole(dir, "hd_key.txt", hex, 33) &&
+        write_whole(dir, "generated", "console_identity = generate\n", 28) &&
+        write_whole(dir, "eeprom.bin", ee, sizeof ee))
+        return 1;
+    {
+        static const char *const made[] = { "hd_key.txt", "generated" };
+        char path[1100];
+        for (i = 0; i < 2; i++) {
+            snprintf(path, sizeof path, "%s" SEP "%s", dir, made[i]);
+            remove(path);
+        }
+    }
+    return 0;
+}
+
+static int want_generated(void)
+{
+    const char *v = recomp_config_lookup("RECOMP_CONSOLE_IDENTITY", "console_identity");
+
+    if (v && *v)
+        return _stricmp(v, "generate") == 0;
+    v = recomp_config_lookup("RECOMP_SYSLINK", "syslink");
+    return v && _stricmp(v, "nat") == 0;
 }
 
 static int hexval(int c)
@@ -269,8 +426,19 @@ static int find_dir(char *out, size_t n, const char **how)
     if (recomp_config_user_dir(base, sizeof base)) {
         snprintf(out, n, "%s" SEP "console", base);
         if (is_dir_with_eeprom(out)) {
-            *how = "the settings folder";
+            *how = file_in_dir(out, "generated") ? "generated earlier" : "the settings folder";
             return 1;
+        }
+        if (want_generated()) {
+            if (xbox_console_generate(out)) {
+                *how = "generated now";
+                return 1;
+            }
+            fprintf(stderr, "[XBOX] console identity: could not generate one in %s "
+                            "(%s); the made-up console instead\n", out,
+                    file_in_dir(out, "hd_key.txt") || file_in_dir(out, "hddinfo.txt")
+                        ? "it holds part of a backup with no eeprom.bin"
+                        : "cannot write there");
         }
     }
     *how = NULL;
@@ -295,6 +463,14 @@ static int load(XboxConsoleId *id)
         return 0;
     }
     snprintf(id->dir, sizeof id->dir, "%s", dir);
+    id->generated = file_in_dir(dir, "generated");
+    if (strcmp(how, "generated now") == 0)
+        fprintf(stderr, "[XBOX] console identity: generated a console for this "
+                        "install in %s (console_identity = generate, the default "
+                        "with syslink = nat). It is kept for good: Insignia knows "
+                        "a console by it, so keep that folder. Saves a title tied "
+                        "to the made-up console before it (zero HDD key) will "
+                        "not verify under it.\n", dir);
 
     snprintf(path, sizeof path, "%s" SEP "eeprom.bin", dir);
     f = fopen(path, "rb");
@@ -326,8 +502,10 @@ static int load(XboxConsoleId *id)
     memcpy(id->mac, id->eeprom + EE_MAC, 6);
     memcpy(id->online_key, id->eeprom + EE_ONLINE_KEY, 16);
 
-    /* The HDD key: the environment, keys.ini, then the backup's own files. */
-    env = getenv("RECOMP_XBOX_HD_KEY");
+    /* The HDD key: the environment, keys.ini, then the backup's own files.
+     * A generated console is its files alone: a key meant for a real console
+     * would pair that console's key with a made-up serial. */
+    env = id->generated ? NULL : getenv("RECOMP_XBOX_HD_KEY");
     if (env && *env) {
         if (parse_key16(env, id->hd_key)) {
             id->have_hd_key = 1;
@@ -336,7 +514,7 @@ static int load(XboxConsoleId *id)
             fprintf(stderr, "[XBOX] RECOMP_XBOX_HD_KEY is not 32 hex digits; ignored\n");
         }
     }
-    if (!id->have_hd_key) {
+    if (!id->have_hd_key && !id->generated) {
         char udir[1024];
         if (recomp_config_user_dir(udir, sizeof udir)) {
             snprintf(path, sizeof path, "%s" SEP "keys.ini", udir);
@@ -373,14 +551,20 @@ static int load(XboxConsoleId *id)
     return 1;
 }
 
+static XboxConsoleId s_id;
+static int s_state;          /* 0 not looked, 1 found, -1 none */
+
 const XboxConsoleId *xbox_ConsoleId(void)
 {
-    static XboxConsoleId id;
-    static int state;        /* 0 not looked, 1 found, -1 none */
+    if (!s_state)
+        s_state = load(&s_id) ? 1 : -1;
+    return s_state > 0 ? &s_id : NULL;
+}
 
-    if (!state)
-        state = load(&id) ? 1 : -1;
-    return state > 0 ? &id : NULL;
+void xbox_console_id_reset(void)
+{
+    s_state = 0;
+    memset(&s_id, 0, sizeof s_id);
 }
 
 /* ---- the Xbox Live accounts ------------------------------------------- */

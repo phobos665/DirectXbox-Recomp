@@ -295,7 +295,7 @@ uint32_t xbox_kernel_console_av_standard(void)
 #define XC_MAX_FACTORY 0x1FF
 #define XC_MAX_ALL     0xFFFF
 
-/* The EEPROM as this console holds it: the player's own when there is one
+/* The EEPROM as this console holds it: the player's own or a generated one
  * (xbox_console_id.c), else the made-up console's factory section. Either
  * way the user settings this runtime answers one by one (the time zone,
  * 0x64-0x8F, and language, video, audio, parental, misc, DVD region,
@@ -319,6 +319,14 @@ static void console_eeprom(uint8_t ee[256])
 
     if (id) {
         memcpy(ee, id->eeprom, 256);
+        if (id->generated) {
+            /* A generated console has no video standard of its own: the
+             * title's, as the single query answers. */
+            v = console_av_region();
+            memcpy(ee + 0x58, &v, 4);
+            v = xbox_eeprom_checksum(ee + 0x34, 0x2C);
+            memcpy(ee + 0x30, &v, 4);
+        }
     } else {
         memset(ee, 0, 256);
         xbox_ExQueryNonVolatileSetting(XC_FACTORY_SERIAL_NUMBER, &type, ee + 0x34, 12, &got);
