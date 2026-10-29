@@ -136,6 +136,28 @@ From the dependencies above: sign in as the machine; `reservename`;
 `createowneracct`, write the account; sign in as the new user; `accepttou`;
 `setuserpin` if a PIN is wanted. To check against the live capture.
 
+## Measured against Insignia (29 Oct 2026)
+
+From `titles/xodash-online` with `RECOMP_XUACS_DRIVE`, on a generated
+console registered through `insignia_register.c` (HTTP 200), signed in by
+the dashboard's own library (MACS, AS, TGS, two security gateways):
+
+- **The country list** is `/Europe/Country/CountryMaster2.INX` (also
+  `/America/...`, `/Asia/...`), service 11, a UTF-16 INI of
+  `[GB] LocaleCode="35"` entries: GB 35, US 103, DE 24, FR 34, JP 53 and 34
+  more. The country byte every account request carries is that code.
+- **`reservename`** for a free name: body machine ID, country `0x23`, count
+  5, the name; answer `HTTP/1.1 200 OK`, `Content-Type: xon/5`,
+  `Content-Length: 2`.
+- **`verifyvouchergetoffer`**: answer `HTTP/1.1 200 OK` with
+  **`X-Err: 00000001`** and no body. Xbox Live carries a request's result in
+  `X-Err`; what 1 means here is not known yet.
+- A reply buffer holds the HTTP response's headers (NUL-separated); the
+  body is not in it.
+
+The drive's file (`steps`, `gamertag`, `country`, `code`) and the log both
+hold the player's code: private files, never committed.
+
 ## Plan
 
 1. **Map each body** the account flow sends (reserve name, the code, terms,

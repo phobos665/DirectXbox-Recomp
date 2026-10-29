@@ -531,7 +531,7 @@ static void xu_dump(FILE *f, const char *what, uint32_t va, uint32_t len)
 /* The used part of a reply buffer: up to its last non-zero byte. */
 static uint32_t xu_used(uint32_t va, uint32_t size)
 {
-    if (va < 0x10000 || va >= 0x80000000u || size > 0x4000)
+    if (va < 0x10000 || va >= 0x80000000u || size > 0x100000)
         return size;
     while (size && XU_PTR(va)[size - 1] == 0)
         size--;
@@ -604,7 +604,10 @@ void sub_00120CB6(void)
  * The file names what to do, one key = value a line, and is the player's
  * own (it holds their subscription code): never commit one.
  *
- *     steps    = reserve,offer     in order; nothing else exists here
+ *     steps    = reserve,offer     in order: download, reserve, offer
+ *     download = <path>            download: a file of the dashboard's, as
+ *                                  /Europe/Country/CountryMaster2.INX
+ *     save     = <file>            download: where its bytes go
  *     gamertag = <name>            reserve: the name to hold
  *     country  = <id>              the country byte both requests carry
  *     code     = <code>            offer: the subscription code to check
@@ -613,7 +616,9 @@ void sub_00120CB6(void)
  *
  * reserve is reservename (sub_00121DBC: name, 5 alternatives, country,
  * event, &task); offer is verifyvouchergetoffer (sub_00121B61: code,
- * country, event, &task). Neither makes the account: creating one is a step
+ * country, event, &task); download is the dashboard's file download
+ * (sub_001209AF: service 11, path, buffer, size, 0, 0, timeout, event,
+ * &task), as it fetches its country list. Neither makes the account: creating one is a step
  * this file does not have. Each task is pumped (sub_0011770B) until it
  * fails, succeeds (0x001500F0) or 60 s pass, then closed (sub_00117720),
  * and the close hooks above write its answer to RECOMP_XUACS_LOG. */
@@ -621,6 +626,7 @@ extern void sub_0011770B_gen(void);
 extern void sub_00117720(void);
 extern void sub_00121DBC(void);
 extern void sub_00121B61(void);
+extern void sub_001209AF(void);
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 #include <time.h>
@@ -629,7 +635,8 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 static struct {
     int      loaded, on, busy;
-    char     steps[64], gamertag[32], code[48];
+    char     steps[64], gamertag[32], code[48], download[128], save[512];
+    uint32_t dl_buf;
     uint32_t country, start_ms;
     uint64_t first, began;
     int      step;            /* index into steps */
@@ -673,6 +680,8 @@ static void xu_load(void)
         if (!strcmp(k, "steps"))         snprintf(xd.steps, sizeof xd.steps, "%s", v);
         else if (!strcmp(k, "gamertag")) snprintf(xd.gamertag, sizeof xd.gamertag, "%s", v);
         else if (!strcmp(k, "code"))     snprintf(xd.code, sizeof xd.code, "%s", v);
+        else if (!strcmp(k, "download")) snprintf(xd.download, sizeof xd.download, "%s", v);
+        else if (!strcmp(k, "save"))     snprintf(xd.save, sizeof xd.save, "%s", v);
         else if (!strcmp(k, "country"))  xd.country = (uint32_t)strtoul(v, NULL, 0);
         else if (!strcmp(k, "start_ms")) xd.start_ms = (uint32_t)strtoul(v, NULL, 0);
     }
@@ -761,6 +770,21 @@ static void xu_start_next(uint32_t cxo)
         args[3] = 0;                  /* no event: pumped */
         args[4] = xd.ptask;
         hr = xu_call(sub_00121DBC, cxo, 5, args);
+    } else if (!strcmp(xd.name, "download")) {
+        uint32_t path = xbox_HeapAlloc((uint32_t)strlen(xd.download) + 1, 16), i;
+        uint32_t dl_args[9];
+        if (!xd.dl_buf)
+            xd.dl_buf = xbox_HeapAlloc(0x100000, 16);
+        if (!path || !xd.dl_buf) {
+            xd.on = 0;
+            return;
+        }
+        for (i = 0; i <= strlen(xd.download); i++)
+            *(volatile char *)((uintptr_t)(path + i) + g_xbox_mem_offset) = xd.download[i];
+        memset((void *)((uintptr_t)xd.dl_buf + g_xbox_mem_offset), 0, 0x100000);
+        dl_args[0] = 11; dl_args[1] = path; dl_args[2] = xd.dl_buf; dl_args[3] = 0x100000;
+        dl_args[4] = 0; dl_args[5] = 0; dl_args[6] = 30000; dl_args[7] = 0; dl_args[8] = xd.ptask;
+        hr = xu_call(sub_001209AF, cxo, 9, dl_args);
     } else if (!strcmp(xd.name, "offer")) {
         args[0] = xu_wide(xd.code);
         args[1] = xd.country;
@@ -813,6 +837,15 @@ static void xu_drive(void)
         xd.last_hr = hr;
     }
     if ((int32_t)hr < 0 || hr == 0x001500F0u || now - xd.began > 60000u) {
+        if (!strcmp(xd.name, "download") && xd.dl_buf && xd.save[0]) {
+            uint32_t used = xu_used(xd.dl_buf, 0x100000);
+            FILE *out = fopen(xd.save, "wb");
+            if (out) {
+                fwrite((const void *)((uintptr_t)xd.dl_buf + g_xbox_mem_offset), 1, used, out);
+                fclose(out);
+            }
+            fprintf(stderr, "[XUACS] download: %u bytes to %s\n", used, xd.save);
+        }
         xu_call(sub_00117720, cxo, 1, &xd.task);   /* the close hooks log the answer */
         xd.task = 0;
         xd.name[0] = 0;
@@ -825,8 +858,36 @@ static void xu_drive(void)
     }
 }
 
+/* Sleep (sub_0007DDE6). The dashboard's DirectSound worker (0x0009106C)
+ * calls DirectSoundDoWork and Sleep(100) in a loop for as long as it runs:
+ * the driver's clock, ten times a second. XOnlineTaskContinue alone stops
+ * being called once the dashboard's own sign-in task is closed, about ten
+ * seconds in. One guest thread runs at a time (the guest lock), so calling
+ * the library from this thread does not race the main one. */
+extern void sub_0007DDE6_gen(void);
+void sub_0007DDE6(void)
+{
+    uint32_t ms = XU_MEM32(g_esp + 4);
+
+    sub_0007DDE6_gen();
+    if (ms == 100 && !xd.busy) {
+        xd.busy = 1;
+        xu_drive();
+        xd.busy = 0;
+    }
+}
+
 void sub_0011770B(void)
 {
+    static unsigned long calls;
+    static uint64_t t0;
+    uint64_t now = xu_now_ms();
+
+    if (!t0)
+        t0 = now;
+    if (getenv("RECOMP_XUACS_DRIVE") && (calls++ % 100u) == 0)
+        fprintf(stderr, "[XUACS] TaskContinue #%lu at %llu ms (task 0x%08X)\n", calls,
+                (unsigned long long)(now - t0), XU_MEM32(g_esp + 4));
     sub_0011770B_gen();
     if (!xd.busy) {
         xd.busy = 1;
