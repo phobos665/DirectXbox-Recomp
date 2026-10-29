@@ -1825,8 +1825,9 @@ static void draw_link(void)
             theme_text_wrapped(line,
                 "The game connects to the internet through this PC and signs in to"
                 " Insignia, the revived Xbox Live, as the console above. Register it"
-                " once first. Making an account (a gamertag) still needs the Xbox"
-                " dashboard: see the Xbox Live guide.",
+                " once first. To make an account you need a subscription code from"
+                " insignia.live and your own copy of the Xbox dashboard (5960): see"
+                " \"Getting your own Xbox dashboard files\" in the docs.",
                 12, THEME_TEXT_DIM);
         }
     } else if (g_link_mode == LINK_JOIN) {
