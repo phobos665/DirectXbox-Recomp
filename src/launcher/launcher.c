@@ -2462,12 +2462,21 @@ static void draw(void)
             11, THEME_TEXT_DIM);
     }
 
-    /* The footer says how to drive it, and changes with what is plugged in. */
+    /* The footer says how to drive it, and changes with what is plugged in,
+     * and with the row: on an action row A does the action, not Play. */
     r.x = 60; r.y = g_ch - 44; r.w = g_cw - 260; r.h = 24;
-    theme_text(r, g_pad_seen
-                  ? "A  Play      B  Quit      LB RB  Change tab      D-pad  Move"
-                  : "Enter  Play      Esc  Quit      Tab  Change tab      Arrows  Move",
-               11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    {
+        int count, action;
+        Row *rows = tab_rows(&count);
+
+        action = rows && g_sel < count && rows[g_sel].kind == ROW_ACTION;
+        theme_text(r, g_pad_seen
+                      ? (action ? "A  Do it      B  Quit      LB RB  Change tab      D-pad  Move"
+                                : "A  Play      B  Quit      LB RB  Change tab      D-pad  Move")
+                      : (action ? "Enter  Do it      Esc  Quit      Tab  Change tab      Arrows  Move"
+                                : "Enter  Play      Esc  Quit      Tab  Change tab      Arrows  Move"),
+                   11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    }
 
     {   /* Play, always on screen, always the obvious thing to press. */
         ThemeRect b;
