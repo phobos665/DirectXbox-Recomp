@@ -604,19 +604,25 @@ void sub_00120CB6(void)
  * The file names what to do, one key = value a line, and is the player's
  * own (it holds their subscription code): never commit one.
  *
- *     steps    = reserve,offer     in order: download, reserve, offer
+ *     steps    = reserve,offer     in order: download, reserve, offer, create
  *     download = <path>            download: a file of the dashboard's, as
  *                                  /Europe/Country/CountryMaster2.INX
  *     save     = <file>            download: where its bytes go
  *     gamertag = <name>            reserve: the name to hold
  *     country  = <id>              the country byte both requests carry
  *     code     = <code>            offer: the subscription code to check
+ *     email    = <address>         create: the one the code was sent to
+ *     confirm_create = yes         create runs only with this: it spends
+ *                                  the subscription code
  *     start_ms = 25000             wait this long after the first call, so
  *                                  the dashboard's own sign-in has finished
  *
  * reserve is reservename (sub_00121DBC: name, 5 alternatives, country,
  * event, &task); offer is verifyvouchergetoffer (sub_00121B61: code,
- * country, event, &task); download is the dashboard's file download
+ * country, event, &task); create is createowneracct (sub_0012248A: the
+ * sign-up state -- gamertag, PIN, birth date -- the owner record, event,
+ * &task), whose answer the library itself turns into the account on the
+ * disk (sub_00121F40); download is the dashboard's file download
  * (sub_001209AF: service 11, path, buffer, size, 0, 0, timeout, event,
  * &task), as it fetches its country list. Neither makes the account: creating one is a step
  * this file does not have. Each task is pumped (sub_0011770B) until it
@@ -627,6 +633,7 @@ extern void sub_00117720(void);
 extern void sub_00121DBC(void);
 extern void sub_00121B61(void);
 extern void sub_001209AF(void);
+extern void sub_0012248A(void);
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 #include <time.h>
@@ -635,7 +642,8 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 static struct {
     int      loaded, on, busy;
-    char     steps[64], gamertag[32], code[48], download[128], save[512];
+    char     steps[64], gamertag[32], code[48], download[128], save[512], email[130];
+    int      confirm_create;
     uint32_t dl_buf;
     uint32_t country, start_ms;
     uint64_t first, began;
@@ -682,6 +690,8 @@ static void xu_load(void)
         else if (!strcmp(k, "code"))     snprintf(xd.code, sizeof xd.code, "%s", v);
         else if (!strcmp(k, "download")) snprintf(xd.download, sizeof xd.download, "%s", v);
         else if (!strcmp(k, "save"))     snprintf(xd.save, sizeof xd.save, "%s", v);
+        else if (!strcmp(k, "email"))    snprintf(xd.email, sizeof xd.email, "%s", v);
+        else if (!strcmp(k, "confirm_create")) xd.confirm_create = !strcmp(v, "yes");
         else if (!strcmp(k, "country"))  xd.country = (uint32_t)strtoul(v, NULL, 0);
         else if (!strcmp(k, "start_ms")) xd.start_ms = (uint32_t)strtoul(v, NULL, 0);
     }
@@ -705,6 +715,17 @@ static uint32_t xu_wide(const char *s)
     }
     return va;
 }
+
+/* A string into a UTF-16 slot of `chars` characters at va. */
+static void xu_put_wide(uint32_t va, const char *s, size_t chars)
+{
+    size_t i;
+    for (i = 0; i + 1 < chars && s[i]; i++)
+        *(volatile uint16_t *)((uintptr_t)(va + 2 * i) + g_xbox_mem_offset) = (uint16_t)(unsigned char)s[i];
+    *(volatile uint16_t *)((uintptr_t)(va + 2 * i) + g_xbox_mem_offset) = 0;
+}
+
+static void xu_put_u32(uint32_t va, uint32_t v) { XU_MEM32(va) = v; }
 
 /* Call a lifted thiscall/stdcall function with these stack arguments, the
  * registers the caller had put back afterwards. */
@@ -751,7 +772,7 @@ static int xu_step_name(int n, char *out, size_t size)
 static void xu_start_next(uint32_t cxo)
 {
     FILE *f = xu_log();
-    uint32_t args[5], hr;
+    uint32_t args[5], hr = 0;
 
     xd.name[0] = 0;
     if (!xu_step_name(xd.step, xd.name, sizeof xd.name)) {
@@ -785,6 +806,43 @@ static void xu_start_next(uint32_t cxo)
         dl_args[0] = 11; dl_args[1] = path; dl_args[2] = xd.dl_buf; dl_args[3] = 0x100000;
         dl_args[4] = 0; dl_args[5] = 0; dl_args[6] = 30000; dl_args[7] = 0; dl_args[8] = xd.ptask;
         hr = xu_call(sub_001209AF, cxo, 9, dl_args);
+    } else if (!strcmp(xd.name, "create")) {
+        /* The sign-up state (the gamertag at +0, the PIN at +0x20, the birth
+         * date at +0x24 as a UTC FILETIME) and the owner record (the fields
+         * docs/technical/xbox-live-accounts.md lists), with the details
+         * Insignia's guide says to make up: a test card, a made-up name and
+         * address. Only the e-mail is the player's. */
+        uint32_t state = xbox_HeapAlloc(0x100, 16), owner = xbox_HeapAlloc(0x1000, 16);
+        if (!xd.confirm_create || !xd.email[0] || !xd.gamertag[0] || !state || !owner) {
+            fprintf(stderr, "[XUACS] create: needs gamertag, email and confirm_create = yes; stopping\n");
+            xd.on = 0;
+            xd.name[0] = 0;
+            return;
+        }
+        memset((void *)((uintptr_t)state + g_xbox_mem_offset), 0, 0x100);
+        memset((void *)((uintptr_t)owner + g_xbox_mem_offset), 0, 0x1000);
+        xu_put_wide(state, xd.gamertag, 16);
+        xu_put_u32(state + 0x20, 0);                       /* no PIN */
+        xu_put_u32(state + 0x24, 0x18d64000u);             /* 1 Jan 1990 */
+        xu_put_u32(state + 0x28, 0x01b41e2au);
+        xu_put_wide(owner + 0x000, "Test", 64);            /* first name */
+        xu_put_wide(owner + 0x080, "Player", 64);          /* last name */
+        xu_put_wide(owner + 0x100, "1 Test Street", 128);
+        xu_put_wide(owner + 0x400, "London", 64);          /* city */
+        *(volatile uint8_t *)((uintptr_t)(owner + 0x500) + g_xbox_mem_offset) = (uint8_t)xd.country;
+        xu_put_wide(owner + 0x502, "SW1A 1AA", 16);        /* postal code */
+        xu_put_wide(owner + 0x53A, "02070000000", 12);     /* phone */
+        xu_put_wide(owner + 0x56A, "Test Player", 64);     /* card holder */
+        *(volatile uint8_t *)((uintptr_t)(owner + 0x5EA) + g_xbox_mem_offset) = 0;  /* Visa */
+        xu_put_wide(owner + 0x5EC, "4111111111111111", 24);
+        xu_put_u32(owner + 0x61C, 0xf5fe4000u);            /* expires 1 Dec 2030 */
+        xu_put_u32(owner + 0x620, 0x01e1fd35u);
+        xu_put_wide(owner + 0x624, xd.email, 129);
+        args[0] = state;
+        args[1] = owner;
+        args[2] = 0;
+        args[3] = xd.ptask;
+        hr = xu_call(sub_0012248A, cxo, 4, args);
     } else if (!strcmp(xd.name, "offer")) {
         args[0] = xu_wide(xd.code);
         args[1] = xd.country;
