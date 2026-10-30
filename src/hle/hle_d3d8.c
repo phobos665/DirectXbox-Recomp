@@ -5903,6 +5903,7 @@ HLE_EXPORT(D3DDevice_UpdateOverlay)
             fflush(stderr);
         }
         d3d8_movie_draw();
+        shadow_dump_frame();          /* F11 and the frame dumps see the movie too */
         host_Swap(g_shadow, 0);
     }
 }
