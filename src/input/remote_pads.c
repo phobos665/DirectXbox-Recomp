@@ -23,6 +23,7 @@ typedef SOCKET sock_t;
 #  include <netinet/in.h>
 #  include <sys/socket.h>
 #  include <sys/time.h>
+#  include <time.h>
 #  include <unistd.h>
 typedef int sock_t;
 #  define SOCK_BAD (-1)
@@ -157,10 +158,24 @@ static struct {
     unsigned     (*local_mask)(void);
     int            never_host, started;
     volatile int   key_wanted;
-} H = { NULL, NULL, SOCK_BAD };
+} H = { .sock = SOCK_BAD };
 
 void recomp_remote_set_local_mask_fn(unsigned (*fn)(void)) { H.local_mask = fn; }
 void recomp_remote_never_host(void) { H.never_host = 1; }
+
+/* The host's clock for its players: monotonic, and its own. SDL_GetTicks
+ * starts again when the title brings SDL up, and a player who joined before
+ * that was dropped as gone quiet the moment it did. */
+static uint64_t host_ms(void)
+{
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
 
 static int same_peer(const struct sockaddr_in *a, const struct sockaddr_in *b)
 {
@@ -234,7 +249,7 @@ static void on_hello(const struct sockaddr_in *from, const RemoteMsg *m, int ver
         say("[REMOTE] %s joined as controller %d\n", H.players[i].name, i + 1);
         H.key_wanted = 1;                    /* its picture starts at a keyframe */
     }
-    H.players[i].last_ms = SDL_GetTicks();
+    H.players[i].last_ms = host_ms();
     SDL_UnlockMutex(H.lock);
     r.type = REMOTE_WELCOME;
     r.port = i + 1;
@@ -263,7 +278,7 @@ static int SDLCALL host_thread(void *arg)
 
         n = (int)recvfrom(H.sock, (char *)buf, (int)sizeof buf, 0,
                           (struct sockaddr *)&from, &fl);
-        now = SDL_GetTicks();
+        now = host_ms();
         if (n > 0 && remote_decode(buf, (size_t)n, &m, &version)) {
             if (m.type == REMOTE_HELLO) {
                 on_hello(&from, &m, version);
@@ -286,6 +301,15 @@ static int SDLCALL host_thread(void *arg)
                     }
                 }
                 SDL_UnlockMutex(H.lock);
+                if (i < 0 && m.type == REMOTE_PAD) {
+                    /* A joiner this host does not know (dropped, or the
+                     * host started again): it should say hello. */
+                    RemoteMsg r;
+                    memset(&r, 0, sizeof r);
+                    r.type = REMOTE_REFUSED;
+                    r.reason = REMOTE_REFUSED_UNKNOWN;
+                    send_to(&from, &r);
+                }
             }
         }
         SDL_LockMutex(H.lock);

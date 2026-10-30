@@ -66,7 +66,8 @@ enum {
 enum {
     REMOTE_REFUSED_FULL = 1,     /* ports 2-4 are all taken          */
     REMOTE_REFUSED_CODE,         /* the session code does not match  */
-    REMOTE_REFUSED_VERSION       /* the joiner speaks another version */
+    REMOTE_REFUSED_VERSION,      /* the joiner speaks another version */
+    REMOTE_REFUSED_UNKNOWN       /* a pad from no player: say hello again */
 };
 
 /* ---- the wire --------------------------------------------------------- */

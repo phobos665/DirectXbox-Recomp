@@ -216,6 +216,11 @@ int main(int argc, char **argv)
                 if (port != m.port)
                     fprintf(stderr, "[REMOTE] in: controller %d\n", m.port);
                 port = m.port;
+            } else if (m.type == REMOTE_REFUSED && m.reason == REMOTE_REFUSED_UNKNOWN) {
+                if (port > 0)
+                    fprintf(stderr, "[REMOTE] the host lost track of us; asking again\n");
+                port = 0;                      /* say hello again */
+                next_hello = 0;
             } else if (m.type == REMOTE_REFUSED) {
                 snprintf(status, sizeof status, "%s",
                          m.reason == REMOTE_REFUSED_FULL ? "the game is full (ports 2-4 taken)"

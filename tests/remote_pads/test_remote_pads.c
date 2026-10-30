@@ -51,7 +51,7 @@ static void send_msg(sock_t s, const RemoteMsg *m)
 /* The next message for this joiner, 0 if none came within half a second. */
 static int recv_msg(sock_t s, RemoteMsg *m)
 {
-    uint8_t buf[128];
+    uint8_t buf[REMOTE_MAX_DATAGRAM];
     int n = (int)recv(s, (char *)buf, sizeof buf, 0);
     return n > 0 && remote_decode(buf, (size_t)n, m, NULL);
 }
@@ -147,6 +147,11 @@ int main(void)
     recomp_remote_rumble(2, 1234, 4321);
     CHECK(recv_msg(a, &r) && r.type == REMOTE_RUMBLE && r.low == 1234 && r.high == 4321,
           "rumble goes back to its player");
+
+    /* A pad from someone who never said hello is told to. */
+    pad(d, 1, 0x0001, 0);
+    CHECK(recv_msg(d, &r) && r.type == REMOTE_REFUSED && r.reason == REMOTE_REFUSED_UNKNOWN,
+          "a stranger's pad is answered with 'say hello'");
 
     memset(&r, 0, sizeof r);
     r.type = REMOTE_PING;
