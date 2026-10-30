@@ -11,11 +11,13 @@ add_library(xbox_input STATIC
     recomp_pad.c
     # The on-screen controller (Android's default when there is no pad).
     touch_controls.c
+    # Remote play: controllers 2-4 from another machine (remote_pads.h).
+    remote_pads.c
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-target_link_libraries(xbox_input PUBLIC platform xbox_config SDL3::SDL3)
+target_link_libraries(xbox_input PUBLIC platform xbox_config xbox_net SDL3::SDL3)
 if(WIN32)
     target_link_libraries(xbox_input PUBLIC xinput)
 endif()
@@ -25,6 +27,11 @@ if(MSVC)
 else()
     target_compile_options(xbox_input PRIVATE -Wall -Wextra -O2)
 endif()
+
+# Join a friend's game as controller 2-4 (remote_pads.h). Holds no game code,
+# so it can go to anyone; built with the toolkit, not with a title.
+add_executable(xboxrecomp-remote remote_join.c)
+target_link_libraries(xboxrecomp-remote PRIVATE xbox_input)
 
 # What the runtime sees of the pads, live: `recomp_pad_probe [seconds] [xinput]`.
 # Not built by default; `cmake --build <dir> --target recomp_pad_probe`.

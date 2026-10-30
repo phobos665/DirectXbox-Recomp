@@ -23,6 +23,7 @@
 #include "input_bindings.h"
 #include "touch_controls.h"
 #include "recomp_pad.h"
+#include "remote_pads.h"     /* controllers 2-4 from another machine */
 #include "recomp_config.h"   /* recomp_config_user_dir */
 
 #include <stdio.h>
@@ -696,6 +697,8 @@ static void look_settings(void)
     g_look.ready = 1;
 }
 
+static unsigned local_present_mask(void);
+
 void recomp_bindings_init(void)
 {
     char *text;
@@ -729,6 +732,9 @@ void recomp_bindings_init(void)
                 g_look.sensitivity,
                 g_ctl[0].device == DEV_NONE ? " -- but controller 1 reads nothing" : "");
     fflush(stderr);
+    /* Remote play: friends' pads on the ports nothing here drives. */
+    recomp_remote_set_local_mask_fn(local_present_mask);
+    recomp_remote_init();
 }
 
 const char *recomp_bindings_source_path(void)
@@ -739,7 +745,13 @@ const char *recomp_bindings_source_path(void)
 
 const char *recomp_bindings_device_name(unsigned port)
 {
+    static char remote[PORTS][48];
+
     recomp_bindings_init();
+    if (port < PORTS && (recomp_remote_mask() & (1u << port))) {
+        snprintf(remote[port], sizeof remote[port], "remote: %s", recomp_remote_name(port));
+        return remote[port];
+    }
     return port < PORTS ? g_ctl[port].label : "nothing";
 }
 
@@ -1112,6 +1124,8 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
     memset(out, 0, sizeof *out);
     if (port >= PORTS)
         return 0;
+    if (recomp_remote_sample(port, out))   /* a remote player holds this port */
+        return 1;
     c = &g_ctl[port];
     if (c->device == DEV_NONE) {
         /* A phone with no pad: the touch controls are controller 1. */
@@ -1183,14 +1197,15 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
     return 1;
 }
 
-unsigned recomp_bindings_present_mask(void)
+/* The ports a device of this machine's drives: what remote play hands out
+ * around (remote_pads.c). */
+static unsigned local_present_mask(void)
 {
     static unsigned long long next;
     static unsigned mask;
     unsigned long long now;
     int i;
 
-    recomp_bindings_init();
     now = now_ms();
     if (mask && now < next)
         return mask;
@@ -1210,9 +1225,19 @@ unsigned recomp_bindings_present_mask(void)
     return mask;
 }
 
+unsigned recomp_bindings_present_mask(void)
+{
+    recomp_bindings_init();
+    return local_present_mask() | recomp_remote_mask();
+}
+
 void recomp_bindings_rumble(unsigned port, unsigned short low, unsigned short high)
 {
     recomp_bindings_init();
+    if (port < PORTS && (recomp_remote_mask() & (1u << port))) {
+        recomp_remote_rumble(port, low, high);
+        return;
+    }
     if (port < PORTS && g_ctl[port].device == DEV_PAD)
         recomp_pad_rumble(g_ctl[port].pad, low, high);
 }
