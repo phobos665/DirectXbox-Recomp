@@ -28,11 +28,6 @@ else()
     target_compile_options(xbox_input PRIVATE -Wall -Wextra -O2)
 endif()
 
-# Join a friend's game as controller 2-4 (remote_pads.h). Holds no game code,
-# so it can go to anyone; built with the toolkit, not with a title.
-add_executable(xboxrecomp-remote remote_join.c)
-target_link_libraries(xboxrecomp-remote PRIVATE xbox_input)
-
 # What the runtime sees of the pads, live: `recomp_pad_probe [seconds] [xinput]`.
 # Not built by default; `cmake --build <dir> --target recomp_pad_probe`.
 add_executable(recomp_pad_probe EXCLUDE_FROM_ALL recomp_pad_probe.c)

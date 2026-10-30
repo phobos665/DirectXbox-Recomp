@@ -48,6 +48,7 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_remote
     xbox_hle
 )
 

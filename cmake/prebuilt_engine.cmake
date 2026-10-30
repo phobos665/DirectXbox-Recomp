@@ -33,7 +33,7 @@
 function(_xboxrecomp_engine_libs out)
     set(_libs platform xbox_config xbox_net xbox_kernel xbox_d3d8 xbox_dsound
               xbox_samplerate xbox_apu xbox_nv2a xbox_usb xbox_input
-              xbox_video xbox_hle)
+              xbox_video xbox_remote xbox_hle)
     foreach(_t xbox_host libminiupnpc-static)
         if(TARGET ${_t})
             list(APPEND _libs ${_t})

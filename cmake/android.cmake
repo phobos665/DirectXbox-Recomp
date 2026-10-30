@@ -35,7 +35,7 @@ endif()
 
 function(xboxrecomp_android_libraries title_objects)
     set(engine xbox_kernel xbox_d3d8 xbox_dsound xbox_input xbox_usb xbox_apu
-               xbox_nv2a xbox_video xbox_hle xbox_host platform xbox_config)
+               xbox_nv2a xbox_video xbox_remote xbox_hle xbox_host platform xbox_config)
     if(TARGET xbox_net)
         list(APPEND engine xbox_net)
     endif()

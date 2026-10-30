@@ -58,6 +58,8 @@ target_link_libraries(xbox_hle PUBLIC xbox_input)
 # platform, and open a window of their own for it: Win32 on Windows, the host
 # shell (src/host) elsewhere.
 target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video)
+# Remote play's picture: the presented frame, to the joiners.
+target_link_libraries(xbox_hle PRIVATE xbox_remote)
 if(WIN32)
     # MSVC's xaudio2.lib is XAudio2 2.9; MinGW names that one by its DLL.
     if(MSVC)

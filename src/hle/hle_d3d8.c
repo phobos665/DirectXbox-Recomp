@@ -80,6 +80,7 @@ static void held_redraw(void);   /* with the overlay's switches, below */
 #include "d3d8_movie.h"
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
+#include "remote_stream.h"                /* remote play's picture */
 #include "rhi.h"                         /* rhi_set_wait_hooks */
 #include "input_bindings.h"              /* the mouse, for mouse look and mouse: bindings */
 #include "../kernel/xbox_memory_layout.h"  /* the guest lock */
@@ -2193,6 +2194,31 @@ int hle_d3d8_dump_back_buffer(const char *path)
     return dump_back_buffer(path);
 }
 
+/* Remote play (src/remote/remote_stream.h): the frame about to be
+ * presented, read back and handed over at the title's own size, while a
+ * remote player is in. Read back as the frame dump is: the back buffer is
+ * the scene at the host's render size, R8G8B8A8. Nothing is read with no
+ * one watching. */
+static void remote_stream_present(void)
+{
+    IDirect3DSurface8 *surf = NULL;
+    D3DLOCKED_RECT lr;
+    D3DSURFACE_DESC sd;
+
+    if (!g_shadow || !remote_stream_wanted())
+        return;
+    if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
+        return;
+    if (SUCCEEDED(surf->lpVtbl->GetDesc(surf, &sd)) && sd.Width && sd.Height &&
+        SUCCEEDED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        remote_stream_frame((const uint8_t *)lr.pBits, sd.Width, sd.Height, (unsigned)lr.Pitch,
+                            g_shadow_width ? g_shadow_width : sd.Width,
+                            g_shadow_height ? g_shadow_height : sd.Height);
+        surf->lpVtbl->UnlockRect(surf);
+    }
+    surf->lpVtbl->Release(surf);
+}
+
 /* RECOMP_RAM_DUMP=<prefix> with RECOMP_RAM_DUMP_SWAPS=<n>[,<n>...]: guest
  * RAM, 0 to the end of title memory, written to <prefix>_<swap>.bin at those
  * swaps. For finding a structure by what changed between two moments of a
@@ -3245,6 +3271,7 @@ static void frame_end_shadow(void)
         }
         g_movie_sampled = 0;
         shadow_dump_frame();             /* before Present discards the buffer */
+        remote_stream_present();         /* likewise */
         shadow_frame_brightness();       /* likewise: Present discards it */
         if (g_inline_begin_frame > g_inline_begin_max)
             g_inline_begin_max = g_inline_begin_frame;
@@ -5883,6 +5910,7 @@ HLE_EXPORT(D3DDevice_UpdateOverlay)
             fflush(stderr);
         }
         d3d8_movie_draw();
+        remote_stream_present();      /* the joiners see the movie too */
         host_Swap(g_shadow, 0);
     }
 }

@@ -9,13 +9,12 @@
  * keyboard, both -- is what you play with here. The window shows whether
  * you are in, as which controller, and the round trip; keep it in front
  * when you play on the keyboard. It holds no game code and reads no game
- * files, so it can go to anyone. The window is coloured by how it is
- * going -- grey asking, green in, red refused -- and its title says the rest.
- *
- * The picture and the sound do not come back yet: watch the host's screen
- * some other way (a call's screen share) until they do.
+ * files, so it can go to anyone. The window shows the host's picture
+ * (remote_stream.h) once it arrives, grey while asking and red when refused,
+ * and its title says the rest. The sound does not come back yet.
  */
 #include "remote_pads.h"
+#include "remote_stream.h"
 #include "input_bindings.h"
 
 #include <SDL3/SDL.h>
@@ -44,6 +43,7 @@ typedef int sock_t;
 #define SEND_MS   8         /* the pad, about 125 times a second */
 #define HELLO_MS  1000      /* until the host answers            */
 #define PING_MS   1000
+#define KEYREQ_MS 250       /* at most this often, after a loss     */
 
 static sock_t g_sock = SOCK_BAD;
 static struct sockaddr_in g_host;
@@ -80,6 +80,43 @@ static int resolve(const char *spec, struct sockaddr_in *out)
     return 0;
 }
 
+/* The picture, as big as the window allows with its own shape, centred. */
+static void show(SDL_Window *win, const uint8_t *bgra, unsigned w, unsigned h)
+{
+    SDL_Surface *dst = SDL_GetWindowSurface(win), *src;
+    SDL_Rect r;
+
+    if (!dst)
+        return;
+    src = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_BGRA32, (void *)bgra, (int)w * 4);
+    if (!src)
+        return;
+    if ((long long)dst->w * h > (long long)dst->h * w) {
+        r.h = dst->h;
+        r.w = (int)((long long)dst->h * w / h);
+    } else {
+        r.w = dst->w;
+        r.h = (int)((long long)dst->w * h / w);
+    }
+    r.x = (dst->w - r.w) / 2;
+    r.y = (dst->h - r.h) / 2;
+    SDL_FillSurfaceRect(dst, NULL, SDL_MapSurfaceRGB(dst, 0, 0, 0));
+    SDL_BlitSurfaceScaled(src, NULL, dst, &r, SDL_SCALEMODE_LINEAR);
+    SDL_DestroySurface(src);
+    SDL_UpdateWindowSurface(win);
+}
+
+/* RECOMP_REMOTE_SHOT=<file.bmp>: the last picture, written on the way out,
+ * for checking a run with no window to look at. */
+static void save_shot(const char *path, const uint8_t *bgra, unsigned w, unsigned h)
+{
+    SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_BGRA32,
+                                           (void *)bgra, (int)w * 4);
+    if (s && SDL_SaveBMP(s, path))
+        fprintf(stderr, "[REMOTE] last picture written to %s\n", path);
+    SDL_DestroySurface(s);
+}
+
 static void usage(void)
 {
     fprintf(stderr, "usage: xboxrecomp-remote <host>[:port] [--code <text>] [--name <text>]\n"
@@ -93,9 +130,13 @@ int main(int argc, char **argv)
     char status[128] = "asking to join...", title[160];
     SDL_Window *win;
     RemoteMsg m;
-    uint64_t next_send = 0, next_hello = 0, next_ping = 0, last_heard = 0;
+    uint64_t next_send = 0, next_hello = 0, next_ping = 0, last_heard = 0, last_keyreq = 0;
     uint32_t seq = 0, rtt = 0;
-    int port = 0, running = 1, i;
+    int port = 0, running = 1, i, pictures = 0, lost_frames = 0;
+    RemoteAssembler *asmb;
+    RemoteDecoder *dec;
+    const uint8_t *last_pic = NULL;
+    unsigned last_w = 0, last_h = 0;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--code") && i + 1 < argc)
@@ -144,17 +185,22 @@ int main(int argc, char **argv)
     }
     /* No SDL renderer: the toolkit's SDL is built without one outside Linux.
      * The window's own surface is enough for a colour. */
-    if (!(win = SDL_CreateWindow("Remote play", 480, 120, 0)))
+    if (!(win = SDL_CreateWindow("Remote play", 960, 720, SDL_WINDOW_RESIZABLE)))
         fprintf(stderr, "[REMOTE] no window (%s): a pad still works, the keyboard "
                 "does not\n", SDL_GetError());
     recomp_bindings_init();
+    asmb = remote_assembler_create();
+    dec = remote_decoder_create();
+    if (!dec)
+        fprintf(stderr, "[REMOTE] no H.264 decoder (FFmpeg): your pad works, but you will "
+                "not see the picture\n");
     if (!name || !*name)
         name = SDL_getenv("USER") ? SDL_getenv("USER") : SDL_getenv("USERNAME");
 
     while (running) {
         SDL_Event ev;
         uint64_t now = SDL_GetTicks();
-        uint8_t buf[128];
+        uint8_t buf[REMOTE_MAX_DATAGRAM];
         int n;
 
         while (SDL_PollEvent(&ev))
@@ -181,6 +227,38 @@ int main(int argc, char **argv)
                 recomp_bindings_rumble(0, m.low, m.high);
             } else if (m.type == REMOTE_PONG) {
                 rtt = (uint32_t)now - m.stamp;
+            } else if (m.type == REMOTE_VIDEO && asmb) {
+                const uint8_t *f;
+                size_t flen;
+                int lost;
+                if (remote_assembler_piece(asmb, m.frame, m.index, m.count,
+                                           (m.flags & REMOTE_VIDEO_KEY) != 0, m.data, m.length,
+                                           &f, &flen, &lost) && dec) {
+                    const uint8_t *bgra;
+                    unsigned w, h;
+                    int r = remote_decoder_frame(dec, f, flen, &bgra, &w, &h);
+                    if (r > 0) {
+                        if (win)
+                            show(win, bgra, w, h);
+                        if (pictures++ == 0)
+                            fprintf(stderr, "[REMOTE] picture: %ux%u\n", w, h);
+                        last_pic = bgra;
+                        last_w = w;
+                        last_h = h;
+                    } else if (r < 0) {
+                        lost = 1;
+                    }
+                }
+                if (lost) {
+                    lost_frames++;
+                    if (now - last_keyreq >= KEYREQ_MS) {
+                        RemoteMsg k;
+                        memset(&k, 0, sizeof k);
+                        k.type = REMOTE_KEYREQ;
+                        send_msg(&k);
+                        last_keyreq = now;
+                    }
+                }
             }
         }
         if (port > 0 && last_heard && now - last_heard > REMOTE_TIMEOUT_MS) {
@@ -213,12 +291,13 @@ int main(int argc, char **argv)
         }
 
         if (port > 0)
-            snprintf(status, sizeof status, "controller %d - round trip %u ms", port, rtt);
+            snprintf(status, sizeof status, "controller %d - round trip %u ms%s", port, rtt,
+                     pictures ? "" : " - no picture yet");
         snprintf(title, sizeof title, "Remote play: %s", status);
         if (win) {
+            SDL_Surface *sf = pictures ? NULL : SDL_GetWindowSurface(win);
             SDL_SetWindowTitle(win, title);
-            SDL_Surface *sf = SDL_GetWindowSurface(win);
-            if (sf) {
+            if (sf) {                          /* until the picture comes */
                 Uint32 c = port > 0 ? SDL_MapSurfaceRGB(sf, 40, 120, 60)
                          : port < 0 ? SDL_MapSurfaceRGB(sf, 140, 40, 40)
                                     : SDL_MapSurfaceRGB(sf, 60, 60, 60);
@@ -234,6 +313,12 @@ int main(int argc, char **argv)
         m.type = REMOTE_BYE;
         send_msg(&m);
     }
+    fprintf(stderr, "[REMOTE] %d picture(s) shown, %d frame(s) lost on the way\n",
+            pictures, lost_frames);
+    if (last_pic && SDL_getenv("RECOMP_REMOTE_SHOT"))
+        save_shot(SDL_getenv("RECOMP_REMOTE_SHOT"), last_pic, last_w, last_h);
+    remote_decoder_destroy(dec);
+    remote_assembler_destroy(asmb);
     sock_close(g_sock);
     if (win)
         SDL_DestroyWindow(win);

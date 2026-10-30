@@ -41,7 +41,7 @@ size_t remote_encode(const RemoteMsg *m, uint8_t *buf, size_t cap)
     size_t n = 6;
     int i;
 
-    if (cap < 64)
+    if (cap < 64 || (m->type == REMOTE_VIDEO && cap < 17u + m->length))
         return 0;
     memset(buf, 0, 64);
     put32(buf, REMOTE_MAGIC);
@@ -69,6 +69,16 @@ size_t remote_encode(const RemoteMsg *m, uint8_t *buf, size_t cap)
     case REMOTE_RUMBLE: put16(buf + 6, m->low); put16(buf + 8, m->high); n = 10; break;
     case REMOTE_BYE: break;
     case REMOTE_PING: case REMOTE_PONG: put32(buf + 6, m->stamp); n = 10; break;
+    case REMOTE_VIDEO:
+        put32(buf + 6, m->frame);
+        put16(buf + 10, m->index);
+        put16(buf + 12, m->count);
+        buf[14] = m->flags;
+        put16(buf + 15, m->length);
+        memcpy(buf + 17, m->data, m->length);
+        n = 17u + m->length;
+        break;
+    case REMOTE_KEYREQ: break;
     default: return 0;
     }
     return n;
@@ -76,7 +86,7 @@ size_t remote_encode(const RemoteMsg *m, uint8_t *buf, size_t cap)
 
 int remote_decode(const uint8_t *buf, size_t len, RemoteMsg *m, int *version)
 {
-    static const size_t need[] = { 0, 46, 7, 7, 28, 10, 6, 10, 10 };
+    static const size_t need[] = { 0, 46, 7, 7, 28, 10, 6, 10, 10, 17, 6 };
     int i;
 
     memset(m, 0, sizeof *m);
@@ -85,7 +95,7 @@ int remote_decode(const uint8_t *buf, size_t len, RemoteMsg *m, int *version)
     if (version)
         *version = buf[4];
     m->type = buf[5];
-    if (m->type < REMOTE_HELLO || m->type > REMOTE_PONG || len < need[m->type])
+    if (m->type < REMOTE_HELLO || m->type > REMOTE_KEYREQ || len < need[m->type])
         return 0;
     if (buf[4] != REMOTE_VERSION && m->type != REMOTE_HELLO)
         return 0;
@@ -108,6 +118,17 @@ int remote_decode(const uint8_t *buf, size_t len, RemoteMsg *m, int *version)
         break;
     case REMOTE_RUMBLE: m->low = (uint16_t)get16(buf + 6); m->high = (uint16_t)get16(buf + 8); break;
     case REMOTE_PING: case REMOTE_PONG: m->stamp = get32(buf + 6); break;
+    case REMOTE_VIDEO:
+        m->frame = get32(buf + 6);
+        m->index = (uint16_t)get16(buf + 10);
+        m->count = (uint16_t)get16(buf + 12);
+        m->flags = buf[14];
+        m->length = (uint16_t)get16(buf + 15);
+        if (len < 17u + m->length || m->length > REMOTE_VIDEO_CHUNK || !m->count ||
+            m->index >= m->count)
+            return 0;
+        m->data = buf + 17;
+        break;
     default: break;
     }
     return 1;
@@ -135,6 +156,7 @@ static struct {
     Player         players[PORTS];          /* [0] is never used: the host's */
     unsigned     (*local_mask)(void);
     int            never_host, started;
+    volatile int   key_wanted;
 } H = { NULL, NULL, SOCK_BAD };
 
 void recomp_remote_set_local_mask_fn(unsigned (*fn)(void)) { H.local_mask = fn; }
@@ -210,6 +232,7 @@ static void on_hello(const struct sockaddr_in *from, const RemoteMsg *m, int ver
         snprintf(H.players[i].name, sizeof H.players[i].name, "%s",
                  m->name[0] ? m->name : "a friend");
         say("[REMOTE] %s joined as controller %d\n", H.players[i].name, i + 1);
+        H.key_wanted = 1;                    /* its picture starts at a keyframe */
     }
     H.players[i].last_ms = SDL_GetTicks();
     SDL_UnlockMutex(H.lock);
@@ -258,6 +281,8 @@ static int SDLCALL host_thread(void *arg)
                         H.players[i].pad = m.pad;
                     } else if (m.type == REMOTE_BYE) {
                         drop(i, "left");
+                    } else if (m.type == REMOTE_KEYREQ) {
+                        H.key_wanted = 1;
                     }
                 }
                 SDL_UnlockMutex(H.lock);
@@ -389,6 +414,45 @@ int recomp_remote_sample(unsigned port, XBOX_GAMEPAD *out)
     }
     SDL_UnlockMutex(H.lock);
     return held;
+}
+
+int recomp_remote_keyframe_wanted(void)
+{
+    int k = H.key_wanted;
+    H.key_wanted = 0;
+    return k;
+}
+
+void recomp_remote_send_video(uint32_t frame, const uint8_t *data, size_t len, int key)
+{
+    struct sockaddr_in to[PORTS];
+    uint8_t buf[REMOTE_MAX_DATAGRAM];
+    RemoteMsg m;
+    size_t off;
+    int n = 0, i;
+
+    if (!H.running || !len || len > 0xFFFFu * (size_t)REMOTE_VIDEO_CHUNK)
+        return;
+    SDL_LockMutex(H.lock);
+    for (i = 1; i < PORTS; i++)
+        if (H.players[i].in_use)
+            to[n++] = H.players[i].from;
+    SDL_UnlockMutex(H.lock);
+    memset(&m, 0, sizeof m);
+    m.type = REMOTE_VIDEO;
+    m.frame = frame;
+    m.count = (uint16_t)((len + REMOTE_VIDEO_CHUNK - 1) / REMOTE_VIDEO_CHUNK);
+    m.flags = key ? REMOTE_VIDEO_KEY : 0;
+    for (off = 0; off < len; off += REMOTE_VIDEO_CHUNK) {
+        size_t k;
+        m.length = (uint16_t)(len - off < REMOTE_VIDEO_CHUNK ? len - off : REMOTE_VIDEO_CHUNK);
+        m.data = data + off;
+        k = remote_encode(&m, buf, sizeof buf);
+        for (i = 0; i < n; i++)
+            sendto(H.sock, (const char *)buf, (int)k, 0, (const struct sockaddr *)&to[i],
+                   sizeof to[i]);
+        m.index++;
+    }
 }
 
 void recomp_remote_rumble(unsigned port, unsigned short low, unsigned short high)

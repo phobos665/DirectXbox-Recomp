@@ -186,6 +186,9 @@ else()
     # Shared FMV player (Media Foundation -> D3D8 texture)
     add_subdirectory(src/video)
 
+    # Remote play's picture, and the joiner (src/remote/remote_stream.h).
+    add_subdirectory(src/remote)
+
     # The host shell off Windows: the main-thread loop and the game window (SDL3).
     if(NOT WIN32)
         add_subdirectory(src/host)
@@ -213,6 +216,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_subdirectory(tests/net_nat)             # portable: the router behind syslink = nat, on 127.0.0.1
     add_subdirectory(tests/console_id)          # portable: the console identity loader, on a made-up EEPROM
     add_subdirectory(tests/remote_pads)         # portable: remote play's host, on 127.0.0.1
+    add_subdirectory(tests/remote_stream)       # portable: remote play's picture, no game (needs FFmpeg)
     add_subdirectory(tests/title_update)        # portable: title updates, the launch defaults
     add_subdirectory(tests/mmio_decode)         # x86-64 decoder; skips on other CPUs
     add_subdirectory(tests/kernel_file_rename)  # FileRenameInformation, either file backend
@@ -265,6 +269,7 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_remote
     xbox_hle
 )
 

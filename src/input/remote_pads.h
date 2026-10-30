@@ -5,8 +5,9 @@
  * controller 1. Friends join over the internet as controllers 2, 3 and 4,
  * each with a pad (or keyboard) on their own machine. Split-screen and
  * shared-screen titles need nothing else -- there is only one copy of the
- * game, so nothing has to stay in step. The picture and the sound go back
- * the other way (not yet: the joiner sees the game some other way for now).
+ * game, so nothing has to stay in step. The picture goes back the other way,
+ * H.264 in the same session (src/remote/remote_stream.h); the sound does not
+ * yet.
  *
  *   remote_play      = off | host        [RECOMP_REMOTE_PLAY]
  *   remote_play_port = 27620             [RECOMP_REMOTE_PLAY_PORT]
@@ -32,6 +33,9 @@
  *   RUMBLE   u16 low, u16 high
  *   BYE
  *   PING     u32 stamp            (answered with PONG, the same stamp)
+ *   VIDEO    u32 frame, u16 index, u16 count, u8 flags, u16 length, bytes
+ *            -- one piece of an encoded frame; flags bit 0: a keyframe
+ *   KEYREQ   (joiner to host: a piece went missing, send a keyframe)
  */
 #ifndef XBOXRECOMP_REMOTE_PADS_H
 #define XBOXRECOMP_REMOTE_PADS_H
@@ -48,11 +52,17 @@ extern "C" {
 #define REMOTE_VERSION      1
 #define REMOTE_DEFAULT_PORT 27620
 #define REMOTE_TIMEOUT_MS   3000
+/* Bytes of encoded video in one datagram: under a 1280-byte path with the
+ * headers, so nothing is fragmented on the way. */
+#define REMOTE_VIDEO_CHUNK  1150
+#define REMOTE_MAX_DATAGRAM (19 + REMOTE_VIDEO_CHUNK)
 
 enum {
     REMOTE_HELLO = 1, REMOTE_WELCOME, REMOTE_REFUSED, REMOTE_PAD,
-    REMOTE_RUMBLE, REMOTE_BYE, REMOTE_PING, REMOTE_PONG
+    REMOTE_RUMBLE, REMOTE_BYE, REMOTE_PING, REMOTE_PONG,
+    REMOTE_VIDEO, REMOTE_KEYREQ
 };
+#define REMOTE_VIDEO_KEY    0x01
 enum {
     REMOTE_REFUSED_FULL = 1,     /* ports 2-4 are all taken          */
     REMOTE_REFUSED_CODE,         /* the session code does not match  */
@@ -70,9 +80,14 @@ typedef struct RemoteMsg {
     XBOX_GAMEPAD pad;                   /* PAD                        */
     uint16_t low, high;                 /* RUMBLE                     */
     uint32_t stamp;                     /* PING / PONG                */
+    uint32_t frame;                     /* VIDEO                      */
+    uint16_t index, count, length;
+    uint8_t  flags;
+    const uint8_t *data;                /* VIDEO: into the datagram   */
 } RemoteMsg;
 
-/* Bytes written to buf (at least 64 long), 0 for an unknown type. */
+/* Bytes written to buf, 0 for an unknown type or too small a buffer
+ * (REMOTE_MAX_DATAGRAM is always enough). */
 size_t remote_encode(const RemoteMsg *m, uint8_t *buf, size_t cap);
 /* 1 and *m filled for a well-formed message of this version or a HELLO of
  * any version (so a joiner can be told it is out of date), else 0. */
@@ -95,6 +110,12 @@ void     recomp_remote_host_stop(void);
 unsigned recomp_remote_mask(void);
 /* Port n's (0-based) remote state; 0 when no remote player holds it. */
 int      recomp_remote_sample(unsigned port, XBOX_GAMEPAD *out);
+/* An encoded frame, to every remote player, in REMOTE_VIDEO_CHUNK pieces.
+ * frame counts up by one a frame. */
+void     recomp_remote_send_video(uint32_t frame, const uint8_t *data, size_t len, int key);
+/* 1 once after a player joined or asked for a keyframe (KEYREQ): the next
+ * frame should be one. */
+int      recomp_remote_keyframe_wanted(void);
 /* Rumble for port n (0-based): sent to its player, if one holds it. */
 void     recomp_remote_rumble(unsigned port, unsigned short low, unsigned short high);
 /* The player's name on port n (0-based), "" if none. */
