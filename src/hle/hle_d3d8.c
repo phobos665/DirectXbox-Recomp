@@ -4648,7 +4648,19 @@ HLE_EXPORT(D3DDevice_End)
     HLE_CALL_ORIGINAL(D3DDevice_End);
     hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_inline_on) {
+        /* Under the program the NV2A would run: one started through the push
+         * buffer since the API last selected a shader, if there is one.
+         * Constantine's Swap resolves its 1280x480 supersampled screen with a
+         * triangle drawn this way: the XDK starts a two-instruction program
+         * (oPos = v0, oT0 = v9) itself and calls Begin / End. Drawn under the
+         * title's own 2D program, which reads its texture coordinate from v2,
+         * every pixel sampled one texel and each frame came out one flat
+         * colour. */
+        PushedProgramSave s;
+
+        pushed_program_begin(&s);
         inline_draw();
+        pushed_program_end(&s);
         g_inline_on = 0;
         g_inline_nverts = 0;
     }
