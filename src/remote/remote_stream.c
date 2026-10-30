@@ -521,7 +521,7 @@ static struct {
     uint8_t       *pending;          /* RGBA at pw x ph, the newest frame  */
     unsigned       pw, ph;
     int            have;
-    unsigned long  sent, dropped;
+    unsigned long  sent, dropped, handed, replaced;
 } S;
 
 static void send_packet(const uint8_t *data, size_t len, int key, void *user)
@@ -582,6 +582,16 @@ static int SDLCALL encode_thread(void *arg)
             S.dropped++;
         else
             S.sent++;
+        if (stream_trace()) {
+            static uint64_t next;
+            uint64_t now = SDL_GetTicks();
+            if (now >= next) {
+                fprintf(stderr, "[REMOTE] frames: %lu handed over, %lu replaced before "
+                        "encoding, %lu encoded, %lu failed\n", S.handed, S.replaced, S.sent,
+                        S.dropped);
+                next = now + 1000;
+            }
+        }
     }
 }
 
@@ -662,6 +672,8 @@ void remote_stream_frame(const uint8_t *rgba, unsigned src_w, unsigned src_h, un
     }
     if (S.pending) {
         scale_into(S.pending, out_w, out_h, rgba, src_w, src_h, pitch);
+        S.handed++;
+        S.replaced += S.have;
         S.have = 1;
         SDL_SignalCondition(S.ready);
     }

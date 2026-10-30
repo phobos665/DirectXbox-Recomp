@@ -20,7 +20,7 @@ seconds. Not attempted.
 | --- | --- |
 | Remote pads into ports 2-4 (`src/input/remote_pads.c`) | Done. Checked by `tests/remote_pads` on 127.0.0.1, and end to end with Constantine as host: a joiner arrives as controller 2, the title reads its A press on port 2, and the port is unplugged when it leaves |
 | The joiner, `xboxrecomp-remote` (`src/input/remote_join.c`) | Done; no game code in it. Reads the joiner's own controller 1 bindings |
-| The picture back to the joiners | Not yet. Watch the host's screen some other way (a call's screen share) meanwhile |
+| The picture back to the joiners (`src/remote/remote_stream.c`) | Works on macOS: H.264 through FFmpeg (libx264, else VideoToolbox), in the same session; checked by `tests/remote_stream`, and end to end with Constantine as host -- the joiner showed the intro movie and menus, 0 frames lost, host uncapped frame rate unchanged (~475 swaps / 5 s with and without a joiner). **Open (30 Oct):** while a joiner is in, the host's capture hook ran 30 times a second against 60 alone in one run and at the swap rate in another; not yet settled whether the stream halves the capped frame rate or the hook misses frames. `RECOMP_REMOTE_PLAY_TRACE=1` prints frames handed over against encoded each second |
 | The sound back | Not yet |
 | Launcher: a Remote play row, and joining from the launcher | Not yet |
 
@@ -73,11 +73,9 @@ the layout.
 
 ## Next
 
-1. The picture: the host's presented frame is 640x480, so 60 fps H.264 is about
-   3-6 Mbit/s. Read it back without stalling the GPU, encode in hardware
-   through FFmpeg (VideoToolbox, NVENC/AMF/QSV/Media Foundation, VAAPI), send
-   in the same session; the joiner decodes (FFmpeg is already loaded at run
-   time for XMV) and shows it.
+1. The picture: settle the 30-against-60 question above; read the frame back
+   without a synchronous GPU stall (an async readback ring); try it on Windows
+   (NVENC/AMF/QSV/Media Foundation) and Linux.
 2. The sound: tap the host's mix, Opus.
 3. The launcher: host from the title's settings, join by address and code.
 4. A relay for hosts whose router will not forward (CGNAT), if direct

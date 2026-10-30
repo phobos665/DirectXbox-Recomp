@@ -312,10 +312,19 @@ static int SDLCALL host_thread(void *arg)
                 }
             }
         }
+        /* The clock read again: a hello just handled stamped its player
+         * after `now`, and against the old reading it had been quiet for
+         * minus 200 ms, wrapped -- dropped the moment it joined. */
+        now = host_ms();
         SDL_LockMutex(H.lock);
         for (i = 1; i < PORTS; i++)
-            if (H.players[i].in_use && now - H.players[i].last_ms > REMOTE_TIMEOUT_MS)
-                drop(i, "went quiet and was unplugged");
+            if (H.players[i].in_use && now > H.players[i].last_ms &&
+                now - H.players[i].last_ms > REMOTE_TIMEOUT_MS) {
+                char why[64];
+                snprintf(why, sizeof why, "went quiet for %llu ms and was unplugged",
+                         (unsigned long long)(now - H.players[i].last_ms));
+                drop(i, why);
+            }
         SDL_UnlockMutex(H.lock);
     }
     return 0;

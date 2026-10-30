@@ -279,6 +279,9 @@ int main(int argc, char **argv)
             send_msg(&m);
             next_hello = now + HELLO_MS;
         }
+        if (port > 0 && next_send && now > next_send + 500)
+            fprintf(stderr, "[REMOTE] (the pad went out %llu ms late)\n",
+                    (unsigned long long)(now - next_send));
         if (port > 0 && now >= next_send) {
             memset(&m, 0, sizeof m);
             m.type = REMOTE_PAD;
