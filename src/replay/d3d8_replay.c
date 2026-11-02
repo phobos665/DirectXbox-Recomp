@@ -228,11 +228,10 @@ static void apply_const_patch(long n)
     }
 }
 
-/* Draws that ask for D3DSHADE_FLAT. The renderer has no flat shading on any
- * backend -- every draw is smooth -- so a capture that has some says so: it
- * is where a replayed frame can differ from the console, and where Metal's
- * last-vertex rule (MoltenVK has no VK_EXT_provoking_vertex) would start to
- * matter once flat shading exists. */
+/* Draws that ask for D3DSHADE_FLAT. The renderer shades them flat where the
+ * backend takes the first vertex, as D3D8 does, and smooth on Metal, which
+ * takes the last (MoltenVK has no VK_EXT_provoking_vertex): a capture that
+ * has some says so, since that is where a Mac replay can differ. */
 static long g_flat_draws;
 
 static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t stride)
@@ -1720,8 +1719,10 @@ static void report_loop(const Replay *r, int loop)
         note("[replay] loop %d: %lu P8 texture(s) expanded again for the palette "
              "they were bound under\n", loop, r->rebakes);
     if (g_flat_draws)
-        fprintf(stderr, "[replay] loop %d: %ld of %ld draws ask for flat shading, which the "
-                "renderer does not do (they are drawn smooth)\n", loop, g_flat_draws, g_draw_index);
+        fprintf(stderr, "[replay] loop %d: %ld of %ld draws ask for flat shading (%s)\n", loop,
+                g_flat_draws, g_draw_index,
+                rhi_flat_shading_matches_d3d() ? "drawn flat"
+                                               : "drawn smooth: this backend's flat takes the last vertex");
 }
 
 /* One walk of the capture from its snapshot, drawing into the back buffer. */

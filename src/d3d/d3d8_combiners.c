@@ -138,11 +138,11 @@ static int ps_dump_limit(void)
  * titles switch the alpha test between draws that share a pixel shader, and
  * the variant is the only structural field that changes without a parse or
  * a shadow-stage change, both of which forget the pair. */
-static RhiShader *g_last_shader[2];
+static RhiShader *g_last_shader[2][2];   /* [alpha_test][flat] */
 
 static void forget_last_shaders(void)
 {
-    g_last_shader[0] = g_last_shader[1] = NULL;
+    memset(g_last_shader, 0, sizeof g_last_shader);
 }
 
 /* ================================================================
@@ -870,8 +870,13 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
      * program wrote it -- as its fog factor. */
     EMIT("struct PS_IN {\n");
     EMIT("    float4 pos     : SV_POSITION;\n");
-    EMIT("    float4 color0  : COLOR0;\n");
-    EMIT("    float4 color1  : COLOR1;\n");
+    if (state->flat) {
+        EMIT("    nointerpolation float4 color0  : COLOR0;\n");
+        EMIT("    nointerpolation float4 color1  : COLOR1;\n");
+    } else {
+        EMIT("    float4 color0  : COLOR0;\n");
+        EMIT("    float4 color1  : COLOR1;\n");
+    }
     /* All four components: q divides a projected 2D lookup and a shadow-map
      * stage's compare, and the reflection modes take the eye vector from the
      * three stages' w. */
@@ -1393,10 +1398,11 @@ RhiShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 
         entry = &g_cache[lru_slot];
         if (entry->shader) {
-            if (g_last_shader[0] == entry->shader)
-                g_last_shader[0] = NULL;
-            if (g_last_shader[1] == entry->shader)
-                g_last_shader[1] = NULL;
+            int a, f;
+            for (a = 0; a < 2; a++)
+                for (f = 0; f < 2; f++)
+                    if (g_last_shader[a][f] == entry->shader)
+                        g_last_shader[a][f] = NULL;
             rhi_shader_destroy(entry->shader);
             entry->shader = NULL;
         }
@@ -1542,11 +1548,15 @@ BOOL d3d8_combiners_prepare_draw(void)
      * toggles them between draws that share a pixel shader. Each variant
      * keeps its own remembered shader, so a toggle costs no lookup. */
     g_combiner_state.alpha_test = d3d8_alpha_test_can_reject(rs) ? 1 : 0;
+    g_combiner_state.flat = d3d8_flat_shading(rs) ? 1 : 0;
 
     /* Get or compile the pixel shader for this combiner state */
-    if (!g_last_shader[g_combiner_state.alpha_test])
-        g_last_shader[g_combiner_state.alpha_test] = d3d8_combiners_get_shader(&g_combiner_state);
-    ps = g_last_shader[g_combiner_state.alpha_test];
+    {
+        RhiShader **slot = &g_last_shader[g_combiner_state.alpha_test][g_combiner_state.flat];
+        if (!*slot)
+            *slot = d3d8_combiners_get_shader(&g_combiner_state);
+        ps = *slot;
+    }
 
     /* Under RECOMP_D3D8_PS_DUMP, say which shader each draw actually binds.
      * Printed only when it changes, so the log stays readable and still

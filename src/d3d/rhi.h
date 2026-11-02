@@ -350,6 +350,9 @@ void        rhi_set_wait_hooks(int (*begin)(void), void (*end)(int));
  * otherwise it says so and keeps the default. */
 int         rhi_select_backend(const char *name);
 const char *rhi_backend_name(void);
+/* 1 when flat shading takes each triangle's first vertex, as D3D8's does;
+ * 0 on Metal (MoltenVK), which takes the last and cannot be told otherwise. */
+int         rhi_flat_shading_matches_d3d(void);
 int         rhi_device_create(const RhiDeviceDesc *desc);   /* 0 on success */
 void        rhi_device_destroy(void);
 /* Whether a device exists: the test the renderer makes before touching

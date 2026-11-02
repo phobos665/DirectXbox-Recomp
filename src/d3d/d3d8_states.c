@@ -480,6 +480,24 @@ void d3d8_states_shutdown(void)
     g_last_raster_hash = 0;
 }
 
+/* Whether this draw's colours are flat (D3DSHADE_FLAT) -- on a backend whose
+ * flat shading takes the first vertex, as D3D8's does. Metal takes the last
+ * (rhi_flat_shading_matches_d3d), and there a flat draw stays smooth, as it
+ * was everywhere before, rather than coloured from the wrong vertex. */
+int d3d8_flat_shading(const DWORD *rs)
+{
+    static int said;
+    if (!rs || rs[D3DRS_SHADEMODE] != D3DSHADE_FLAT)
+        return 0;
+    if (rhi_flat_shading_matches_d3d())
+        return 1;
+    if (!said++)
+        fprintf(stderr, "D3D8: the title asks for flat shading; this backend's flat "
+                "shading takes each triangle's last vertex (Metal), not D3D8's first, so "
+                "those draws stay smooth\n");
+    return 0;
+}
+
 void d3d8_states_apply(void)
 {
     const DWORD *rs = d3d8_GetRenderStates();

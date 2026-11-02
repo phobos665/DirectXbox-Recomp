@@ -559,6 +559,11 @@ typedef enum D3DFILLMODE {
     D3DFILL_SOLID     = 3,
 } D3DFILLMODE;
 
+typedef enum D3DSHADEMODE {
+    D3DSHADE_FLAT    = 1,
+    D3DSHADE_GOURAUD = 2,
+} D3DSHADEMODE;
+
 typedef enum D3DPOOL {
     D3DPOOL_DEFAULT     = 0,
     D3DPOOL_MANAGED     = 1,

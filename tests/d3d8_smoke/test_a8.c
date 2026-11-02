@@ -21,6 +21,8 @@ ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return NULL; }
 IDirect3DDevice8 *xbox_GetD3DDevice(void) { return NULL; }
 const DWORD *d3d8_GetPalette(DWORD stage) { (void)stage; return states; }
 const DWORD *d3d8_GetRenderStates(void) { return states; }
+/* d3d8_states.c's: whether the draw's colours are flat. Smooth here. */
+int d3d8_flat_shading(const DWORD *rs) { (void)rs; return 0; }
 const DWORD *d3d8_GetTSS(DWORD stage) { return stages[stage]; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return textures[stage]; }
 /* The size the guest's pre-transformed geometry is measured in; the host

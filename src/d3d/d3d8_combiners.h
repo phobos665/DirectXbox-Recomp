@@ -277,7 +277,11 @@ typedef struct NV2ACombinerState {
      * at most twice the shaders, not eight times. Set per draw from the
      * render states, like `shadow`, not from the token. */
     BYTE alpha_test;
-    BYTE key_pad[3];   /* zero: part of the key bytes, so never left unset */
+    /* 1 under D3DSHADE_FLAT: the colours are not interpolated, each triangle
+     * takes its first vertex's (nointerpolation, the same rule as D3D8's).
+     * Per draw from the render states, like alpha_test. */
+    BYTE flat;
+    BYTE key_pad[2];   /* zero: part of the key bytes, so never left unset */
 
     /* Everything above decides the generated shader and is its cache key
      * (NV2A_COMBINER_KEY_BYTES). Everything below is uploaded to the

@@ -85,6 +85,7 @@ UINT                 d3d8_GetBackbufferHeight(void);
 
 /* Current render state array accessor */
 const DWORD         *d3d8_GetRenderStates(void);
+int                  d3d8_flat_shading(const DWORD *rs);   /* d3d8_states.c */
 const DWORD         *d3d8_GetTSS(DWORD stage);
 
 /* Base texture currently bound to a texture stage (2D/cube/volume),

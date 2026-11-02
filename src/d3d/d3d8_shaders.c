@@ -314,8 +314,8 @@ static const char g_ps_body[] =
     "\n"
     "struct PS_IN {\n"   /* the same interface as VS_OUT above */
     "    float4 pos      : SV_POSITION;\n"
-    "    float4 diffuse  : COLOR0;\n"
-    "    float4 specular : COLOR1;\n"
+    "    COLOR_INTERP float4 diffuse  : COLOR0;\n"   /* nointerpolation when flat */
+    "    COLOR_INTERP float4 specular : COLOR1;\n"
     "    float4 tex0     : TEXCOORD0;\n"
     "    float4 tex1     : TEXCOORD1;\n"
     "    float4 tex2     : TEXCOORD2;\n"
@@ -497,12 +497,17 @@ static const char g_ps_end[] =
  */
 #define FF_PS_SRC_SIZE 16384
 #define FF_PS_SIG_ALPHA_TEST 0x100u
+/* D3DSHADE_FLAT: the colours are not interpolated; each triangle takes its
+ * first vertex's (the same rule as D3D8's). */
+#define FF_PS_SIG_FLAT       0x200u
 
 static void build_ps_source(UINT sig, char *buf, int bufsize)
 {
     int off = 0;
     int i;
 
+    off += snprintf(buf + off, bufsize - off, "#define COLOR_INTERP %s\n",
+                    (sig & FF_PS_SIG_FLAT) ? "nointerpolation" : "");
     for (i = 0; i < 4; i++) {
         UINT dim = (sig >> (i * 2)) & 3u;
         const char *decl = (dim == 1u) ? "TextureCube" :
@@ -611,8 +616,12 @@ static RhiShader *ff_ps_get_shader(UINT sig)
  * states. */
 static UINT ff_ps_compute_signature(void)
 {
-    UINT sig = d3d8_alpha_test_can_reject(d3d8_GetRenderStates()) ? FF_PS_SIG_ALPHA_TEST : 0;
+    const DWORD *rs = d3d8_GetRenderStates();
+    UINT sig = d3d8_alpha_test_can_reject(rs) ? FF_PS_SIG_ALPHA_TEST : 0;
     int i;
+
+    if (d3d8_flat_shading(rs))
+        sig |= FF_PS_SIG_FLAT;
 
     for (i = 0; i < 4; i++) {
         IDirect3DBaseTexture8 *tex = d3d8_GetStageTexture(i);

@@ -68,6 +68,16 @@ int rhi_select_backend(const char *name)
 
 const char *rhi_backend_name(void) { return g_rhi ? g_rhi->name : "none"; }
 
+int rhi_flat_shading_matches_d3d(void)
+{
+#if defined(RHI_HAVE_VULKAN)
+    extern int g_vk_flat_last_vertex;             /* rhi_vulkan.c */
+    if (g_rhi == &rhi_vulkan_backend)
+        return !g_vk_flat_last_vertex;
+#endif
+    return 1;
+}
+
 /* A backend that was asked for and cannot start (no loader, no Vulkan 1.3
  * device, no shader compiler) gives way to the default, said once, rather
  * than leaving the title with no picture at all. */

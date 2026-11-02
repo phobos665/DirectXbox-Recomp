@@ -56,6 +56,8 @@ int rhi_vk_dxc_compile(uint32_t stage, const RhiShaderSource *src,
 IDirect3DDevice8 *xbox_GetD3DDevice(void) { return NULL; }
 const DWORD *d3d8_GetPalette(DWORD stage) { (void)stage; return states; }
 const DWORD *d3d8_GetRenderStates(void) { return states; }
+/* d3d8_states.c's: whether the draw's colours are flat. Smooth here. */
+int d3d8_flat_shading(const DWORD *rs) { (void)rs; return 0; }
 const DWORD *d3d8_GetTSS(DWORD stage) { return stages[stage]; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { (void)stage; return NULL; }
 UINT d3d8_GetGuestWidth(void) { return 1; }

@@ -1054,6 +1054,7 @@ static int begin_rendering(void)
 /* ---- the device ------------------------------------------------------------------------------ */
 
 static int g_validation_errors;
+int g_vk_flat_last_vertex;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL on_debug(VkDebugUtilsMessageSeverityFlagBitsEXT sev,
                                                VkDebugUtilsMessageTypeFlagsEXT types,
@@ -1413,6 +1414,10 @@ static int create_device(void)
      * first sampler that asks. The rest (triangle fans, point fill, the
      * tessellation modes) are things the renderer never asks for. */
     V.feat_lod_bias = !portability || have_ps.samplerMipLodBias;
+    /* Flat shading takes the first vertex's colour on Vulkan, as in D3D8 --
+     * except on Metal, which takes the last, and MoltenVK has no
+     * VK_EXT_provoking_vertex to change it (rhi_flat_shading_matches_d3d). */
+    g_vk_flat_last_vertex = portability;
     if (!have13.dynamicRendering || !have13.synchronization2 || !have13.maintenance4 ||
         !have12.timelineSemaphore) {
         fprintf(stderr, "[RHI] vulkan: %s lacks dynamic rendering, synchronization2, "
