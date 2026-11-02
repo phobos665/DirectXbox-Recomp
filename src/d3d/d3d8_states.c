@@ -48,6 +48,8 @@ static uint32_t d3d8_to_rhi_blend(DWORD d3d8blend)
     case D3DBLEND_DESTCOLOR:    return RHI_BLEND_DEST_COLOR;
     case D3DBLEND_INVDESTCOLOR: return RHI_BLEND_INV_DEST_COLOR;
     case D3DBLEND_SRCALPHASAT:  return RHI_BLEND_SRC_ALPHA_SAT;
+    case D3DBLEND_BLENDFACTOR:     return RHI_BLEND_FACTOR;
+    case D3DBLEND_INVBLENDFACTOR:  return RHI_BLEND_INV_FACTOR;
     default:                    return RHI_BLEND_ONE;
     }
 }
@@ -120,7 +122,9 @@ static DWORD hash_raster_states(const DWORD *rs, BOOL scissor)
 {
     return rs[D3DRS_CULLMODE] ^
            (rs[D3DRS_FILLMODE] << 4) ^
-           (scissor ? 0x100u : 0u);
+           (scissor ? 0x100u : 0u) ^
+           (rs[D3DRS_XBOX_DEPTHBIAS_SLOPE] * 0x9E3779B1u) ^
+           (rs[D3DRS_XBOX_DEPTHBIAS_UNITS] * 0x85EBCA77u);
 }
 
 /* ================================================================
@@ -239,6 +243,21 @@ static void update_rasterizer_state(const DWORD *rs, BOOL scissor)
     }
 
     rd.front_ccw = 0;
+    /* The NV2A's polygon offset (D3DRS_XBOX_DEPTHBIAS_*): decals, blob
+     * shadows and shadow-map passes pull themselves off the surface under
+     * them with it. The constant is in units of a 24-bit depth buffer, which
+     * is what the host's is (D24S8; MoltenVK's D32S8 counts a unit at the
+     * depth near 1 the same way, and less nearer the eye). */
+    {
+        float slope, units;
+        DWORD s = rs[D3DRS_XBOX_DEPTHBIAS_SLOPE], u = rs[D3DRS_XBOX_DEPTHBIAS_UNITS];
+        memcpy(&slope, &s, sizeof slope);
+        memcpy(&units, &u, sizeof units);
+        if (slope == slope && units == units) {          /* not NaN */
+            rd.slope_scaled_depth_bias = slope;
+            rd.depth_bias = (int32_t)(units < 0 ? units - 0.5f : units + 0.5f);
+        }
+    }
     rd.depth_clip = depth_clamp() ? 0 : 1;
     rd.scissor = scissor ? 1 : 0;
     rd.multisample = 0;
@@ -459,6 +478,14 @@ void d3d8_states_apply(void)
     update_depth_stencil_state(rs);
     update_rasterizer_state(rs, scissor_on);
 
+    /* The constant colour D3DBLEND_BLENDFACTOR blends with (D3DCOLOR). */
+    {
+        DWORD c = rs[D3DRS_BLENDFACTOR];
+        blend_factor[0] = (float)((c >> 16) & 0xFF) / 255.0f;
+        blend_factor[1] = (float)((c >> 8) & 0xFF) / 255.0f;
+        blend_factor[2] = (float)(c & 0xFF) / 255.0f;
+        blend_factor[3] = (float)(c >> 24) / 255.0f;
+    }
     if (g_blend_state)
         rhi_set_blend_state(g_blend_state, blend_factor, 0xFFFFFFFF);
     if (g_ds_state)

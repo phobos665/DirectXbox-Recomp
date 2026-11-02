@@ -415,6 +415,15 @@ typedef enum D3DRENDERSTATETYPE {
      * with the texture coordinate's r/q (a shadow map). A D3DCMPFUNC; 0
      * while the title has not set it. */
     D3DRS_SHADOWFUNC               = 254,
+    /* Xbox D3DRS_BLENDCOLOR: the constant colour D3DBLEND_BLENDFACTOR and
+     * INVBLENDFACTOR blend with, as a D3DCOLOR. D3D9's number for it. */
+    D3DRS_BLENDFACTOR              = 193,
+    /* The NV2A's polygon offset, worked out from the Xbox's
+     * POLYGONOFFSETZSLOPESCALE / ZOFFSET / *OFFSETENABLE and ZBIAS
+     * (hle_d3d8_state.c): float bits, the slope factor and the constant
+     * in units of a 24-bit depth buffer. 0 for none. */
+    D3DRS_XBOX_DEPTHBIAS_SLOPE     = 172,
+    D3DRS_XBOX_DEPTHBIAS_UNITS     = 173,
 } D3DRENDERSTATETYPE;
 
 #define D3D8_PSTEXTUREMODES_XBOX 0x80000000u
@@ -522,6 +531,8 @@ typedef enum D3DBLEND {
     D3DBLEND_DESTCOLOR       = 9,
     D3DBLEND_INVDESTCOLOR    = 10,
     D3DBLEND_SRCALPHASAT     = 11,
+    D3DBLEND_BLENDFACTOR     = 14,   /* D3D9's: the constant colour */
+    D3DBLEND_INVBLENDFACTOR  = 15,
 } D3DBLEND;
 
 typedef enum D3DCMPFUNC {

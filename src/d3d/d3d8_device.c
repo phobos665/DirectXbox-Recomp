@@ -784,6 +784,7 @@ static void d3d8_init_default_states(D3D8DeviceState *state)
     /* Set Xbox D3D8 default render states */
     memset(state->render_states, 0, sizeof(state->render_states));
     state->render_states[D3DRS_ZENABLE]           = 1;
+    state->render_states[D3DRS_BLENDFACTOR]       = 0xFFFFFFFF;
     state->render_states[D3DRS_FILLMODE]          = D3DFILL_SOLID;
     state->render_states[D3DRS_SHADEMODE]         = 2; /* D3DSHADE_GOURAUD */
     state->render_states[D3DRS_ZWRITEENABLE]      = TRUE;

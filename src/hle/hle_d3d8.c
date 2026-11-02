@@ -6811,6 +6811,14 @@ HLE_EXPORT(D3DDevice_GetVisibilityTestResult)
 
 /* For hle_d3d8_texture.c: the shadow device (NULL when shadow mode is off)
  * and the frame count its cache ages entries by. */
+/* The depth buffer's full scale (65535 for D16, 16777215 for D24S8, a
+ * float format's otherwise), for the polygon offset's units
+ * (hle_d3d8_state.c). */
+float hle_d3d8_depth_z_scale(void)
+{
+    return g_z_scale;
+}
+
 IDirect3DDevice8 *hle_d3d8_shadow_device(void)
 {
     return g_shadow;

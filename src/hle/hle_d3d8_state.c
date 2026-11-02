@@ -43,8 +43,10 @@
  *
  * Forwarded but not yet used by the host: SHADEMODE, DITHERENABLE,
  * NORMALIZENORMALS, RESULTARG, BUMPENVMAT*, MIPMAPLODBIAS,
- * MAXMIPLEVEL, BORDERCOLOR. Not forwarded: WRAP0-3, VERTEXBLEND, LOCALVIEWER, ZBIAS,
- * EDGEANTIALIAS, BLENDCOLOR, the back-face material and two-sided lighting
+ * MAXMIPLEVEL. BLENDCOLOR, the polygon offset states and ZBIAS are
+ * forwarded as the host's blend factor and depth bias (derived_states).
+ * Not forwarded: WRAP0-3, VERTEXBLEND, LOCALVIEWER,
+ * EDGEANTIALIAS, the back-face material and two-sided lighting
  * states, point sprite and multisample states, and the
  * texture stage states ADDRESSW, BUMPENVLSCALE/LOFFSET,
  * COLORKEYOP, COLORSIGN, ALPHAKILL, COLORKEYCOLOR, COLORARG0 (its host number
@@ -234,7 +236,15 @@ static DWORD blend_to_host(uint32_t v)
         return D3DBLEND_ONE;
     if (v >= 0x300 && v <= 0x308)
         return D3DBLEND_SRCCOLOR + (v - 0x300);  /* SRCCOLOR..SRCALPHASAT */
-    unmapped("D3DBLEND", v);                 /* the constant-colour factors */
+    /* The constant factors (GL_CONSTANT_COLOR 0x8001, its inverse, and
+     * GL_CONSTANT_ALPHA 0x8003 and its inverse): the host has one constant,
+     * the blend factor, so the alpha ones take the colour's alpha in all four
+     * channels (derived_states). */
+    if (v == 0x8001 || v == 0x8003)
+        return D3DBLEND_BLENDFACTOR;
+    if (v == 0x8002 || v == 0x8004)
+        return D3DBLEND_INVBLENDFACTOR;
+    unmapped("D3DBLEND", v);
     return D3DBLEND_ONE;
 }
 
@@ -418,6 +428,88 @@ static const struct {
      * The compare a shadow-map stage makes (d3d8_combiners.c). */
     { 157, D3DRS_SHADOWFUNC,       CMP },
 };
+
+/* States the host takes as one value worked out from several of the
+ * title's, each forwarded when the value changes.
+ *
+ * The blend factor: BLENDCOLOR (75), or its alpha in all four channels while
+ * either blend factor is a constant alpha (GL_CONSTANT_ALPHA, 0x8003/0x8004):
+ * the host has one constant for both. A draw that blends by the constant
+ * colour on one side and the constant alpha on the other cannot be expressed
+ * and gets the colour, said once.
+ *
+ * The depth bias: the NV2A's polygon offset -- POLYGONOFFSETZSLOPESCALE (77)
+ * and ZOFFSET (78), floats, applied while the enable for the current fill
+ * mode is on (POINT/WIREFRAME/SOLIDOFFSETENABLE, 79-81). The constant is in
+ * units of the title's depth buffer, scaled here to a 24-bit one's. With no
+ * offset enabled, ZBIAS (149, 0-16) as Cxbx-Reloaded applies it: a constant
+ * 0.000005 of the depth range towards the eye per step. Decals and blob
+ * shadows use these to sit on the surface under them; without them they
+ * z-fight with it or vanish. */
+static uint32_t g_prev_factor = 0xFFFFFFFFu, g_prev_slope, g_prev_units;
+static int      g_prev_derived_valid;
+
+float hle_d3d8_depth_z_scale(void);              /* hle_d3d8.c */
+
+static void derived_states(IDirect3DDevice8 *dev)
+{
+    uint32_t color = guest_rs(75), src = guest_rs(62), dst = guest_rs(63);
+    uint32_t factor = color, fill = guest_rs(139), enable;
+    int cc = src == 0x8001 || src == 0x8002 || dst == 0x8001 || dst == 0x8002;
+    int ca = src == 0x8003 || src == 0x8004 || dst == 0x8003 || dst == 0x8004;
+    float slope = 0.0f, units = 0.0f;
+    uint32_t s_bits, u_bits;
+
+    if (ca && !cc) {
+        uint32_t a = color >> 24;
+        factor = (a << 24) | (a << 16) | (a << 8) | a;
+    } else if (ca && cc) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[HLE-D3D8] a draw blends by both the constant colour and the "
+                    "constant alpha; the host has one constant and uses the colour\n");
+    }
+    if ((cc || ca) && guest_rs(59)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[HLE-D3D8] the title blends by a constant (factors 0x%X/0x%X, "
+                    "colour 0x%08X)\n", src, dst, color);
+    }
+    if (!g_prev_derived_valid || factor != g_prev_factor) {
+        g_prev_factor = factor;
+        host_SetRenderState(dev, D3DRS_BLENDFACTOR, factor);
+    }
+
+    /* Fill mode is GL's: POINT 0x1B00, LINE 0x1B01, FILL 0x1B02. */
+    enable = fill == 0x1B00 ? guest_rs(79) : fill == 0x1B01 ? guest_rs(80) : guest_rs(81);
+    if (enable) {
+        uint32_t sb = guest_rs(77), ob = guest_rs(78);
+        float zmax = hle_d3d8_depth_z_scale();
+        memcpy(&slope, &sb, sizeof slope);
+        memcpy(&units, &ob, sizeof units);
+        if (zmax >= 1.0f && zmax < 16777215.0f && zmax != 511.9375f)
+            units *= 16777215.0f / zmax;           /* D16: 256 host units a step */
+    } else if (guest_rs(149)) {
+        units = -(float)(int32_t)guest_rs(149) * 0.000005f * 16777215.0f;
+    }
+    if (slope != slope || units != units)
+        slope = units = 0.0f;
+    memcpy(&s_bits, &slope, sizeof s_bits);
+    memcpy(&u_bits, &units, sizeof u_bits);
+    if ((slope != 0.0f || units != 0.0f)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[HLE-D3D8] depth bias: slope %g, %g units (%s)\n", slope, units,
+                    enable ? "polygon offset" : "ZBIAS");
+    }
+    if (!g_prev_derived_valid || s_bits != g_prev_slope || u_bits != g_prev_units) {
+        g_prev_slope = s_bits;
+        g_prev_units = u_bits;
+        host_SetRenderState(dev, D3DRS_XBOX_DEPTHBIAS_SLOPE, s_bits);
+        host_SetRenderState(dev, D3DRS_XBOX_DEPTHBIAS_UNITS, u_bits);
+    }
+    g_prev_derived_valid = 1;
+}
 
 static DWORD rs_to_host(uint8_t kind, uint32_t v)
 {
@@ -968,6 +1060,7 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
                                       host_value);
         }
     }
+    derived_states(dev);
     forward_pixel_shader(dev);
 
     /* RECOMP_HLE_D3D8_STATE_DUMP: what the title's own arrays actually hold,
