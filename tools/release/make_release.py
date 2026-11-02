@@ -37,6 +37,12 @@ known to work from, each with a name and, when the title keeps one folder of
 addresses per image, that folder; the builder refuses any other image. A
 title whose lift does more than the pipeline names its own script as
 `lift`, which the builder runs instead (docs/technical/self-build-release.md).
+`"updater": true` also carries the toolkit's titles/xodash-update as
+recipe-updater/, so the player's launcher can build the 5960 dashboard's
+online updater from their own dashboard (xboxrecomp-build updater) and the
+game installs its title updates from Insignia. `title_update` (exe, sha1,
+lift, cmake) names how the title's own update is built once installed
+(xboxrecomp-build title-update).
 
 Run it where the toolkit builds (the Freedesktop SDK on SteamOS, with the
 rust-stable extension for the builder): the engine and launcher compile
@@ -135,6 +141,11 @@ This release works from these images of the game's default.xbe (SHA-1):
 {hashes}
 Any other is refused, because it has not been tested.
 
+Xbox Live (Insignia): in the settings' System Link tab choose Xbox Live, then
+register this computer's console there. Making an account and installing title
+updates need your own copy of the Xbox dashboard (5960), from an Xbox you own:
+dashboard-files.md, beside this file, says how to get it.
+
 {shortcut}
 
 This is an independent project, not affiliated with, endorsed by or sponsored
@@ -195,6 +206,29 @@ will not run one of its tools, quit and run the command above.)
 README_MACOS_SHORTCUT = """\
 It needs macOS {macos_min} or later on Apple Silicon. Nothing else is
 installed: not Xcode, not its command line tools."""
+
+
+# The 5960 dashboard's online updater: its project here, its target, and the
+# xodash/update.xbe it is lifted from (titles/xodash-update; a hash, not the
+# file).
+UPDATER_PROJECT = "titles/xodash-update"
+UPDATER_EXE = "xodash_update_recomp"
+UPDATER_SHA1 = ["28e1634969edfd307c241979aef5aef1bdc6a5d4"]
+
+
+def copy_project(project, dest, wanted):
+    """What a title's build reads, into dest: its CMakeLists, its sources and
+    its own config (seeds, XDK symbols), and what the recipe adds (its own
+    lift script). Not other scripts, a submodule, or lifted code."""
+    for rel_path in tracked_files(project, ["."]):
+        if not (rel_path == "CMakeLists.txt" or rel_path.startswith(("src/", "config/"))
+                or rel_path in wanted
+                or any(rel_path.startswith(w.rstrip("/") + "/") for w in wanted)):
+            continue
+        if "/recomp/gen/" in rel_path:
+            continue
+        (dest / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(project / rel_path, dest / rel_path)
 
 
 def cm(path):
@@ -413,21 +447,13 @@ def main():
         shutil.copy2(ROOT / f, tk / f)
 
     # The title's project, without generated code or build output.
-    tracked = tracked_files(project, ["."])
     lift = recipe.get("lift")
     wanted = set(recipe.get("include", [])) | ({lift[0]} if lift else set())
-    for rel_path in tracked:
-        # What a title's build reads: its CMakeLists, its sources and its own
-        # config (seeds, XDK symbols), and what the recipe adds (its own lift
-        # script). Not other scripts, a submodule, or lifted code.
-        if not (rel_path == "CMakeLists.txt" or rel_path.startswith(("src/", "config/"))
-                or rel_path in wanted
-                or any(rel_path.startswith(w.rstrip("/") + "/") for w in wanted)):
-            continue
-        if "/recomp/gen/" in rel_path:
-            continue
-        (rel / "recipe" / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(project / rel_path, rel / "recipe" / rel_path)
+    copy_project(project, rel / "recipe", wanted)
+    # The dashboard's online updater, built on the player's machine from
+    # their own dashboard: the project only.
+    if recipe.get("updater"):
+        copy_project(ROOT / UPDATER_PROJECT, rel / "recipe-updater", set())
 
     # The launcher: the title's own target. The project needs a lifted source
     # to configure; the launcher uses none.
@@ -490,6 +516,13 @@ def main():
     # disc); the builder checks and lifts that one.
     if recipe.get("xbe"):
         release["xbe"] = recipe["xbe"]
+    if recipe.get("updater"):
+        release["updater"] = {"recipe": "recipe-updater", "exe": UPDATER_EXE,
+                              "sha1": UPDATER_SHA1}
+    # The title's own update, built once the updater has installed it: its
+    # target, the update XBE's SHA-1s, its lift and CMake switches.
+    if recipe.get("title_update"):
+        release["title_update"] = recipe["title_update"]
     (rel / "release.json").write_text(json.dumps(release, indent=2) + "\n")
     shutil.copy2(ROOT / "LICENSE", rel / "LICENSE")
     notice = NOTICE.format(
@@ -519,6 +552,7 @@ def main():
         start=start, shortcut=shortcut, userdir=userdir,
         hashes="".join(f"  {i['sha1']}  {i.get('name', '')}\n" for i in images))
     (rel / "README.txt").write_text(readme)
+    shutil.copy2(ROOT / "docs/dashboard-files.md", rel / "dashboard-files.md")
     # The toolkit's icon, for a desktop entry or a Steam shortcut; on a Mac,
     # the application's.
     shutil.copy2(ROOT / "assets/icon/png/256.png", rel / "icon.png")
@@ -543,6 +577,7 @@ def main():
             }, f)
         # Beside the application in the archive, where a player sees it first.
         (out / "README.txt").write_text(readme)
+        shutil.copy2(ROOT / "docs/dashboard-files.md", out / "dashboard-files.md")
         # An ad-hoc signature over the whole bundle, last, once nothing in it
         # changes. The linker signs each executable, but alone that leaves
         # the bundle with no Info.plist bound and no resources sealed, which

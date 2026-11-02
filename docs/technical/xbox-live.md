@@ -78,6 +78,59 @@ With an identity loaded, every copy run from that game folder is the same
 console. Two copies in one System Link session need `console_dir = off` on
 one of them.
 
+### With no backup: a generated console (29 Oct 2026)
+
+`console_identity = generate` (`RECOMP_CONSOLE_IDENTITY`), the default with
+`syslink = nat`, makes a console in the settings folder's `console/` when no
+backup is found, as [hakuX](https://github.com/rfandango/hakuX) makes its
+consoles: twelve random digits for the serial, `00:50:F2` and three random
+bytes for the address, sixteen random bytes for the online key, and hakuX's
+HDD key, the same in every install. `backup` only ever uses a backup.
+
+- It is made once and never replaced. To Insignia a new identity is a new
+  console, and a stream of them looks like ban evasion. Nothing writes over
+  a folder holding `eeprom.bin`, `hd_key.txt` or `hddinfo.txt`, so a backup
+  (or part of one) is never touched either.
+- It is in the per-user folder, not the game folder, so every title on the
+  machine is the same console, and copying a game folder does not copy it.
+- The files are what the loader already reads (`eeprom.bin`, `hd_key.txt`),
+  plus `generated`, which marks it as one: its HDD key comes from
+  `hd_key.txt` alone (a `keys.ini` key belongs to a real console), and its
+  video standard follows the title.
+- The EEPROM's security section is left zero. A real one is encrypted with
+  the BIOS's EEPROM key, which the runtime does not have and does not need:
+  the kernel exports the HDD key itself.
+- Why one HDD key for everyone: the machine key is the online key under a
+  keystream from the HDD key, so a unique online key still makes a unique
+  console, and hakuX players sign in to Insignia with this key. The cost:
+  every install is one console to content locked to a console, and an
+  account key on the disk is protected only by a key anyone can read.
+- Saves a title tied to the made-up console (zero HDD key) do not verify
+  under a generated one; the log says so once, when it is made.
+
+Insignia still has to be told the console's keys before it will sign it in.
+Its setup assistant
+([insignia-live/setup-assistant-release](https://github.com/insignia-live/setup-assistant-release),
+an nxdk program, not an XDK title) does that with one HTTPS request,
+`POST https://insignia.live/api/v1/xbox`, a JSON body of `serial_number`,
+`hdd_key` and `online_key` (the keys as 32 upper-case hex digits); it
+refuses a zero HDD key and an EEPROM whose checksums fail.
+`src/net/insignia_register.c` makes the same request from the host (WinHTTP;
+libcurl loaded at run time elsewhere) and reads the answers as the assistant
+does: 200 registered, 422 with Laravel's `errors` ("The serial number has
+already been taken."), 429 too often. Its User-Agent is
+`DirectXbox-Recomp/<version>` (`RECOMP_INSIGNIA_UA`), and
+`RECOMP_INSIGNIA_URL` points it at a test server (`tests/insignia_register`).
+
+The launcher's System Link tab has an **Xbox Live (Insignia)** choice
+(`syslink = nat`; before it a hand-set `nat` was rewritten to `off` on Play)
+with a **Register this console** row. It builds `xbox_console_id.c` in, so it
+finds the console the game will be; looking never makes one
+(`xbox_console_id_generate(0)`), pressing Register does. A 200 for a
+generated console leaves `registered` in its folder and the row says so; a
+backup's folder is never written to. `RECOMP_LAUNCHER_TAB=link` and
+`RECOMP_LAUNCHER_ROW=1` open the launcher there for `RECOMP_LAUNCHER_SHOT`.
+
 ## Accounts
 
 XOnline keeps the console's accounts in the hard disk's config area, which
@@ -87,9 +140,16 @@ Insignia (EvoX's `disk.bin`, the drive's first 512 KB):
 
 | Sector | What |
 | --- | --- |
-| 8 | an index the title updates every run |
+| 8 | the network settings (Xombie's `CONFIG_PARAMS`), which the title rewrites every run; hakuX 0.3 wrote Insignia's DNS at 0x2C, 0x60, 0x178 and 0x18C |
 | 9 | the machine account: named `SN.<serial>`, domain `insignia.live`, realm `passport.net` |
-| 12 | the user account: the gamertag, domain `insignia.live`, realm `PASSPORT.NET` |
+| 10 | not described anywhere yet |
+| 11 | the user table: eight 12-byte slots, a dword 1 when in use and the slot's 3DES IV |
+| 12-19 | the user accounts, slot *i* in sector 12 + *i*: the gamertag, domain `insignia.live`, realm `PASSPORT.NET` |
+
+The sector map is Xombie's (`libs/xbox-sys/src/config_area.rs`); sectors 8,
+9 and 12 are measured here. Every sector is framed: magic `0x79132568` at
+0, two non-zero dwords, the payload from 0x0C, a checksum at 0x1F8 and
+`0xAA550000` at 0x1FC.
 
 Each record starts 0x0C into its sector (name at +0x0C, Kerberos domain at
 +0x24, realm at +0x38), the layout
@@ -103,6 +163,9 @@ otherwise (`console_accounts = replace` takes the backup's, `off` leaves the
 image alone). A title asking to sign up with no account on the disk reboots
 to the dashboard (`HalReturnToFirmware`, launch reason 7) and, with none to
 go to, comes back to itself: that is what an empty disk looks like.
+
+Sectors 8 to 15 hold the user table and the first four user slots; a
+console with a fifth account (sectors 16 to 19) does not bring it yet.
 
 ## Signing in, measured (Rainbow Six 3, 16 Oct 2026)
 

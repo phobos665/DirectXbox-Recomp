@@ -26,6 +26,57 @@ installs it, and the updated game signs in and plays online.
 | Windows, Linux | written, not yet run with Xbox Live |
 | Other titles | not yet tried; each may need its own steps (a Live block, a title update build) |
 
+## Without a console's backup
+
+No BIOS, EEPROM or HDD key is needed: the runtime makes a console of its own,
+as the hakuX emulator does. What you bring is one thing, **your own copy of
+the Xbox dashboard**, and Insignia gives you the rest.
+
+### What you need
+
+- **A subscription code from Insignia.** Register your e-mail at
+  [insignia.live](https://insignia.live/) and they e-mail you a code. It works
+  once, and only with that e-mail address.
+- **The 5960 Xbox dashboard's files**: the C: drive of an Xbox running
+  dashboard 5960 (the last one, and the one Insignia requires), about 100 MB.
+  What is used from it:
+
+  | From C: | What for |
+  | --- | --- |
+  | `xodash\xonlinedash.xbe` | the online dashboard: it signs in and makes your account |
+  | `xodash\media\`, `media\`, `audio\`, `Xbox.xtf`, `XBox Book.xtf` | its graphics, sounds and fonts, which it loads as it starts |
+  | `xodash\update.xbe` | the online updater, which installs title updates (Step 5) |
+
+  It has to be your own copy; nothing here ships it. **How to get it, from
+  an Xbox or from an xemu disk image: `docs/dashboard-files.md`.** Only
+  dashboard 5960 is supported (System Info shows `D:1.00.5960.01`).
+
+### Steps
+
+1. In the launcher's **System Link** tab choose **Xbox Live (Insignia)**.
+2. Select **Register this console**. A console is made for this PC once and
+   kept for good (in `console/` in the per-user settings folder), and
+   Insignia is told its serial number and keys, as its setup assistant does
+   on a real console. Every game on this PC is then that console.
+3. **Make your account** with the dashboard's files, your code, a gamertag
+   and your e-mail: the recompiled online dashboard signs this console in
+   and signs you up, as it does on a console, and the account is written to
+   the game's disk. *(Being wired into the launcher; today it is the
+   `titles/xodash-online` project, see `docs/technical/xbox-live-accounts.md`.)*
+4. **Set your password**: Insignia e-mails you a link. That is for their
+   website; the game signs in without it.
+5. **Title updates**: in a self-building release, the launcher's **Updater**
+   row builds the dashboard's online updater from your dashboard, as the game
+   was built from your disc. When Xbox Live says the game needs an update,
+   choosing OK installs it (Step 5).
+
+Then start the game and sign in from its Xbox Live menu. Checked end to end
+on 29 Oct 2026: an account made this way signed in to Rainbow Six 3 (with
+its title update) and stayed connected.
+
+`console_identity = backup` (or `RECOMP_CONSOLE_IDENTITY=backup`) turns the
+made console off: only a backup is used, as below.
+
 ## What you need
 
 - **Your own original Xbox, softmodded** (running homebrew such as the EvoX
