@@ -1481,6 +1481,25 @@ static int guest_should_hand_over(int64_t now, int at_backedge)
     }
     if (top < GL_PRIO_MIN)
         return 0;
+    /* Raised IRQL. On the console a thread at DISPATCH_LEVEL or above is not
+     * pre-empted by another thread, only interrupted; titles raise it as
+     * mutual exclusion, around a ring another thread reads, and a hand-over
+     * here let that thread in half-way. An interrupt (a host thread, the top
+     * level) still gets in. The starvation valve stays as the bound, for a
+     * title that left IRQL raised by mistake. */
+    if (top <= GL_PRIO_MAX && xbox_IrqlOfThisThread() >= DISPATCH_LEVEL) {
+        static volatile LONG said;
+        if (held < GL_STARVE_QUANTA * q)
+            return 0;
+        if (InterlockedIncrement(&said) == 1) {
+            fprintf(stderr, "  [GUESTLOCK] tid %lu held the lock at raised IRQL for %d ms "
+                            "with another guest thread waiting; handed over anyway\n",
+                    (unsigned long)GetCurrentThreadId(),
+                    (int)(held / 1000000));
+            fflush(stderr);
+        }
+        return 1;
+    }
     if (top > mine)
         return 1;
     if (top == mine)

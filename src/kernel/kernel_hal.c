@@ -259,6 +259,11 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     }
 }
 
+int xbox_IrqlOfThisThread(void)
+{
+    return (int)g_current_irql;
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).

@@ -892,6 +892,8 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
+/* The calling thread's own IRQL (the guest lock asks before handing over). */
+int     xbox_IrqlOfThisThread(void);
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */
