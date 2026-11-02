@@ -2453,14 +2453,29 @@ static void flip_gate_hold_suspended(void)
     xbox_GuestLockRestore(guest_held);
 }
 
+/* A title's hold to the vblank (xbox_Nv2aFlipGateHoldVblank). */
+static volatile LONG g_flip_gate_vblank_hold;
+
+void xbox_Nv2aFlipGateHoldVblank(int on)
+{
+    LONG was = InterlockedExchange(&g_flip_gate_vblank_hold, on ? 1 : 0);
+
+    if (was != (on ? 1 : 0) && getenv("RECOMP_FLIP_GATE_TRACE")) {
+        fprintf(stderr, "  [NV2A] flip gate: %s the vblank for the title\n",
+                on ? "holding to" : "released from");
+        fflush(stderr);
+    }
+}
+
 void xbox_Nv2aFlipGateArm(void)
 {
     static int said;
+    int hold = (int)InterlockedCompareExchange(&g_flip_gate_vblank_hold, 0, 0);
 
     flip_gate_hold_suspended();
-    if (flip_gate_divisor() == 0)
+    if (flip_gate_divisor() == 0 && !hold)
         return;
-    if (g_flip_gate_host_hz) {
+    if (g_flip_gate_host_hz && !hold) {
         flip_gate_host_paced();
         return;
     }

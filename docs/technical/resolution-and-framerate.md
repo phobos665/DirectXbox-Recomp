@@ -337,6 +337,18 @@ recur; that is cheap and should be part of the stage.
   `recomp_title_timing(DELTA)` in its CMakeLists; only then does its launcher
   offer 90 to 240 and uncapped, and F10 add 120 and 144 to its stops.
   Adaptive 60 stays the default either way.
+- **A frame-stepped title can be made to keep time** (Nov 2026). TimeSplitters
+  2 steps its world by whole vblanks counted each frame, clamped to 1..3, so it
+  runs right below 60 and fast above it. Its project rewrites the step the next
+  frame will use after each present, from the host clock (a fractional float
+  step, whole ticks from an accumulator for the int one; split2-recomp
+  `ts2_free_step`), and then declares `DELTA`. What such a title cannot step by
+  real time -- TimeSplitters 2's in-engine cutscenes, scripted per frame -- it
+  holds to the console's rate with `xbox_Nv2aFlipGateHoldVblank(1)`: while held,
+  uncapped and the host-clocked caps wait for the vblank instead, and 60, 30 and
+  adaptive are unchanged. `RECOMP_FLIP_GATE_TRACE=1` logs each hold and release.
+  Checked the same way as Turok: frames dumped by wall clock at 60 and at 120
+  match, and at 120 with the rewrite off they do not.
 - **"Match display refresh"** should *not* drive the guest vblank. Reading the
   output's refresh (`IDXGIOutput::GetDisplayModeList`, or `EnumDisplaySettings`)
   and adopting, say, 144 Hz as the console's rate speeds the game up. Adopt it

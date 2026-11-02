@@ -326,6 +326,12 @@ void xbox_Nv2aFlipGateSetIdle(xbox_FlipGateIdleFn fn);
  * RECOMP_FPS_CAP asked for that is not a stop on the cycle), and the next
  * one along. For a key the player presses while the title runs. */
 const char *xbox_Nv2aFlipGateModeName(void);
+/* While on, the gate paces one Swap per vblank whatever the frame cap says:
+ * uncapped and the host-clocked caps above 60 (120, 144) wait for the
+ * vblank instead. For a title that steps its logic by real time above 60
+ * but has parts that only run right at the console's rate -- TimeSplitters
+ * 2 holds its in-engine cutscenes to it. 60, 30 and adaptive are unchanged. */
+void        xbox_Nv2aFlipGateHoldVblank(int on);
 
 /* While the title is held at its Swap (host_suspended), what presents the
  * held frame again when the host asks (host_request_redraw). Set by the
