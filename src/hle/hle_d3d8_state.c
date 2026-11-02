@@ -42,13 +42,12 @@
  * object D3DDevice_SetPixelShader selects, not from the render states.
  *
  * Forwarded but not yet used by the host: SHADEMODE, DITHERENABLE,
- * NORMALIZENORMALS, RESULTARG, BUMPENVMAT*, MIPMAPLODBIAS,
- * MAXMIPLEVEL. BLENDCOLOR, the polygon offset states and ZBIAS are
+ * NORMALIZENORMALS, RESULTARG, BUMPENVMAT*. BLENDCOLOR, the polygon offset states and ZBIAS are
  * forwarded as the host's blend factor and depth bias (derived_states).
  * Not forwarded: WRAP0-3, VERTEXBLEND, LOCALVIEWER,
  * EDGEANTIALIAS, the back-face material and two-sided lighting
  * states, point sprite and multisample states, and the
- * texture stage states ADDRESSW, BUMPENVLSCALE/LOFFSET,
+ * texture stage states BUMPENVLSCALE/LOFFSET,
  * COLORKEYOP, COLORSIGN, ALPHAKILL, COLORKEYCOLOR, COLORARG0 (its host number
  * is ALPHAKILL's) and ALPHAARG0.
  */
@@ -536,6 +535,7 @@ static const struct {
 } g_ts_map[] = {
     {  0, D3DTSS_ADDRESSU,      TS_ADDRESS },
     {  1, D3DTSS_ADDRESSV,      TS_ADDRESS },
+    {  2, D3DTSS_ADDRESSW,      TS_ADDRESS },
     {  3, D3DTSS_MAGFILTER,     TS_FILTER },
     {  4, D3DTSS_MINFILTER,     TS_FILTER },
     {  5, D3DTSS_MIPFILTER,     TS_FILTER },

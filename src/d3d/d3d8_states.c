@@ -385,7 +385,7 @@ void d3d8_states_apply_sampler(DWORD stage)
         tss[D3DTSS_MIPFILTER]);
     sd.address_u = d3d8_to_rhi_address(tss[D3DTSS_ADDRESSU] ? tss[D3DTSS_ADDRESSU] : D3DTADDRESS_WRAP);
     sd.address_v = d3d8_to_rhi_address(tss[D3DTSS_ADDRESSV] ? tss[D3DTSS_ADDRESSV] : D3DTADDRESS_WRAP);
-    sd.address_w = RHI_ADDRESS_WRAP;
+    sd.address_w = d3d8_to_rhi_address(tss[D3DTSS_ADDRESSW] ? tss[D3DTSS_ADDRESSW] : D3DTADDRESS_WRAP);
     sd.max_anisotropy = tss[D3DTSS_MAXANISOTROPY] ? tss[D3DTSS_MAXANISOTROPY] : 1;
 
     /* What a BORDER stage reads outside 0..1: the title's D3DTSS_BORDERCOLOR
@@ -424,6 +424,25 @@ void d3d8_states_apply_sampler(DWORD stage)
     }
     sd.compare = RHI_CMP_NEVER;
     sd.max_lod = 3.402823466e+38f;          /* D3D11_FLOAT32_MAX */
+    /* The stage's level-of-detail controls. MIPFILTER NONE reads the top
+     * level only -- it was sampling the smaller ones as soon as the texture
+     * had any; MAXMIPLEVEL is the most detailed level the stage may use (0
+     * for all); MIPMAPLODBIAS, a float, shifts the choice (not on MoltenVK,
+     * which has no sampler bias: rhi_vulkan.c says so once). */
+    if (tss[D3DTSS_MIPFILTER] == D3DTEXF_NONE)
+        sd.max_lod = 0.0f;
+    if (tss[D3DTSS_MAXMIPLEVEL] && tss[D3DTSS_MAXMIPLEVEL] < 16u) {
+        sd.min_lod = (float)tss[D3DTSS_MAXMIPLEVEL];
+        if (sd.max_lod < sd.min_lod)
+            sd.max_lod = sd.min_lod;
+    }
+    {
+        DWORD b = tss[D3DTSS_MIPMAPLODBIAS];
+        float bias;
+        memcpy(&bias, &b, sizeof bias);
+        if (bias == bias && bias > -16.0f && bias < 16.0f)
+            sd.mip_lod_bias = bias;
+    }
 
     /* Unchanged since it was bound: nothing to do. */
     if (g_sampler_states[stage] &&

@@ -449,6 +449,7 @@ typedef enum D3DTEXTURESTAGESTATETYPE {
     D3DTSS_MIPMAPLODBIAS = 19,
     D3DTSS_MAXMIPLEVEL  = 20,
     D3DTSS_MAXANISOTROPY = 21,
+    D3DTSS_ADDRESSW     = 22,   /* a volume texture's third coordinate */
     /* Whether the stage's texture matrix is applied at all, and to how many
      * coordinates (D3DTTFF_*). Not the PC's 24, which this enumeration
      * already uses for COLORKEYOP. */
