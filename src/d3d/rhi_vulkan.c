@@ -1485,14 +1485,18 @@ static int create_allocator(void)
 }
 
 /* The one descriptor set (rhi_vulkan_bindings.h): vertex b0-b3 and b7,
- * pixel b0, b1 and b7, t0-t3, t8 and t9, s0-s3, s8 and s9 -- every slot
- * the renderer binds (section 4.2). */
+ * pixel b0, b1 and b7, t0-t3 and t8-t10, s0-s3 and s8-s10 -- every slot
+ * the renderer binds (section 4.2). A shader that uses any other slot gets
+ * no pipeline and its draws are skipped (build_pipeline), so a new slot
+ * goes here when it goes into a shader: t10 is the display resolve's gamma
+ * ramp (d3d8_display.c), and until it was listed the resolve -- the draw
+ * that puts each frame on screen -- was skipped on every Vulkan host. */
 static const uint32_t g_ubo_bindings[] = {
     RHI_VK_VS_UNIFORM_BASE + 0, RHI_VK_VS_UNIFORM_BASE + 1, RHI_VK_VS_UNIFORM_BASE + 2,
     RHI_VK_VS_UNIFORM_BASE + 3, RHI_VK_VS_UNIFORM_BASE + 7,
     RHI_VK_PS_UNIFORM_BASE + 0, RHI_VK_PS_UNIFORM_BASE + 1, RHI_VK_PS_UNIFORM_BASE + 7,
 };
-static const uint32_t g_tex_slots[] = { 0, 1, 2, 3, 8, 9 };
+static const uint32_t g_tex_slots[] = { 0, 1, 2, 3, 8, 9, 10 };
 
 static int binding_declared(uint32_t binding, uint32_t kind)
 {
