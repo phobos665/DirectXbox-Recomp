@@ -469,15 +469,42 @@ static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
     }
 }
 
+/* The guest's own fields of the section, kept as the console's kernel keeps
+ * them. The lock itself is the host shadow; these are what a title sees when
+ * it looks: Xbox RTL_CRITICAL_SECTION is a DISPATCHER_HEADER (16 bytes), then
+ * LockCount (-1 when free, one more for every holder and waiter), then
+ * RecursionCount and OwningThread (the owner's KTHREAD). They were left as
+ * initialised, so a title asking "do I own this?" -- the XAPI and the CRT
+ * both look at OwningThread -- was always told no. */
+#define CS_LOCK_COUNT(g)  ((volatile LONG *)((uint8_t *)(g) + 0x10))
+#define CS_RECURSION(g)   ((volatile LONG *)((uint8_t *)(g) + 0x14))
+#define CS_OWNER(g)       ((volatile uint32_t *)((uint8_t *)(g) + 0x18))
+extern uint32_t xbox_CurrentThreadObject(void);
+
+static void cs_guest_owned(PRTL_CRITICAL_SECTION g)     /* now held by this thread */
+{
+    if ((*CS_RECURSION(g))++ == 0)
+        *CS_OWNER(g) = xbox_CurrentThreadObject();
+}
+
+static void cs_guest_released(PRTL_CRITICAL_SECTION g)  /* about to be let go */
+{
+    if (*CS_RECURSION(g) > 0 && --(*CS_RECURSION(g)) == 0)
+        *CS_OWNER(g) = 0;
+    InterlockedDecrement(CS_LOCK_COUNT(g));
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (!cs)
         return;
     InterlockedIncrement(&g_cs_enters);
+    InterlockedIncrement(CS_LOCK_COUNT(CriticalSection));   /* holders and waiters */
     crt_lock_trace("take", CriticalSection);
     if (TryEnterCriticalSection(cs)) {
         xbox_cs_note_owner(cs);
+        cs_guest_owned(CriticalSection);
         return;
     }
     if (InterlockedIncrement(&g_cs_contention_reports) <= 16) {
@@ -511,6 +538,7 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
     EnterCriticalSection(cs);
     xbox_cs_note_owner(cs);
+    cs_guest_owned(CriticalSection);
     if (g_cs_contention_reports <= 16) {
         fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
                 GetCurrentThreadId(),
@@ -527,6 +555,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         InterlockedIncrement(&g_cs_leaves);
         crt_lock_trace("drop", CriticalSection);
         xbox_cs_clear_owner(cs);
+        cs_guest_released(CriticalSection);
         LeaveCriticalSection(cs);
     }
 }
@@ -545,16 +574,24 @@ BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION Critical
     if (!TryEnterCriticalSection(cs))
         return FALSE;
     InterlockedIncrement(&g_cs_enters);
+    InterlockedIncrement(CS_LOCK_COUNT(CriticalSection));
     crt_lock_trace("take", CriticalSection);
     xbox_cs_note_owner(cs);
+    cs_guest_owned(CriticalSection);
     return TRUE;
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     /* Creating the shadow here is not required -- Enter does it -- but doing
-     * it now keeps the first Enter off the exclusive path. */
+     * it now keeps the first Enter off the exclusive path. The guest fields
+     * as the console's kernel sets them: free, unowned. */
     (void)xbox_cs_shadow(CriticalSection);
+    if (CriticalSection) {
+        *CS_LOCK_COUNT(CriticalSection) = -1;
+        *CS_RECURSION(CriticalSection) = 0;
+        *CS_OWNER(CriticalSection) = 0;
+    }
 }
 
 /* ============================================================================
