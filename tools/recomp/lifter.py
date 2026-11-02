@@ -505,6 +505,7 @@ _EFLAGS_PRESERVE = frozenset({
     "cvtsi2ss", "cvtss2si", "cvttss2si",
     "cvtsi2sd", "cvtsd2si", "cvttsd2si",
     "cvtss2sd", "cvtsd2ss",
+    "stmxcsr", "ldmxcsr",
     "cmpss", "cmpsd",
     "cmpltss", "cmpeqss", "cmpleps", "cmpneqss",
     # SSE packed float
@@ -2181,7 +2182,7 @@ class Lifter:
                  "comiss", "comisd", "ucomiss", "ucomisd",
                  "cvtsi2ss", "cvtss2si", "cvttss2si",
                  "cvtsi2sd", "cvtsd2si", "cvttsd2si",
-                 "cvtss2sd", "cvtsd2ss",
+                 "cvtss2sd", "cvtsd2ss", "stmxcsr", "ldmxcsr",
                  "xorps", "xorpd", "andps", "orps", "andnps",
                  "movd", "movq",
                  "shufps", "unpcklps", "unpckhps",
@@ -4369,6 +4370,16 @@ class Lifter:
             if lifted is not None:
                 return lifted
             return [f"/* {m} {insn.op_str} */"]
+
+        # ── MXCSR ──
+        # The guest's own, per thread (recomp_types_simd.h). Unlifted, both
+        # did nothing: stmxcsr left its slot unwritten, so the CRT's
+        # _controlfp read stack garbage back, and a rounding mode a title
+        # set never reached the rounding conversions.
+        if m == "stmxcsr" and nops >= 1:
+            return [_fmt_operand_write(ops[0], "recomp_stmxcsr()") + " /* stmxcsr */"]
+        if m == "ldmxcsr" and nops >= 1:
+            return [f"recomp_ldmxcsr((uint32_t){_fmt_operand_read(ops[0])}); /* ldmxcsr */"]
 
         # ── Conversions ──
         if m == "cvtsi2ss":

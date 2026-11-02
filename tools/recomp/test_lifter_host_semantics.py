@@ -57,6 +57,15 @@ def test_conversions_use_the_helpers():
     assert "(int32_t)xmm" not in _lift("cvtss2si", _reg("eax"), _reg("xmm1"))
 
 
+def test_mxcsr_is_the_guests_own():
+    # stmxcsr writes the thread's MXCSR to memory; ldmxcsr loads it. Both
+    # were unlifted: the store left its slot unwritten.
+    st = _lift("stmxcsr", _mem(4, base="esp", disp=8))
+    assert "recomp_stmxcsr()" in st and "MEM32(" in st and "RECOMP_UNIMPL" not in st
+    ld = _lift("ldmxcsr", _mem(4, base="esp", disp=8))
+    assert "recomp_ldmxcsr(" in ld and "RECOMP_UNIMPL" not in ld
+
+
 def test_division_is_checked_and_sized():
     assert "RECOMP_DIV_CHECK(_dv)" in _lift("div", _reg("ecx"))
     assert "RECOMP_IDIV_CHECK(_dividend, _dv)" in _lift("idiv", _mem(4))
@@ -102,6 +111,8 @@ _HARNESS = r'''
 #include "recomp_types.h"
 
 ptrdiff_t g_xbox_mem_offset;
+RECOMP_TLS uint32_t g_mxcsr = 0x1F80u;
+volatile int g_mxcsr_rounding;
 static uint8_t guest[0x1000];
 static uint32_t eax, ecx, edx, ebx, esi, edi;
 static uint32_t _fa, _fb; static int32_t _fas, _fbs; static int _cf;
@@ -195,6 +206,18 @@ int main(void)
     edx = 0xFFFFFFFFu; eax = 0x80000000u; ecx = 0xFFFFFFFFu;   /* -2^31 / -1 */
     if (run_div(idiv32) != 0 || eax != 0x80000000u) FAIL("idiv32 -2^31/-1 eax=%08X", eax);
 #endif
+
+    /* The guest's MXCSR rounding control reaches the rounding conversions,
+     * and the truncating ones ignore it. */
+    recomp_ldmxcsr(0x1F80u | 0x2000u);                       /* down */
+    CVT(recomp_cvtss2si, 2.5f, 2);  CVT(recomp_cvtss2si, -2.5f, -3);
+    recomp_ldmxcsr(0x1F80u | 0x4000u);                       /* up */
+    CVT(recomp_cvtsd2si, 2.25, 3);  CVT(recomp_cvtsd2si, -2.75, -2);
+    recomp_ldmxcsr(0x1F80u | 0x6000u);                       /* toward zero */
+    CVT(recomp_cvtss2si, -2.75f, -2); CVT(recomp_cvttss2si, -2.75f, -2);
+    recomp_ldmxcsr(0x1F80u);                                 /* nearest again */
+    CVT(recomp_cvtss2si, 2.5f, 2);  CVT(recomp_cvtss2si, 3.5f, 4);
+    if (recomp_stmxcsr() != 0x1F80u) FAIL("stmxcsr %08X", recomp_stmxcsr());
 
     /* Locked read-modify-writes: the value, and the flags the unlocked form
      * gives (here ZF via _fa, and inc's OF via _fb). */

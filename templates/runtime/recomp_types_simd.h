@@ -15,18 +15,65 @@
 
 /* SSE float-to-int conversions, as x86 does them.
  *
- * cvttss2si/cvttsd2si truncate; cvtss2si/cvtsd2si round under MXCSR.RC,
- * which the guest never changes here (ldmxcsr is not lifted), so to nearest.
+ * cvttss2si/cvttsd2si truncate; cvtss2si/cvtsd2si round under MXCSR.RC: to
+ * nearest unless the guest's own MXCSR (g_mxcsr, ldmxcsr) says otherwise.
  * A NaN or out-of-range input gives 0x80000000, the "integer indefinite".
  * These were plain (int32_t) casts: right for the truncating forms on an x86
  * host, where the cast compiles to cvttss2si; wrong for the rounding forms on
  * every host (they truncated); and on AArch64 a cast saturates instead of
  * giving 0x80000000. x86 hosts use the instructions themselves. */
+/* The guest's MXCSR, per thread like the registers, 0x1F80 (every exception
+ * masked, round to nearest) at reset; stmxcsr and ldmxcsr read and write it.
+ * Only its rounding control (bits 13-14) is applied, to the rounding
+ * conversions below; the exception masks and flags are kept so a title that
+ * reads them back (the CRT's _controlfp) sees what it wrote. Flush-to-zero
+ * and denormals-are-zero are kept but not applied: that would change the
+ * host's own floating-point mode for the runtime's C code on the thread too.
+ * g_mxcsr_rounding is set once any thread asks for a mode other than
+ * nearest, so the conversions read the thread-local only then. Defined in
+ * src/kernel/xbox_memory_layout.c. */
+extern RECOMP_TLS uint32_t g_mxcsr;
+extern volatile int g_mxcsr_rounding;
+static inline uint32_t recomp_stmxcsr(void) { return g_mxcsr; }
+static inline void recomp_ldmxcsr(uint32_t v)
+{
+    g_mxcsr = v;
+    if (v & 0x6000u)
+        g_mxcsr_rounding = 1;
+}
+/* v rounded as MXCSR.RC says: 0 nearest, 1 down, 2 up, 3 toward zero. */
+static inline double recomp_round_rc(double v)
+{
+    switch ((g_mxcsr >> 13) & 3u) {
+    case 1:  return floor(v);
+    case 2:  return ceil(v);
+    case 3:  return trunc(v);
+    default: return nearbyint(v);
+    }
+}
+static inline int32_t recomp_cvt_rc_indef(double v)
+{
+    double r = recomp_round_rc(v);
+    if (!(r >= -2147483648.0 && r <= 2147483647.0))
+        return INT32_MIN;                  /* integer indefinite, NaN included */
+    return (int32_t)r;
+}
+
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <emmintrin.h>
-static RECOMP_FORCEINLINE int32_t recomp_cvtss2si(float v)   { return _mm_cvtss_si32(_mm_set_ss(v)); }
+static RECOMP_FORCEINLINE int32_t recomp_cvtss2si(float v)
+{
+    if (RECOMP_UNLIKELY(g_mxcsr_rounding))
+        return recomp_cvt_rc_indef((double)v);
+    return _mm_cvtss_si32(_mm_set_ss(v));
+}
 static RECOMP_FORCEINLINE int32_t recomp_cvttss2si(float v)  { return _mm_cvttss_si32(_mm_set_ss(v)); }
-static RECOMP_FORCEINLINE int32_t recomp_cvtsd2si(double v)  { return _mm_cvtsd_si32(_mm_set_sd(v)); }
+static RECOMP_FORCEINLINE int32_t recomp_cvtsd2si(double v)
+{
+    if (RECOMP_UNLIKELY(g_mxcsr_rounding))
+        return recomp_cvt_rc_indef(v);
+    return _mm_cvtsd_si32(_mm_set_sd(v));
+}
 static RECOMP_FORCEINLINE int32_t recomp_cvttsd2si(double v) { return _mm_cvttsd_si32(_mm_set_sd(v)); }
 #else
 static inline int32_t recomp_f2i32_indef(double rounded)
@@ -36,10 +83,20 @@ static inline int32_t recomp_f2i32_indef(double rounded)
     return (int32_t)rounded;
 }
 /* nearbyint rounds in the host's mode, which nothing here changes: nearest,
- * as MXCSR's default. */
-static inline int32_t recomp_cvtss2si(float v)   { return recomp_f2i32_indef(nearbyint((double)v)); }
+ * as MXCSR's default; the guest's own mode only once one was asked for. */
+static inline int32_t recomp_cvtss2si(float v)
+{
+    if (g_mxcsr_rounding)
+        return recomp_cvt_rc_indef((double)v);
+    return recomp_f2i32_indef(nearbyint((double)v));
+}
 static inline int32_t recomp_cvttss2si(float v)  { return recomp_f2i32_indef(trunc((double)v)); }
-static inline int32_t recomp_cvtsd2si(double v)  { return recomp_f2i32_indef(nearbyint(v)); }
+static inline int32_t recomp_cvtsd2si(double v)
+{
+    if (g_mxcsr_rounding)
+        return recomp_cvt_rc_indef(v);
+    return recomp_f2i32_indef(nearbyint(v));
+}
 static inline int32_t recomp_cvttsd2si(double v) { return recomp_f2i32_indef(trunc(v)); }
 #endif
 

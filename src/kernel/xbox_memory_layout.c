@@ -3445,6 +3445,9 @@ RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
 RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+/* MXCSR (recomp_types_simd.h): 0x1F80 at reset, every exception masked. */
+RECOMP_TLS uint32_t g_mxcsr = 0x1F80u;
+volatile int g_mxcsr_rounding;
 /* g_ebp, the last frame established by `mov ebp, esp`, read by frameless
  * functions that address their caller's frame through ebp: a field of g_cpu. */
 
