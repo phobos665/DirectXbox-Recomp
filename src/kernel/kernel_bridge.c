@@ -11507,7 +11507,10 @@ static void kernel_thunk_dispatch(void)
         fflush(stderr);
     }
 
-    {
+    /* The two-second summary looks at the clock one call in 256: kernel
+     * calls come by the hundred thousand a second, and reading the time for
+     * each was a measurable share of a busy thread. */
+    if ((g_kernel_call_count & 255) == 0) {
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;

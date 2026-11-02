@@ -31,6 +31,7 @@
 #include <sys/resource.h>
 #include <limits.h>
 #if defined(__APPLE__)
+#include <mach/mach_time.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
@@ -1471,20 +1472,43 @@ VOID GetLocalTime(LPSYSTEMTIME st)
     fill_systemtime(st, &tm, ts.tv_nsec);
 }
 
-ULONGLONG GetTickCount64(void)
+/* The monotonic clock in nanoseconds, which QueryPerformanceCounter and
+ * GetTickCount are. On macOS clock_gettime(CLOCK_MONOTONIC) goes through
+ * gettimeofday and the boot time (17 ns a call on an M4), and the runtime
+ * reads the clock a great deal -- 7.5% of Constantine's main thread was
+ * those two -- so there it is mach_absolute_time (5 ns) and its timebase.
+ * It stops while the machine sleeps, which for a game is what is wanted. */
+static inline uint64_t monotonic_ns(void)
 {
+#if defined(__APPLE__)
+    static uint32_t numer, denom;
+    uint64_t t = mach_absolute_time();
+    if (!denom) {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        numer = tb.numer;
+        denom = tb.denom ? tb.denom : 1;
+    }
+    if (numer == denom)
+        return t;
+    return (uint64_t)(((unsigned __int128)t * numer) / denom);
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (ULONGLONG)ts.tv_sec * 1000ULL + (ULONGLONG)ts.tv_nsec / 1000000ULL;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+ULONGLONG GetTickCount64(void)
+{
+    return (ULONGLONG)(monotonic_ns() / 1000000ULL);
 }
 
 DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 
 BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    count->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    count->QuadPart = (LONGLONG)monotonic_ns();
     return TRUE;
 }
 
