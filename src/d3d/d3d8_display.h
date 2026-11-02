@@ -87,6 +87,11 @@ void d3d8_display_output_shape(UINT scene_w, UINT scene_h,
 HRESULT d3d8_display_resolve(RhiView *scene, UINT scene_w, UINT scene_h,
                              RhiView *out, D3D8DisplayFit fit);
 
+/* The title's gamma ramp, 0..255 to 0..255 per channel, applied at the
+ * resolve as the console's DAC applies it at scan-out. */
+void d3d8_display_set_gamma(const uint8_t red[256], const uint8_t green[256],
+                            const uint8_t blue[256]);
+
 void d3d8_display_shutdown(void);
 
 
