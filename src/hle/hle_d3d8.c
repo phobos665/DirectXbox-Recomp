@@ -78,6 +78,7 @@
 #include "rhi.h"                         /* rhi_set_wait_hooks */
 #include "input_bindings.h"              /* the mouse, for mouse look and mouse: bindings */
 #include "../kernel/xbox_memory_layout.h"  /* the guest lock */
+#include <nmmintrin.h>                   /* CRC32C, ec_hash */
 
 void hle_d3d8_push_constants_sync(void);   /* hle_d3d8_vertex.c */
 int  hle_d3d8_pb_walking(void);             /* hle_d3d8_vertex.c */
@@ -85,6 +86,16 @@ void hle_d3d8_apply_pending_textures(void); /* hle_d3d8_texture.c */
 void hle_d3d8_apply_pending_constants(void); /* hle_d3d8_vertex.c */
 void hle_d3d8_push_skip(void);
 int  hle_d3d8_pb_inline_on(void);
+/* d3d8_device.c: a converted mesh that stays put is uploaded once. */
+void d3d8_stable_vertex_note(const void *ptr, unsigned long long stamp);
+void d3d8_stable_vertex_drop(const void *ptr);
+void d3d8_stable_vertex_report(void);
+int  d3d8_stable_index_prepare(const void *guest, unsigned index_count, unsigned topology,
+                               unsigned long frame, unsigned expect_bytes,
+                               unsigned *min_index, unsigned *vertex_span,
+                               unsigned long long *stamp);
+int  d3d8_stable_index_commit(const void *bytes, unsigned size);
+void d3d8_stable_index_disarm(void);
 
 /* Every replacement starts here. Beyond the one-time log line, it brings the
  * push-buffer walk up to date first (hle_d3d8_vertex.c): what the title wrote
@@ -236,18 +247,27 @@ static int movie_layer_mode(void)
     return mode;
 }
 
-/* After a draw reached the host. */
+/* After a draw reached the host. With deferred frames the stages are only
+ * bound when the queue runs, so the draw wrappers' call comes too early and
+ * the queued draw reports itself instead (hle_d3d8_note_deferred_draw):
+ * judged at recording, Forza Motorsport's menu movie counted as unsampled
+ * and the movie layer covered the whole menu. */
 static void note_draw_sampled_movie(void)
 {
     int s;
 
-    if (!g_movie_phys)
+    if (!g_movie_phys || hle_d3d8_defer_recording())
         return;
     for (s = 0; s < 4; s++)
         if (g_stage_texels[s] == g_movie_phys)
             g_movie_sampled = 1;
 }
 static uint32_t           g_shadow_last_color;
+
+void hle_d3d8_note_deferred_draw(void)
+{
+    note_draw_sampled_movie();
+}
 
 /* RECOMP_HLE_D3D8_TRACE_SWAPS=<from>-<to>: one line per render-target set,
  * clear, back-buffer query, copy and swap while the swap count is in that
@@ -1595,7 +1615,7 @@ static unsigned long g_draws_off_thread;
  * after the title's own body ran: the return addresses are still there. */
 static void trace_draw_callers(void)
 {
-    static long want = -2;
+    static long want = -2, want_host = -1;
     static int shown;
     static uint32_t seen[16];
     extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
@@ -1605,8 +1625,13 @@ static void trace_draw_callers(void)
     if (want == -2) {
         const char *e = getenv("RECOMP_HLE_D3D8_TRACE_DRAW");
         want = e && *e ? (long)strtoul(e, NULL, 0) : -1;
+        e = getenv("RECOMP_HLE_D3D8_TRACE_HOST_DRAW");
+        want_host = e && *e ? (long)strtoul(e, NULL, 0) : -1;
     }
-    if (want < 0 || (uint32_t)want != g_shadow_vs || shown >= 16)
+    if (shown >= 16 ||
+        !((want >= 0 && (uint32_t)want == g_shadow_vs) ||
+          (want_host >= 0 && g_shadow_vs_slot >= 0 &&
+           g_programs[g_shadow_vs_slot].host == (DWORD)want_host)))
         return;
     for (i = -8; i < 120 && n < 6; i++) {
         v = HLE_MEM32(g_esp + 4u * (uint32_t)i);
@@ -1900,6 +1925,15 @@ static int ff_from_declaration(uint32_t handle, uint32_t stride)
 static UINT g_draw_overread;
 static unsigned long g_draws_overread;
 
+/* Read-only correlation between a title material and host draw commands. */
+static uint32_t g_material_trace_object, g_material_trace_pass, g_material_trace_type;
+static int g_material_trace_active;
+void hle_d3d8_material_trace_context(uint32_t object,uint32_t pass,uint32_t type,int active)
+{
+    g_material_trace_object=object;g_material_trace_pass=pass;
+    g_material_trace_type=type;g_material_trace_active=active;
+}
+
 static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 {
     if (g_cpu_bb_locked)
@@ -2023,6 +2057,11 @@ states:
      * from its own state arrays (hle_d3d8_state.c). */
     hle_d3d8_shadow_apply_states(g_shadow);
     hle_d3d8_sync_palettes(g_shadow);
+    if(g_material_trace_active)
+        fprintf(stderr,"[MATDRAW] swap %lu draw %lu object %08X pass %u type %u hostvs %08X stride %u screen %d target %ux%u\n",
+                g_shadow_swaps,g_frame_draws,g_material_trace_object,g_material_trace_pass,g_material_trace_type,
+                g_shadow_vs_slot>=0?(unsigned)g_programs[g_shadow_vs_slot].host:0u,stride,
+                g_target_is_screen,g_target_width,g_target_height);
     g_frame_draws++;
     if (g_target_is_screen)
         g_screen_changes++;
@@ -2058,9 +2097,22 @@ void hle_d3d8_beside_exe(char *out, size_t bytes, const char *name)
     }
 }
 
+/* RECOMP_F11_SERIES=<n>: F11 writes the next n frames, one a swap, and
+ * the next n in-between frames (RECOMP_INTERP_DUMP), each named by its
+ * swap -- the two side by side show what an in-between draws differently
+ * from the frames either side of it (flicker). */
+static int g_dump_series;
+
 static void shadow_dump_next_frame(void)
 {
+    const char *e = getenv("RECOMP_F11_SERIES");
+    int n = e ? atoi(e) : 0;
+
     g_dump_requested = 1;
+    if (n > 0) {
+        g_dump_series = n;
+        hle_d3d8_interp_dump_now(n);
+    }
 }
 
 /* RECOMP_HLE_D3D8_BRIGHT=<n>: every n swaps, say how bright the finished frame
@@ -2201,8 +2253,15 @@ static void ram_dump_at_swap(void)
     static int parsed;
     static unsigned long want[16];
     static int nwant;
-    const char *prefix = getenv("RECOMP_RAM_DUMP");
+    static const char *prefix;
+    static int looked;
     int i;
+
+    /* Once: getenv walks the whole environment, and this runs every Swap. */
+    if (!looked) {
+        prefix = getenv("RECOMP_RAM_DUMP");
+        looked = 1;
+    }
 
     if (!prefix || !*prefix)
         return;
@@ -2287,6 +2346,10 @@ static void shadow_dump_frame(void)
      * no prefix was given -- so pressing the key is the whole procedure. */
     asked = g_dump_requested;
     g_dump_requested = 0;
+    if (g_dump_series > 0) {
+        asked = 2;                      /* one of an F11 series */
+        g_dump_series--;
+    }
     if (asked && (!prefix || !*prefix)) {
         hle_d3d8_beside_exe(asked_prefix, sizeof asked_prefix, "frame");
         prefix = asked_prefix;
@@ -2314,6 +2377,8 @@ static void shadow_dump_frame(void)
         snprintf(path, sizeof path, "%s_s%08lu.bmp", prefix, g_shadow_swaps);
         snprintf(slot, sizeof ring[0], "%s", path);
         written++;
+    } else if (asked == 2) {
+        snprintf(path, sizeof path, "%s_n%05lu.bmp", prefix, g_shadow_swaps);
     } else {
         snprintf(path, sizeof path, "%s%03d.bmp", prefix, written++);
     }
@@ -2694,6 +2759,23 @@ HLE_EXPORT(D3DDevice_Clear)
     hle_d3d8_push_skip();   /* its own clear methods: cleared here, not by the walk */
     if (g_shadow) {
         float z;
+        static int keep_depth = -1;
+
+        /* RECOMP_HLE_D3D8_KEEP_DEPTH_ON_ZCLEAR=1: a clear of the screen's
+         * depth and stencil alone (no colour) clears the stencil only.
+         * Forza Motorsport draws its road and the road's light, then
+         * clears depth and stencil and draws the rest of the scene with
+         * colour writes off for alpha; a far ground plane drawn after that
+         * clear covered the road in the light buffer the road's second pass
+         * multiplies by, and dark slabs lay across the road. Kept, the
+         * road's depth holds it back, as the console's picture shows. Why
+         * the console keeps it is not known; off by default. */
+        if (keep_depth < 0) {
+            const char *e = getenv("RECOMP_HLE_D3D8_KEEP_DEPTH_ON_ZCLEAR");
+            keep_depth = e && e[0] == '1';
+        }
+        if (keep_depth && g_target_is_screen && !(flags & 0xF0u) && (flags & 0x01u))
+            flags &= ~0x01u;
 
         memcpy(&z, &z_bits, sizeof z);
         if (g_shadow_clears < 4)
@@ -2787,6 +2869,74 @@ static unsigned long g_swap_timed;
 static long long g_swap_flush_ticks, g_swap_present_ticks;
 static long long g_swap_flush_max, g_swap_present_max;
 
+extern void d3d8_profile_report(unsigned long frames);
+static void vertex_cache_report(void);
+static void expand_cache_report(void);
+
+/* RECOMP_HLE_PEEK=<va>:<dwords>[,<va>:<dwords>...]: guest memory printed
+ * with every five-second report, sixteen dwords a line. For watching a
+ * title's own state change (a queue, a flag) while it runs, without
+ * stopping it. */
+static int hle_peek_readable(uint32_t va, uint32_t bytes)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    const char *p = (const char *)HLE_PTR(va);
+    if (!bytes)
+        return 1;
+    if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return 0;
+    if ((const char *)mbi.BaseAddress + mbi.RegionSize < p + bytes)
+        return hle_peek_readable(va + (uint32_t)((const char *)mbi.BaseAddress + mbi.RegionSize - p),
+                                 bytes - (uint32_t)((const char *)mbi.BaseAddress + mbi.RegionSize - p));
+    return 1;
+}
+
+static void hle_peek_report(void)
+{
+    static int parsed;
+    static uint32_t va[8], n[8], hop[8][4];
+    static int nva, nhop[8];
+
+    if (!parsed) {
+        const char *e = getenv("RECOMP_HLE_PEEK");
+        parsed = 1;
+        while (e && *e && nva < 8) {
+            char *end;
+            va[nva] = (uint32_t)strtoul(e, &end, 0);
+            nhop[nva] = 0;
+            /* addr@off@off...: follow a pointer at each '@' and add off. */
+            while (*end == '@' && nhop[nva] < 4)
+                hop[nva][nhop[nva]++] = (uint32_t)strtoul(end + 1, &end, 0);
+            n[nva] = 16;
+            if (*end == ':')
+                n[nva] = (uint32_t)strtoul(end + 1, &end, 0);
+            if (n[nva] > 256)
+                n[nva] = 256;
+            nva++;
+            e = *end == ',' ? end + 1 : NULL;
+        }
+    }
+    for (int i = 0; i < nva; i++) {
+        uint32_t a = va[i];
+        int ok = hle_peek_readable(a, 4);
+        for (int h = 0; ok && h < nhop[i]; h++) {
+            a = HLE_MEM32(a) + hop[i][h];
+            ok = a >= 0x10000u && hle_peek_readable(a, 4);
+        }
+        if (!ok || !hle_peek_readable(a, n[i] * 4)) {
+            fprintf(stderr, "[PEEK] #%d: %08X not readable\n", i, a);
+            continue;
+        }
+        for (uint32_t k = 0; k < n[i]; k++) {
+            if (k % 16 == 0)
+                fprintf(stderr, "%s[PEEK] #%d %08X:", k ? "\n" : "", i, a + k * 4);
+            fprintf(stderr, " %08X", HLE_MEM32(a + k * 4));
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
 static void swap_timing_report(void)
 {
     LARGE_INTEGER qpf;
@@ -2794,6 +2944,7 @@ static void swap_timing_report(void)
 
     if (!g_swap_timed)
         return;
+    hle_peek_report();
     QueryPerformanceFrequency(&qpf);
     ms = 1000.0 / (double)qpf.QuadPart / (double)g_swap_timed;
     fprintf(stderr, "[HLE-D3D8] swap timing over %lu frames: gate wait %.2f ms, "
@@ -2806,6 +2957,9 @@ static void swap_timing_report(void)
             (double)g_swap_flush_max * ms * (double)g_swap_timed,
             (double)g_swap_present_ticks * ms,
             (double)g_swap_present_max * ms * (double)g_swap_timed);
+    d3d8_profile_report(g_swap_timed);
+    vertex_cache_report();
+    expand_cache_report();
     g_swap_gate_ticks = g_swap_body_ticks = g_swap_frame_ticks = 0;
     g_swap_flush_ticks = g_swap_present_ticks = 0;
     g_swap_flush_max = g_swap_present_max = 0;
@@ -3139,6 +3293,7 @@ static void frame_end_shadow(void)
         hle_d3d8_texture_frame_end();
 
         g_shadow_swaps++;
+        xbox_WatchdogNotePresent();   /* RECOMP_WATCHDOG_STALL */
         /* The frame boundary for capture: closes the frame being recorded, or
          * starts recording if this is the requested swap. */
         hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
@@ -3222,6 +3377,7 @@ static void frame_end_shadow(void)
                         g_skipped_fullscreen);
             swap_timing_report();
             hle_d3d8_interp_report();
+            xbox_D3D8PacedReport();
             if (g_slot_reloads)
                 fprintf(stderr, "[HLE-D3D8] shadow vertex programs: %lu loads answered from "
                         "the %d cached host programs\n", g_slot_reloads, g_slot_program_count);
@@ -3365,15 +3521,33 @@ HLE_EXPORT(D3DDevice_Swap)
         QueryPerformanceCounter(&t0);
         if (g_swap_last.QuadPart)
             g_swap_frame_ticks += t0.QuadPart - g_swap_last.QuadPart;
-        xbox_Nv2aFlipGateArm();
-        QueryPerformanceCounter(&t1);
-        g_in_swap_body = 1;
-        g_swap_body_starts = g_pushed_starts;
-        HLE_CALL_ORIGINAL(D3DDevice_Swap);
-        g_in_swap_body = 0;
-        QueryPerformanceCounter(&t2);
-        g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
-        g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
+        /* With frame interpolation the title's own Swap runs before the
+         * gate's wait, since the in-between is drawn in that wait from what
+         * the frame drew: Forza draws one last full-screen pass inside its
+         * Swap, and an in-between made before it showed every menu without
+         * it on every other picture -- sharp, then soft, sixty times a
+         * second. */
+        if (hle_d3d8_interp_gate_after_swap()) {
+            g_in_swap_body = 1;
+            g_swap_body_starts = g_pushed_starts;
+            HLE_CALL_ORIGINAL(D3DDevice_Swap);
+            g_in_swap_body = 0;
+            QueryPerformanceCounter(&t1);
+            xbox_Nv2aFlipGateArm();
+            QueryPerformanceCounter(&t2);
+            g_swap_body_ticks += t1.QuadPart - t0.QuadPart;
+            g_swap_gate_ticks += t2.QuadPart - t1.QuadPart;
+        } else {
+            xbox_Nv2aFlipGateArm();
+            QueryPerformanceCounter(&t1);
+            g_in_swap_body = 1;
+            g_swap_body_starts = g_pushed_starts;
+            HLE_CALL_ORIGINAL(D3DDevice_Swap);
+            g_in_swap_body = 0;
+            QueryPerformanceCounter(&t2);
+            g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
+            g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
+        }
         g_swap_last = t2;
         g_swap_timed++;
     }
@@ -4978,7 +5152,11 @@ HLE_EXPORT(D3DDevice_SetViewport)
     uint32_t viewport = HLE_ARG(0);
 
     first_call(&seen, "D3DDevice_SetViewport", viewport);
-    if (viewport && xbox_EnvSwitch("RECOMP_HLE_D3D8_TRACE_VIEWPORT", 0)) {
+    static int trace_viewport = -1;
+
+    if (trace_viewport < 0)
+        trace_viewport = xbox_EnvSwitch("RECOMP_HLE_D3D8_TRACE_VIEWPORT", 0);
+    if (viewport && trace_viewport) {
         /* Every distinct viewport the title sets, once, with its caller:
          * where a title computes the rectangle it draws its 3D into. */
         static struct { uint32_t x, y, w, h, from; } seenvp[64];
@@ -5204,23 +5382,26 @@ static uint32_t depth_texture_of(uint32_t surface)
  * host texture SetTexture binds when the title samples it
  * (hle_d3d8_render_texture), so what a shadow pass writes is what the next
  * pass reads. NULL if the host cannot hold it. */
-static IDirect3DSurface8 *depth_texture_surface(uint32_t texture_va)
+static IDirect3DSurface8 *depth_host_surface(IDirect3DTexture8 *t,uint32_t texture_va)
 {
     static struct { IDirect3DTexture8 *texture; IDirect3DSurface8 *surface; } cache[8];
-    IDirect3DTexture8 *t = hle_d3d8_render_texture(g_shadow, texture_va);
     int i;
 
     if (!t)
         return NULL;
     for (i = 0; i < 8; i++)
-        if (cache[i].texture == t)
+        if (cache[i].texture == t) {
+            host_NoteDepthAlias(cache[i].surface,t);
             return cache[i].surface;
+        }
     for (i = 0; i < 8 && cache[i].texture; i++)
         ;
     if (i == 8)
         i = 0;                           /* reuse the oldest; keeps its ref */
     if (cache[i].surface)
         cache[i].surface->lpVtbl->Release(cache[i].surface);
+    if(cache[i].texture)host_ReleaseTexture(cache[i].texture);
+    t->lpVtbl->AddRef(t);
     cache[i].texture = t;
     cache[i].surface = NULL;
     if (FAILED(t->lpVtbl->GetSurfaceLevel(t, 0, &cache[i].surface)))
@@ -5228,7 +5409,12 @@ static IDirect3DSurface8 *depth_texture_surface(uint32_t texture_va)
     else
         fprintf(stderr, "[HLE-D3D8] shadow map 0x%08X: depth renders into the "
                 "texture the title samples\n", texture_va);
+    host_NoteDepthAlias(cache[i].surface,t);
     return cache[i].surface;
+}
+static IDirect3DSurface8 *depth_texture_surface(uint32_t va)
+{
+    return depth_host_surface(hle_d3d8_render_texture(g_shadow,va),va);
 }
 
 static int nodepth_zscale_on(void)
@@ -5506,6 +5692,9 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         if (!depth && kind != 0 && kind != 3 && own && g_device_depth && texture &&
             share_device_depth_on() && device_depth_fits(texture, level))
             depth = g_device_depth;
+        /* Forza samples a bare depth surface through another container. */
+        if(!depth && kind!=0 && zw==w && zh==h && is_depth_format(zfmt) && shadow_maps_on())
+            depth=depth_host_surface(hle_d3d8_render_surface(g_shadow,zs),zs);
         if (!depth)
             depth = depth_surface(w, h);
         g_target_shadow_map = depth && depth_texture_of(zs) && zw == w && zh == h &&
@@ -6079,13 +6268,146 @@ static void packed_current(const struct shadow_program *p, int k, uint8_t *dst)
     }
 }
 
+/* The converted copy of a draw's vertices (shadow_expand_vertices) is made
+ * for most of a race's draws -- Forza's car and track programs read packed
+ * normals -- and was calloc'd and freed for every one of them. A sampled
+ * race (profil-race5) spent ~2% of the guest thread in the heap for it and
+ * ~4% in out-of-line memmove calls, one per vertex for 30-60 bytes each.
+ *
+ * The copy only lives until the host draw returns: host_DrawPrimitiveUP and
+ * host_DrawIndexedPrimitiveUP hand it to the device, which copies it into
+ * its own vertex buffer, and a deferred or captured draw copies it too
+ * (hle_d3d8_record.c). So one buffer per thread is reused, zeroed as calloc
+ * zeroed it; a copy too big for it is still calloc'd. expand_release frees
+ * whichever it was. */
+#if defined(_WIN32)
+#define EXPAND_TLS __declspec(thread)
+#else
+#define EXPAND_TLS __thread
+#endif
+#define EXPAND_SCRATCH_MAX (8u * 1024u * 1024u)
+static EXPAND_TLS uint8_t *g_expand_scratch;
+static EXPAND_TLS size_t g_expand_scratch_size;
+
+static uint8_t *expand_alloc(size_t n, size_t size)
+{
+    size_t bytes;
+
+    if (!n || !size || n > (size_t)-1 / size)
+        return calloc(n, size);
+    bytes = n * size;
+    if (bytes > EXPAND_SCRATCH_MAX)
+        return calloc(n, size);
+    if (bytes > g_expand_scratch_size) {
+        size_t want = g_expand_scratch_size ? g_expand_scratch_size : 64u * 1024u;
+
+        while (want < bytes)
+            want *= 2u;
+        free(g_expand_scratch);
+        g_expand_scratch = (uint8_t *)malloc(want);
+        g_expand_scratch_size = g_expand_scratch ? want : 0u;
+        if (!g_expand_scratch)
+            return calloc(n, size);
+    }
+    memset(g_expand_scratch, 0, bytes);
+    return g_expand_scratch;
+}
+
+static EXPAND_TLS uint8_t *g_ecache_lent;   /* expand_cached: lent, not given */
+
+/* For hle_d3d8_record.c: vertices the cache owns and keeps unchanged until
+ * the next frame (an entry drawn this frame is neither converted again nor
+ * dropped before then), so a draw kept for an in-between can point at them
+ * instead of copying them. */
+int hle_d3d8_vertices_stable(const void *p)
+{
+    return p && p == (const void *)g_ecache_lent;
+}
+
+static void expand_release(uint8_t *p)
+{
+    if (p == g_ecache_lent) {
+        g_ecache_lent = NULL;              /* the cache's own; it stays there */
+        return;
+    }
+    if (p && p != g_expand_scratch)
+        free(p);
+}
+
+/* Rebased index lists were malloc'd and freed on every indexed draw. One
+ * buffer per thread covers them; a list past 1 MB is still malloc'd and the
+ * caller frees that one. The host copies the indices before this returns. */
+static EXPAND_TLS uint8_t *g_index_scratch;
+static EXPAND_TLS size_t g_index_scratch_size;
+
+static void *index_scratch(size_t bytes)
+{
+    if (!bytes)
+        return NULL;
+    if (bytes <= 1024u * 1024u) {
+        if (bytes > g_index_scratch_size) {
+            size_t want = g_index_scratch_size ? g_index_scratch_size : 4096u;
+            uint8_t *n;
+
+            while (want < bytes)
+                want *= 2u;
+            n = (uint8_t *)realloc(g_index_scratch, want);
+            if (!n)
+                return malloc(bytes);
+            g_index_scratch = n;
+            g_index_scratch_size = want;
+        }
+        return g_index_scratch;
+    }
+    return malloc(bytes);
+}
+
+static void index_scratch_free(void *p)
+{
+    if (p && p != g_index_scratch)
+        free(p);
+}
+
+/* A vertex's few dozen bytes copied inline. memcpy with a size not known at
+ * compile time is a call into the C runtime, made once per vertex; fixed
+ * 16/8/4-byte pieces are a load and a store. The function using it is
+ * marked no_builtin so clang does not fold the loop back into that call. */
+static inline void copy_small(uint8_t *d, const uint8_t *s, size_t n)
+{
+    while (n >= 16u) {
+        __builtin_memcpy(d, s, 16u);
+        d += 16u; s += 16u; n -= 16u;
+    }
+    if (n >= 8u) {
+        __builtin_memcpy(d, s, 8u);
+        d += 8u; s += 8u; n -= 8u;
+    }
+    if (n >= 4u) {
+        __builtin_memcpy(d, s, 4u);
+        d += 4u; s += 4u; n -= 4u;
+    }
+    while (n) {
+        *d++ = *s++;
+        n--;
+    }
+}
+
+#if defined(__clang__)
+#define EXPAND_NO_BUILTIN __attribute__((no_builtin("memcpy", "memmove")))
+#else
+#define EXPAND_NO_BUILTIN
+#endif
+
 /* The vertices a program with NORMPACKED3 registers reads: each vertex copied
  * behind its unpacked normals, as shadow_read_declaration laid them out. The
  * bits are x:11, y:11, z:10, signed, divided by 1023, 1023 and 511
  * (Cxbx-Reloaded's vertex buffer conversion). Returns NULL with *failed clear
  * when the current program packs nothing, and NULL with *failed set when the
  * copy cannot be made; otherwise the copy, and *stride grows to match. */
-static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *stride,
+/* Fixed-size copies inside stay builtins under no_builtin. */
+#define memcpy(d, s, n) __builtin_memcpy((d), (s), (n))
+EXPAND_NO_BUILTIN
+static uint8_t *shadow_expand_vertices_uncached(const void *verts, UINT vertices, UINT *stride,
                                        uint32_t first, int *failed)
 {
     const struct shadow_program *p;
@@ -6117,7 +6439,7 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
             }
         }
         out_stride = g_ff.out_stride;
-        out = calloc((size_t)vertices, out_stride);
+        out = expand_alloc((size_t)vertices, out_stride);
         if (!out) {
             *failed = 1;
             return NULL;
@@ -6143,7 +6465,8 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
                         memcpy(dst + g_ff.out[k], bgra, 4);
                     }
                 } else {
-                    memcpy(dst + g_ff.out[k], f, (size_t)g_ff.floats[k] * sizeof f[0]);
+                    copy_small(dst + g_ff.out[k], (const uint8_t *)f,
+                               (size_t)g_ff.floats[k] * sizeof f[0]);
                 }
             }
         }
@@ -6163,14 +6486,14 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
         UINT span = g_draw_overread;
 
         out_stride = (span + 3u) & ~3u;
-        out = calloc((size_t)vertices, out_stride);
+        out = expand_alloc((size_t)vertices, out_stride);
         if (!out) {
             *failed = 1;
             return NULL;
         }
         for (v = 0; v < vertices; v++) {
             size_t n = AVAIL(v) < span ? AVAIL(v) : span;
-            memcpy(out + (size_t)v * out_stride, (const uint8_t *)verts + (size_t)v * in_stride, n);
+            copy_small(out + (size_t)v * out_stride, (const uint8_t *)verts + (size_t)v * in_stride, n);
         }
         *stride = out_stride;
         return out;
@@ -6206,7 +6529,7 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
         UINT span = g_draw_overread > in_stride ? g_draw_overread : in_stride;
         out_stride = shift + ((span + 3u) & ~3u);
     }
-    out = calloc((size_t)vertices, out_stride);
+    out = expand_alloc((size_t)vertices, out_stride);
     if (!out) {
         *failed = 1;
         return NULL;
@@ -6227,7 +6550,7 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
             at = base[k] + (size_t)v * sstride[k] + p->packed_offset[k];
 
             if (p->packed_raw[k]) {
-                memcpy(dst + p->packed_out[k], at, p->packed_size[k]);
+                copy_small(dst + p->packed_out[k], at, p->packed_size[k]);
                 continue;
             }
             if (p->packed_format[k] == 0x16u) {      /* NORMPACKED3 */
@@ -6259,17 +6582,449 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
                     n[c] = (float)s;
                 }
             }
-            memcpy(dst + p->packed_out[k], n, (size_t)count * sizeof n[0]);
+            copy_small(dst + p->packed_out[k], (const uint8_t *)n, (size_t)count * sizeof n[0]);
         }
         {
             size_t span = g_draw_overread > in_stride ? g_draw_overread : in_stride;
-            memcpy(dst + shift, src, AVAIL(v) < span ? AVAIL(v) : span);
+            copy_small(dst + shift, src, AVAIL(v) < span ? AVAIL(v) : span);
         }
     }
 #undef AVAIL
     *stride = out_stride;
     return out;
 }
+#undef memcpy
+/* Memoize only single-stream conversions. Compare all source bytes and the
+ * whole declaration before reuse; multi-stream/current-register paths stay
+ * uncached. Returned copies retain the caller's existing free() ownership. */
+#define VERTEX_CACHE_SLOTS 64
+#define VERTEX_CACHE_LIMIT (32u*1024u*1024u)
+static struct vertex_cache_entry {
+    const void *source;
+    UINT vertices,in_stride,out_stride;
+    struct shadow_program program;
+    uint8_t *input,*output;
+    size_t input_bytes,output_bytes;
+    unsigned long used;
+} g_vertex_cache[VERTEX_CACHE_SLOTS];
+static size_t g_vertex_cache_bytes;
+static unsigned long g_vertex_cache_hits,g_vertex_cache_misses,g_vertex_cache_verified,g_vertex_cache_mismatch;
+static void vertex_cache_report(void)
+{
+    fprintf(stderr,"[VERTEX-CACHE] hits %lu, misses %lu, verified %lu, mismatches %lu, %.1f MiB\n",
+        g_vertex_cache_hits,g_vertex_cache_misses,g_vertex_cache_verified,g_vertex_cache_mismatch,
+        (double)g_vertex_cache_bytes/(1024.0*1024.0));
+    g_vertex_cache_hits=g_vertex_cache_misses=0;
+}
+
+/* ---- converted vertices kept across frames -------------------------------
+ *
+ * shadow_expand_vertices_uncached rebuilds every vertex of a draw whose
+ * program reads a packed format (NORMPACKED3 and the like), at every draw,
+ * every frame. Forza's car and track programs all do, and their meshes do
+ * not change from one frame to the next: in a sampled race (profil-race6)
+ * the conversion was 11% of the guest thread on its own.
+ *
+ * So a conversion is kept, keyed by where the vertices are, how many, their
+ * stride and everything about the program that shapes the copy, and reused
+ * while a hash of the guest bytes still matches. Hashing reads the vertices
+ * once at memory speed; converting them read, unpacked and wrote every one.
+ * A changed mesh hashes differently and is converted again.
+ *
+ * Only what the copy is a function of alone is kept: one stream, a program
+ * from the declaration, no fixed function. Draws reading other streams, or
+ * a register's current value, are converted every time as before.
+ *
+ * One table per thread, made the first time that thread draws, so nothing
+ * here needs a lock. RECOMP_EXPAND_CACHE=0 turns it off. */
+#define ECACHE_SLOTS      4096u            /* power of two */
+#define ECACHE_PROBE      8u
+#define ECACHE_BUDGET     (96u * 1024u * 1024u)
+#define ECACHE_MAX_INPUT  (4u * 1024u * 1024u)
+#define ECACHE_AGE        240u             /* swaps unused before it may go */
+
+struct ecache_entry {
+    const void *src;
+    uint64_t    layout;                    /* program layout + stride + overread */
+    uint64_t    content;                   /* hash of the guest bytes */
+    UINT        vertices, out_stride;
+    uint8_t    *out;
+    size_t      out_bytes, out_cap;
+    unsigned long used;
+    unsigned long hashed;                  /* swap its bytes were last hashed */
+    unsigned long changed;                 /* swap they last came out different */
+};
+struct ecache {
+    struct ecache_entry e[ECACHE_SLOTS];
+    size_t bytes;
+};
+static EXPAND_TLS struct ecache *g_ecache;
+static unsigned long g_ec_hits, g_ec_converted, g_ec_new, g_ec_uncacheable, g_ec_full;
+static unsigned long g_ec_again, g_ec_frame_skip, g_ec_alt_skip;
+static unsigned long long g_ec_hashed;
+/* Direct map of (pointer, byte count) hashed earlier this frame. A collision
+ * under-counts; it never changes a draw. Tells whether a second hash of the
+ * same mesh is common enough to be worth a same-frame skip. */
+static struct { const void *src; size_t bytes; unsigned long frame; } g_ec_seen[4096];
+
+/* Four CRC32C lanes. The old multiply-rotate hash read every mesh on every
+ * draw (about 10 MB a frame in a race, several milliseconds). Hardware CRC
+ * is the same check — a changed byte lands in a different lane — and moves
+ * at a memory load per instruction. SSE4.2 is the floor: every x64 CPU this
+ * renderer runs on has it. */
+__attribute__((target("sse4.2")))
+static uint64_t ec_hash(const uint8_t *p, size_t n, uint64_t seed)
+{
+    uint64_t a = seed ^ 0x9E3779B185EBCA87ull;
+    uint64_t b = seed ^ 0xC2B2AE3D27D4EB4Full;
+    uint64_t c = seed ^ 0x165667B19E3779F9ull;
+    uint64_t d = seed ^ 0x85EBCA77C2B2AE63ull;
+    size_t i = 0;
+
+    for (; i + 32u <= n; i += 32u) {
+        uint64_t w0, w1, w2, w3;
+        __builtin_memcpy(&w0, p + i, 8u);
+        __builtin_memcpy(&w1, p + i + 8u, 8u);
+        __builtin_memcpy(&w2, p + i + 16u, 8u);
+        __builtin_memcpy(&w3, p + i + 24u, 8u);
+        a = _mm_crc32_u64(a, w0);
+        b = _mm_crc32_u64(b, w1);
+        c = _mm_crc32_u64(c, w2);
+        d = _mm_crc32_u64(d, w3);
+    }
+    for (; i + 8u <= n; i += 8u) {
+        uint64_t w;
+        __builtin_memcpy(&w, p + i, 8u);
+        a = _mm_crc32_u64(a, w);
+    }
+    for (; i < n; i++)
+        a = _mm_crc32_u8((uint32_t)a, p[i]);
+    a ^= (b << 32) ^ c ^ (d << 17) ^ ((uint64_t)n * 0xC2B2AE3D27D4EB4Full);
+    a ^= a >> 33;
+    a *= 0x9E3779B185EBCA87ull;
+    a ^= a >> 29;
+    return a;
+}
+
+static void ec_drop(struct ecache *c, struct ecache_entry *e)
+{
+    d3d8_stable_vertex_drop(e->out);
+    c->bytes -= e->out_cap;
+    free(e->out);
+    memset(e, 0, sizeof *e);
+}
+
+/* Make room: everything not drawn for ECACHE_AGE swaps goes. */
+static void ec_sweep(struct ecache *c, unsigned long now)
+{
+    unsigned i;
+
+    for (i = 0; i < ECACHE_SLOTS; i++)
+        if (c->e[i].out && now - c->e[i].used > ECACHE_AGE)
+            ec_drop(c, &c->e[i]);
+}
+
+static void expand_cache_report(void)
+{
+    unsigned long total = g_ec_hits + g_ec_converted + g_ec_new + g_ec_uncacheable;
+
+    if (!total)
+        return;
+    fprintf(stderr, "[EXPAND-CACHE] %lu draws: %lu reused, %lu converted again (changed), "
+            "%lu new, %lu not cacheable, %lu not kept (full), %lu hashed the same bytes again, "
+            "%lu taken unhashed (checked earlier this frame), %lu on alternate frames; "
+            "%.1f MiB hashed, %.1f MiB held\n",
+            total, g_ec_hits, g_ec_converted, g_ec_new, g_ec_uncacheable, g_ec_full, g_ec_again,
+            g_ec_frame_skip, g_ec_alt_skip,
+            (double)g_ec_hashed / (1024.0 * 1024.0),
+            g_ecache ? (double)g_ecache->bytes / (1024.0 * 1024.0) : 0.0);
+    g_ec_hits = g_ec_converted = g_ec_new = g_ec_uncacheable = g_ec_full = g_ec_again = 0;
+    g_ec_frame_skip = g_ec_alt_skip = 0;
+    g_ec_hashed = 0;
+    d3d8_stable_vertex_report();
+}
+
+static int expand_cache_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_EXPAND_CACHE");
+        on = !(v && v[0] == '0');
+        fprintf(stderr, "[EXPAND-CACHE] converted vertices %s across frames "
+                "(RECOMP_EXPAND_CACHE)\n", on ? "kept" : "not kept");
+    }
+    return on;
+}
+
+/* NULL with *handled clear: not a draw this cache takes. Otherwise the
+ * converted vertices (owned by the cache, see expand_release) or NULL with
+ * *failed set, as the uncached conversion would answer. */
+static uint8_t *expand_cached(const void *verts, UINT vertices, UINT *stride,
+                              uint32_t first, int *failed, int *handled)
+{
+    const struct shadow_program *p;
+    struct ecache *c;
+    struct ecache_entry *e = NULL, *victim = NULL;
+    uint64_t layout, content, kh;
+    UINT in_stride = *stride;
+    size_t in_bytes;
+    unsigned long now = g_shadow_swaps;
+    uint8_t *out;
+    unsigned i;
+    int k;
+
+    *handled = 0;
+    if (g_ff_active || !g_shadow_vs_is_program || g_shadow_vs_slot < 0 ||
+        !verts || !vertices || !in_stride)
+        return NULL;
+    p = &g_programs[g_shadow_vs_slot];
+    if (!p->packed_count && !g_draw_overread)
+        return NULL;                       /* nothing to convert: no copy at all */
+    for (k = 0; k < p->packed_count; k++)
+        if (p->packed_stream[k]) {
+            g_ec_uncacheable++;
+            return NULL;
+        }
+    in_bytes = (size_t)vertices * in_stride;
+    if (in_bytes > ECACHE_MAX_INPUT) {
+        g_ec_uncacheable++;
+        return NULL;
+    }
+    if (!g_ecache) {
+        g_ecache = (struct ecache *)calloc(1, sizeof *g_ecache);
+        if (!g_ecache)
+            return NULL;
+    }
+    c = g_ecache;
+
+    /* Everything the copy's shape depends on besides the bytes. */
+    {
+        uint32_t sh[8 + 6 * SHADOW_MAX_PACKED];
+        int n = 0;
+        sh[n++] = (uint32_t)p->packed_count;
+        sh[n++] = (uint32_t)p->expanded_bytes;
+        sh[n++] = (uint32_t)in_stride;
+        sh[n++] = (uint32_t)g_draw_overread;
+        for (k = 0; k < p->packed_count && k < SHADOW_MAX_PACKED; k++) {
+            sh[n++] = p->packed_offset[k];
+            sh[n++] = p->packed_out[k];
+            sh[n++] = p->packed_format[k];
+            sh[n++] = p->packed_size[k];
+            sh[n++] = p->packed_raw[k];
+            sh[n++] = 0;
+        }
+        layout = ec_hash((const uint8_t *)sh, (size_t)n * sizeof sh[0], 0x51ED270B27u);
+    }
+    kh = ((uint64_t)(uintptr_t)verts * 0x9E3779B97F4A7C15ull) ^ layout ^
+         ((uint64_t)vertices * 0xC2B2AE3D27D4EB4Full);
+    kh ^= kh >> 29;
+    for (i = 0; i < ECACHE_PROBE; i++) {
+        struct ecache_entry *s = &c->e[(kh + i) & (ECACHE_SLOTS - 1u)];
+        if (s->out && s->src == verts && s->vertices == vertices && s->layout == layout) {
+            e = s;
+            break;
+        }
+        if (!victim || !s->out || (victim->out && s->used < victim->used))
+            victim = s;
+    }
+    *handled = 1;
+    /* Checked already this frame: a third of a race's draws are a mesh drawn
+     * again (its shadow, the mirror, a second pass), and hashing it again
+     * read the same bytes for the same answer. An entry used this frame had
+     * its bytes hashed this frame -- a hit, or converted and stored. A mesh
+     * rewritten between two draws of one frame would be missed; Forza never
+     * does it (the "not kept" count, which catches exactly that, stays 0),
+     * and RECOMP_EXPAND_CACHE_FRAME=0 hashes at every draw again. */
+    {
+        static int frame_skip = -1;
+        if (frame_skip < 0) {
+            const char *v = getenv("RECOMP_EXPAND_CACHE_FRAME");
+            frame_skip = !(v && v[0] == '0');
+        }
+        if (frame_skip && e && e->used == now) {
+            g_ec_hits++;
+            g_ec_frame_skip++;
+            *stride = e->out_stride;
+            *failed = 0;
+            g_ecache_lent = e->out;
+            d3d8_stable_vertex_note(e->out, e->content);
+            return e->out;
+        }
+        /* A mesh that has not changed for four seconds and was hashed last
+         * frame is taken as it is on every other frame (half the entries one
+         * frame, half the next). The bytes are still checked at least every
+         * second frame, so a change -- a car's body deforming in a crash --
+         * shows at most one frame late, and from then on that mesh counts as
+         * changing and is hashed at every draw again. Anything that moves
+         * often (and the "changed" count says a few do) never gets here.
+         * RECOMP_EXPAND_CACHE_ALTERNATE=0 hashes every frame. */
+        {
+            static int alternate = -1;
+            if (alternate < 0) {
+                const char *v = getenv("RECOMP_EXPAND_CACHE_ALTERNATE");
+                alternate = !(v && v[0] == '0');
+            }
+            if (alternate && e && e->hashed + 1u == now && now - e->changed >= 120u &&
+                ((((uintptr_t)e >> 6) ^ now) & 1u)) {
+                e->used = now;
+                g_ec_hits++;
+                g_ec_alt_skip++;
+                *stride = e->out_stride;
+                *failed = 0;
+                g_ecache_lent = e->out;
+                d3d8_stable_vertex_note(e->out, e->content);
+                return e->out;
+            }
+        }
+    }
+    {
+        uint64_t sk = ((uint64_t)(uintptr_t)verts * 0x9E3779B97F4A7C15ull) ^ (uint64_t)in_bytes;
+        unsigned slot = (unsigned)(sk ^ (sk >> 32)) & (unsigned)(sizeof g_ec_seen / sizeof g_ec_seen[0] - 1u);
+
+        if (g_ec_seen[slot].frame == now && g_ec_seen[slot].src == verts &&
+            g_ec_seen[slot].bytes == in_bytes)
+            g_ec_again++;
+        else {
+            g_ec_seen[slot].src = verts;
+            g_ec_seen[slot].bytes = in_bytes;
+            g_ec_seen[slot].frame = now;
+        }
+    }
+    content = ec_hash((const uint8_t *)verts, in_bytes, 0);
+    g_ec_hashed += in_bytes;
+    if (e && e->content == content) {
+        e->used = now;
+        e->hashed = now;
+        g_ec_hits++;
+        *stride = e->out_stride;
+        *failed = 0;
+        g_ecache_lent = e->out;
+        d3d8_stable_vertex_note(e->out, content);
+        return e->out;
+    }
+
+    out = shadow_expand_vertices_uncached(verts, vertices, stride, first, failed);
+    if (!out || *failed)
+        return out;                        /* the scratch, or nothing to draw */
+    if (e && e->used == now) {
+        /* Drawn already this frame with other bytes: an in-between may be
+         * pointing at those, so they stay until the frame is over. */
+        g_ec_full++;
+        return out;
+    }
+    {
+        size_t bytes = (size_t)vertices * *stride;
+
+        if (!e) {
+            e = victim;
+            if (e->out && now - e->used <= 1u) {
+                /* Everything in reach is in use this frame. */
+                g_ec_full++;
+                return out;
+            }
+            if (e->out)
+                ec_drop(c, e);
+            g_ec_new++;
+        } else {
+            g_ec_converted++;
+        }
+        if (bytes > e->out_cap) {
+            uint8_t *n;
+            if (c->bytes - e->out_cap + bytes > ECACHE_BUDGET)
+                ec_sweep(c, now);
+            if (c->bytes - (e->out ? e->out_cap : 0) + bytes > ECACHE_BUDGET ||
+                !(n = (uint8_t *)malloc(bytes))) {
+                if (e->out)
+                    ec_drop(c, e);
+                g_ec_full++;
+                return out;
+            }
+            if (e->out) {
+                d3d8_stable_vertex_drop(e->out);
+                c->bytes -= e->out_cap;
+                free(e->out);
+            }
+            e->out = n;
+            e->out_cap = bytes;
+            c->bytes += bytes;
+        }
+        memcpy(e->out, out, bytes);
+        e->src = verts;
+        e->vertices = vertices;
+        e->layout = layout;
+        e->content = content;
+        e->out_stride = *stride;
+        e->out_bytes = bytes;
+        e->used = now;
+        e->hashed = e->changed = now;
+        g_ecache_lent = e->out;            /* the same bytes, and they stay */
+        d3d8_stable_vertex_note(e->out, content);
+        return e->out;
+    }
+}
+
+static uint8_t *shadow_expand_vertices(const void *verts,UINT vertices,UINT *stride,
+                                        uint32_t first,int *failed)
+{
+    static int enabled=-1;
+    if(enabled<0){const char *v=getenv("RECOMP_VERTEX_CACHE");enabled=v && v[0]=='1';}
+    if (!enabled && expand_cache_on()) {
+        int handled;
+        uint8_t *out = expand_cached(verts, vertices, stride, first, failed, &handled);
+        if (handled)
+            return out;
+        return shadow_expand_vertices_uncached(verts, vertices, stride, first, failed);
+    }
+    if(!enabled || g_vertex_cache_mismatch || g_ff_active || !g_shadow_vs_is_program ||
+       g_shadow_vs_slot<0 || g_draw_overread || !verts || !vertices || !*stride)
+        return shadow_expand_vertices_uncached(verts,vertices,stride,first,failed);
+    const struct shadow_program *p=&g_programs[g_shadow_vs_slot];
+    if(!p->packed_count || p->other_streams)
+        return shadow_expand_vertices_uncached(verts,vertices,stride,first,failed);
+    for(int k=0;k<p->packed_count;++k)if(p->packed_stream[k])
+        return shadow_expand_vertices_uncached(verts,vertices,stride,first,failed);
+    size_t input_bytes=(size_t)vertices**stride;
+    if(input_bytes>1024u*1024u)
+        return shadow_expand_vertices_uncached(verts,vertices,stride,first,failed);
+    unsigned victim=0;UINT in_stride=*stride;
+    for(unsigned j=0;j<VERTEX_CACHE_SLOTS;++j){
+        struct vertex_cache_entry *e=&g_vertex_cache[j];
+        if(e->input && e->source==verts && e->vertices==vertices && e->in_stride==in_stride &&
+           !memcmp(&e->program,p,sizeof *p) && !memcmp(e->input,verts,input_bytes)){
+            uint8_t *out=malloc(e->output_bytes);
+            if(!out)break;
+            memcpy(out,e->output,e->output_bytes);e->used=g_shadow_swaps;
+            *stride=e->out_stride;*failed=0;++g_vertex_cache_hits;
+            if(g_vertex_cache_verified<32){
+                UINT reference_stride=in_stride;int bad=0;
+                uint8_t *reference=shadow_expand_vertices_uncached(verts,vertices,&reference_stride,first,&bad);
+                ++g_vertex_cache_verified;
+                if(!reference || bad || reference_stride!=e->out_stride ||
+                   memcmp(reference,out,e->output_bytes)){
+                    ++g_vertex_cache_mismatch;free(out);*stride=reference_stride;*failed=bad;return reference;
+                }
+                expand_release(reference);
+            }
+            return out;
+        }
+        if(!e->input || (g_vertex_cache[victim].input && e->used<g_vertex_cache[victim].used))victim=j;
+    }
+    ++g_vertex_cache_misses;
+    uint8_t *out=shadow_expand_vertices_uncached(verts,vertices,stride,first,failed);
+    if(!out || *failed)return out;
+    size_t output_bytes=(size_t)vertices**stride;
+    struct vertex_cache_entry *e=&g_vertex_cache[victim];
+    size_t old=e->input_bytes+e->output_bytes;
+    if(output_bytes>2u*1024u*1024u || g_vertex_cache_bytes-old+input_bytes+output_bytes>VERTEX_CACHE_LIMIT)return out;
+    uint8_t *input=malloc(input_bytes),*copy=malloc(output_bytes);
+    if(!input || !copy){free(input);free(copy);return out;}
+    memcpy(input,verts,input_bytes);memcpy(copy,out,output_bytes);
+    free(e->input);free(e->output);g_vertex_cache_bytes=g_vertex_cache_bytes-old+input_bytes+output_bytes;
+    e->source=verts;e->vertices=vertices;e->in_stride=in_stride;e->out_stride=*stride;
+    e->program=*p;e->input=input;e->output=copy;e->input_bytes=input_bytes;e->output_bytes=output_bytes;e->used=g_shadow_swaps;
+    return out;
+}
+
 
 /* The host half of every non-indexed draw: the UP draw below and the vertex
  * buffer draws in hle_d3d8_vertex.c. `verts` is already a host pointer to the
@@ -6309,7 +7064,7 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
     if (xpt == XPT_LINELOOP) {           /* close the loop: repeat vertex 0 */
         loop = malloc((size_t)(count + 1) * host_stride);
         if (!loop) {
-            free(expanded);
+            expand_release(expanded);
             g_draws_failed++;
             return;
         }
@@ -6319,7 +7074,7 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
     }
     hr = host_DrawPrimitiveUP(g_shadow, pt, prims, verts, host_stride);
     free(loop);
-    free(expanded);
+    expand_release(expanded);
     if (FAILED(hr))
         g_draws_failed++;
     else if (from_buffer)
@@ -6342,7 +7097,8 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
     uint8_t *expanded;
     D3DPRIMITIVETYPE pt;
     UINT prims, vertices = 0, i, n = 0, host_stride = stride, min_index = 0;
-    int failed;
+    int failed, index_keep = -2;
+    UINT index_expect = 0;
     HRESULT hr;
 
     if (!g_shadow || !idx || !verts || !stride || !count)
@@ -6364,22 +7120,54 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
      * of vertices in: TimeSplitters 2's Siberia draws 340 pieces a frame with
      * indices up to 35,000, and copying every vertex below the highest one
      * for each of them moved hundreds of megabytes a frame and ran at 14 fps.
-     * The range a draw actually uses is a few kilobytes. */
+     * The range a draw actually uses is a few kilobytes.
+     * An unchanged guest list is already in a kept index buffer: the scan
+     * that found its range also checked the bytes, and the draw binds that
+     * buffer instead of rebuilding the list. */
     {
-        UINT lo = 0xFFFFu, hi = 0;
-        for (i = 0; i < count; i++) {
-            if (idx[i] < lo) lo = idx[i];
-            if (idx[i] > hi) hi = idx[i];
+        unsigned long long stamp = 0;
+        index_expect = count * (UINT)sizeof(uint16_t);
+        if (xpt == XPT_TRIANGLEFAN || xpt == XPT_POLYGON)
+            index_expect = prims * 3u * (UINT)sizeof(uint16_t);
+        else if (xpt == XPT_QUADLIST)
+            index_expect = prims * 6u * (UINT)sizeof(uint16_t);
+        else if (xpt == XPT_LINELOOP)
+            index_expect = (count + 1u) * (UINT)sizeof(uint16_t);
+        index_keep = d3d8_stable_index_prepare(idx, count, xpt, g_shadow_swaps, index_expect,
+                                               &min_index, &vertices, &stamp);
+
+        if (index_keep < 0 && index_keep != -1) {
+            UINT lo = 0xFFFFu, hi = 0;
+            for (i = 0; i < count; i++) {
+                if (idx[i] < lo) lo = idx[i];
+                if (idx[i] > hi) hi = idx[i];
+            }
+            min_index = lo;
+            vertices = hi - lo + 1;
         }
-        min_index = lo;
-        vertices = hi - lo + 1;
-        verts = (const uint8_t *)verts + (size_t)lo * stride;
+        verts = (const uint8_t *)verts + (size_t)min_index * stride;
+        /* A converted list is longer than the guest one. Skipping the
+         * rebuild is only safe when the pointer passed below is the guest
+         * list and it is exactly as long as the draw reads. */
+        if (index_keep == 1 && index_expect == count * (UINT)sizeof(uint16_t) &&
+            !hle_d3d8_capture_active()) {
+            /* The live draw can use the retained, rebased GPU indices, but
+             * a capture needs the matching CPU list too. Otherwise it saves
+             * guest indices against a vertex range already shifted by min,
+             * and replay reads past that range into unrelated geometry. */
+            /* The kept list was stored after this conversion. */
+            if (xpt == XPT_TRIANGLEFAN || xpt == XPT_POLYGON || xpt == XPT_QUADLIST)
+                pt = D3DPT_TRIANGLELIST;
+            if (xpt == XPT_QUADLIST)
+                prims *= 2;
+            goto index_ready;
+        }
     }
 
     switch (xpt) {
     case XPT_TRIANGLEFAN:
     case XPT_POLYGON:
-        list = malloc((size_t)prims * 3 * sizeof *list);
+        list = index_scratch((size_t)prims * 3 * sizeof *list);
         for (i = 0; list && i < prims; i++) {
             list[n++] = (uint16_t)(idx[0] - min_index);
             list[n++] = (uint16_t)(idx[i + 1] - min_index);
@@ -6388,7 +7176,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         pt = D3DPT_TRIANGLELIST;
         break;
     case XPT_QUADLIST:
-        list = malloc((size_t)prims * 6 * sizeof *list);
+        list = index_scratch((size_t)prims * 6 * sizeof *list);
         for (i = 0; list && i < prims; i++) {
             const uint16_t *q = idx + i * 4;
             uint16_t a = (uint16_t)(q[0] - min_index), b = (uint16_t)(q[1] - min_index);
@@ -6400,7 +7188,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         prims *= 2;
         break;
     case XPT_LINELOOP:
-        list = malloc(((size_t)count + 1) * sizeof *list);
+        list = index_scratch(((size_t)count + 1) * sizeof *list);
         for (i = 0; list && i < count; i++)
             list[i] = (uint16_t)(idx[i] - min_index);
         if (list)
@@ -6408,7 +7196,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         break;
     default:
         if (min_index) {
-            list = malloc((size_t)count * sizeof *list);
+            list = index_scratch((size_t)count * sizeof *list);
             for (i = 0; list && i < count; i++)
                 list[i] = (uint16_t)(idx[i] - min_index);
         }
@@ -6416,8 +7204,22 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
     }
     if ((xpt == XPT_TRIANGLEFAN || xpt == XPT_POLYGON || xpt == XPT_QUADLIST ||
          xpt == XPT_LINELOOP || min_index) && !list) {
+        d3d8_stable_index_disarm();
         g_draws_failed++;
         return;
+    }
+index_ready:
+    if (index_keep == 0) {
+        UINT kept_n = count;
+        if (list) {
+            if (xpt == XPT_LINELOOP)
+                kept_n = count + 1u;
+            else if (n)
+                kept_n = n;
+        }
+        if (kept_n * (UINT)sizeof(uint16_t) == index_expect)
+            d3d8_stable_index_commit(list ? (const void *)list : (const void *)idx,
+                                     index_expect);
     }
     expanded = shadow_expand_vertices(verts, vertices, &host_stride,
                                       from_buffer && g_draw_first != NO_FIRST_VERTEX
@@ -6425,15 +7227,17 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
                                       &failed);
     g_draw_first = NO_FIRST_VERTEX;
     if (failed) {
-        free(list);
+        d3d8_stable_index_disarm();
+        index_scratch_free(list);
         g_draws_failed++;
         return;
     }
     hr = host_DrawIndexedPrimitiveUP(
         g_shadow, pt, 0, vertices, prims, list ? list : idx, D3DFMT_INDEX16,
         expanded ? expanded : verts, host_stride);
-    free(list);
-    free(expanded);
+    d3d8_stable_index_disarm();
+    index_scratch_free(list);
+    expand_release(expanded);
     if (FAILED(hr))
         g_draws_failed++;
     else if (from_buffer)

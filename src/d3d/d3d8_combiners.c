@@ -85,7 +85,7 @@ static uint32_t g_frame_counter = 0;
  * for our purposes and produces good distribution.
  * ================================================================ */
 
-static uint32_t fnv1a_hash(const void *data, size_t len)
+__attribute__((unused)) static uint32_t fnv1a_hash(const void *data, size_t len)
 {
     const uint8_t *p = (const uint8_t *)data;
     uint32_t h = 0x811C9DC5u;
@@ -102,9 +102,30 @@ static uint32_t fnv1a_hash(const void *data, size_t len)
  * on them made every distinct colour a new entry and a new D3DCompile in a
  * 128-entry table that then evicted and recompiled the same shaders in
  * steady state. */
+/* Eight bytes a step in two lanes. The key is over a kilobyte, and a byte
+ * at a time through one multiply chain was most of a lookup -- and Forza
+ * looks one up at nearly every draw, since its pixel shader changes that
+ * often. Only this process's table uses the value. */
 static uint32_t combiner_state_hash(const NV2ACombinerState *state)
 {
-    return fnv1a_hash(state, NV2A_COMBINER_KEY_BYTES);
+    const uint8_t *p = (const uint8_t *)state;
+    size_t n = NV2A_COMBINER_KEY_BYTES, i = 0;
+    uint64_t a = 0x9E3779B97F4A7C15ull, b = 0xC2B2AE3D27D4EB4Full;
+
+    for (; i + 16u <= n; i += 16u) {
+        uint64_t w0, w1;
+        memcpy(&w0, p + i, 8u);
+        memcpy(&w1, p + i + 8u, 8u);
+        a = (a ^ w0) * 0x100000001B3ull;
+        a ^= a >> 29;
+        b = (b ^ w1) * 0x9E3779B97F4A7C15ull;
+        b ^= b >> 31;
+    }
+    for (; i < n; i++)
+        a = (a ^ p[i]) * 0x100000001B3ull;
+    a ^= b * 0x165667B19E3779F9ull;
+    a ^= a >> 33;
+    return (uint32_t)(a ^ (a >> 32));
 }
 
 static BOOL combiner_state_equal(const NV2ACombinerState *a,
@@ -711,6 +732,17 @@ static int emit_shadow_compare(char *buf, int bufsize, int *poff, int i)
  * matrix is a texture stage state not forwarded yet), CLIPPLANE kills
  * nothing (PSCOMPAREMODE is not forwarded), DOT_ZW does not replace depth.
  * A mode at a stage the hardware does not allow it at reads zero. */
+static int proj2d_volume_r(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_D3D8_PROJ2D_VOLUME_R");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 static int emit_xbox_textures(const NV2ACombinerState *state, char *buf,
                               int bufsize, int *poff)
 {
@@ -736,6 +768,29 @@ static int emit_xbox_textures(const NV2ACombinerState *state, char *buf,
             EMIT("    r_t%d = float4(0, 0, 0, 1);\n", i);
             break;
         case XTM_PROJECT2D:
+            if (state->tex_mode[i] == NV2A_TEXMODE_CUBEMAP) {
+                EMIT("    r_t%d = tex%d.Sample(samp%d, input.tc%d.xyz);\n",
+                     i, i, i, i);
+                break;
+            }
+            if (state->tex_mode[i] == NV2A_TEXMODE_3D) {
+                /* PROJECT2D on a volume: the texture's own dimensions decide,
+                 * so r may be a coordinate too: RECOMP_D3D8_PROJ2D_VOLUME_R=1
+                 * samples at r. Off by default; tried for Forza Motorsport's
+                 * street lights, whose white road turned out to be empty
+                 * stages (d3d8_device.c, empty_stage_view), and it changed
+                 * nothing there. */
+                if (proj2d_volume_r() && (state->vol_r & (1u << i)))
+                    EMIT("    r_t%d = tex%d.Sample(samp%d, input.tc%d.xyz / qdiv(input.tc%d.w));\n",
+                         i,i,i,i,i);
+                else
+                    EMIT("    r_t%d = tex%d.Sample(samp%d, float3(input.tc%d.xy / qdiv(input.tc%d.w), 0.0));\n",
+                         i,i,i,i,i);
+                break;
+            }
+            EMIT("    r_t%d = tex%d.Sample(samp%d, input.tc%d.xy / qdiv(input.tc%d.w) * tex_scale[%d].xy);\n",
+                 i,i,i,i,i,i);
+            break;
         case XTM_BUMPENVMAP:
         case XTM_BUMPENVMAP_LUM:
             EMIT("    r_t%d = tex%d.Sample(samp%d, input.tc%d.xy / qdiv(input.tc%d.w)"
@@ -884,6 +939,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
      * (d3d8_shaders.c for fixed function, d3d8_vsh.c for a program). */
     EMIT("    float  fog     : TEXCOORD4;\n");
     EMIT("    float4 viewpos : TEXCOORD5;\n");
+    /* The W-buffer depth, one copy perspective-correct and one not
+     * (d3d8_vsh.c, oWDep, and d3d8_vsh_wdepth_on). */
+    EMIT("    float4 wdep    : XBOXWDEPTH0;\n");
+    EMIT("    noperspective float4 wlin : XBOXWLINEAR0;\n");
     EMIT("};\n\n");
 
     /* The fog unit, which runs before the combiners: the factor their fog
@@ -943,7 +1002,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     }
 
     /* ---- Main function ---- */
-    EMIT("float4 main(PS_IN input) : SV_TARGET {\n");
+    EMIT("float4 main(PS_IN input, out float o_depth : SV_Depth) : SV_TARGET {\n");
+    /* A W-buffered draw: the exact w, from the rasterised depth less what
+     * screen-space interpolation overstated (d3d8_vsh_wdepth_on). */
+    EMIT("    o_depth = input.pos.z - input.wdep.y * max(input.wlin.x - input.wdep.x, 0.0);\n");
     EMIT("    float shadow_dbg = 0.0;\n");
 
     /* Initialize register file */
@@ -1515,6 +1577,58 @@ BOOL d3d8_combiners_prepare_draw(void)
         forget_last_shaders();
     }
 
+    /* Sampling operation and resource dimension are independent on NV2A.
+     * In particular Forza binds 3D paint atlases under PROJECT2D, and its
+     * car paint's environment cube (stage 3) the same way: sampled as a
+     * cube, the paint has the gloss and reflections it has on the console
+     * (compared with xemu in the car selection and a race); sampled as 2D
+     * it was matte. On by default; RECOMP_D3D8_PROJECT2D_CUBES=0 for the
+     * old 2D sampling. */
+    for (i=0;i<NV2A_MAX_TEXTURES;++i) {
+        if (g_combiner_state.xmode[i] == XTM_PROJECT2D) {
+            IDirect3DBaseTexture8 *texture=d3d8_GetStageTexture(i);
+            static int project2d_cubes = -1;
+            if (project2d_cubes < 0) {
+                const char *e = getenv("RECOMP_D3D8_PROJECT2D_CUBES");
+                project2d_cubes = !(e && e[0] == '0');
+            }
+            D3DRESOURCETYPE type = texture ? texture->lpVtbl->GetType(texture) : 0;
+            NV2ATextureMode mode = type == D3DRTYPE_VOLUMETEXTURE ? NV2A_TEXMODE_3D :
+                project2d_cubes && type == D3DRTYPE_CUBETEXTURE ?
+                    NV2A_TEXMODE_CUBEMAP : NV2A_TEXMODE_2D;
+            if (g_combiner_state.tex_mode[i] != mode) {
+                g_combiner_state.tex_mode[i]=mode;
+                forget_last_shaders();
+            }
+            /* Only a volume at least RECOMP_D3D8_PROJ2D_VOLUME_R_DEPTH
+             * slices deep (8 by default) samples at r. Forza's headlight
+             * volume is 128x128x8 and needs r; its 2-slice paint atlases and
+             * the volumes under its car shadows take r = 0, and sampled at
+             * their own r the shadows jumped from frame to frame. */
+            {
+                static int min_depth = -1;
+                BYTE bit = (BYTE)(1u << i), want = 0;
+                if (min_depth < 0) {
+                    const char *e = getenv("RECOMP_D3D8_PROJ2D_VOLUME_R_DEPTH");
+                    min_depth = e && atoi(e) > 0 ? atoi(e) : 8;
+                }
+                if (mode == NV2A_TEXMODE_3D) {
+                    D3DVOLUME_DESC vd;
+                    memset(&vd, 0, sizeof vd);
+                    if (((IDirect3DVolumeTexture8 *)texture)->lpVtbl->GetLevelDesc(
+                            (IDirect3DVolumeTexture8 *)texture, 0, &vd) == S_OK &&
+                        (int)vd.Depth >= min_depth)
+                        want = bit;
+                }
+                if ((g_combiner_state.vol_r & bit) != want) {
+                    g_combiner_state.vol_r = (BYTE)((g_combiner_state.vol_r & ~bit) | want);
+                    forget_last_shaders();
+                }
+            }
+        }
+    }
+
+
     /* Shadow-map stages come from the textures bound for this draw, not the
      * token: a depth-format texture is compared, not sampled. Part of the
      * shader key, so a change selects another shader. */
@@ -1579,75 +1693,67 @@ BOOL d3d8_combiners_prepare_draw(void)
     /* Bind the combiner pixel shader */
     rhi_set_shader(RHI_STAGE_PIXEL, ps);
 
-    /* Update the PS constant buffer with current values.
-     *
-     * Even though the shader structure doesn't change, the constant
-     * values (C0, C1, fog, alpha ref) can change every frame via
-     * render state writes. So we always re-upload. */
-    mapped = rhi_buffer_map(g_combiner_cb, RHI_MAP_WRITE_DISCARD);
-    if (mapped) {
-        NV2APSConstants *cb = (NV2APSConstants *)mapped;
+    /* Fill the combiner constants, and upload only when they differ from
+     * the buffer the last draw sent. Fog, material colours and the bound
+     * textures stay put across long runs of draws; mapping the buffer on
+     * every one of them was a driver call per draw. */
+    {
+        static NV2APSConstants sent;
+        static int sent_ok;
+        static unsigned long uploads, skipped;
+        static DWORD report_at;
+        NV2APSConstants cb;
 
-        /* Per-stage constants */
+        memset(&cb, 0, sizeof cb);
         for (i = 0; i < NV2A_MAX_COMBINER_STAGES; i++) {
-            d3dcolor_to_float4(g_combiner_state.c0[i], cb->c0[i]);
-            d3dcolor_to_float4(g_combiner_state.c1[i], cb->c1[i]);
+            d3dcolor_to_float4(g_combiner_state.c0[i], cb.c0[i]);
+            d3dcolor_to_float4(g_combiner_state.c1[i], cb.c1[i]);
         }
-
-        /* Final combiner constants */
-        d3dcolor_to_float4(g_combiner_state.final_c0, cb->final_c0);
-        d3dcolor_to_float4(g_combiner_state.final_c1, cb->final_c1);
-
-        /* Fog color from render state */
-        d3dcolor_to_float4(rs[D3DRS_FOGCOLOR], cb->fog_color);
-
-        /* Alpha test parameters */
-        cb->alpha_ref = rs[D3DRS_ALPHAREF] / 255.0f;
-        cb->alpha_func = rs[D3DRS_ALPHAFUNC];
-        cb->alpha_test_enable = rs[D3DRS_ALPHATESTENABLE] ? 1 : 0;
-        cb->fog_enable = rs[D3DRS_FOGENABLE] ? 1 : 0;
-        cb->fog_src = NV2A_FOG_SRC_FACTOR;
-        cb->fog_range = 0;
-        memset(cb->fog_pad, 0, sizeof cb->fog_pad);
-        memset(cb->fog_params, 0, sizeof cb->fog_params);
+        d3dcolor_to_float4(g_combiner_state.final_c0, cb.final_c0);
+        d3dcolor_to_float4(g_combiner_state.final_c1, cb.final_c1);
+        d3dcolor_to_float4(rs[D3DRS_FOGCOLOR], cb.fog_color);
+        cb.alpha_ref = rs[D3DRS_ALPHAREF] / 255.0f;
+        cb.alpha_func = rs[D3DRS_ALPHAFUNC];
+        cb.alpha_test_enable = rs[D3DRS_ALPHATESTENABLE] ? 1 : 0;
+        cb.fog_enable = rs[D3DRS_FOGENABLE] ? 1 : 0;
+        cb.fog_src = NV2A_FOG_SRC_FACTOR;
         if (rs[D3DRS_FOGENABLE]) {
             int program = d3d8_shaders_draw_is_program();
-            memcpy(&cb->fog_params[0], &rs[D3DRS_FOGSTART], sizeof(float));
-            memcpy(&cb->fog_params[1], &rs[D3DRS_FOGEND], sizeof(float));
-            memcpy(&cb->fog_params[2], &rs[D3DRS_FOGDENSITY], sizeof(float));
-            cb->fog_params[3] = (float)rs[D3DRS_FOGTABLEMODE];
-            cb->fog_range = rs[D3DRS_RANGEFOGENABLE] ? 1 : 0;
+            memcpy(&cb.fog_params[0], &rs[D3DRS_FOGSTART], sizeof(float));
+            memcpy(&cb.fog_params[1], &rs[D3DRS_FOGEND], sizeof(float));
+            memcpy(&cb.fog_params[2], &rs[D3DRS_FOGDENSITY], sizeof(float));
+            cb.fog_params[3] = (float)rs[D3DRS_FOGTABLEMODE];
+            cb.fog_range = rs[D3DRS_RANGEFOGENABLE] ? 1 : 0;
             /* Only table fog is mapped here. With no table mode a program's
              * oFog stays the factor itself, as D3D vertex fog has it: mapped
              * linearly through start..end, Need for Speed Underground 2's
              * world (fog on, FOGTABLEMODE NONE) came out the fog colour,
              * a black screen. */
             if (rs[D3DRS_FOGTABLEMODE] != D3DFOG_NONE)
-                cb->fog_src = program ? NV2A_FOG_SRC_PROGRAM_TABLE : NV2A_FOG_SRC_VIEW_TABLE;
+                cb.fog_src = program ? NV2A_FOG_SRC_PROGRAM_TABLE : NV2A_FOG_SRC_VIEW_TABLE;
         }
         for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
             IDirect3DBaseTexture8 *tex = d3d8_GetStageTexture(i);
             D3DFORMAT format = d3d8_base_format(tex);
             UINT w = 0, h = 0;
 
-            cb->alpha_only[i] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
+            cb.alpha_only[i] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
             /* Linear textures are addressed in texels on the NV2A; see
              * NV2APSConstants.tex_scale. */
-            cb->tex_scale[i][0] = cb->tex_scale[i][1] = 1.0f;
-            cb->tex_scale[i][2] = cb->tex_scale[i][3] = 0.0f;
+            cb.tex_scale[i][0] = cb.tex_scale[i][1] = 1.0f;
             if (tex && d3d8_format_is_linear(format) && d3d8_base_size(tex, &w, &h) && w && h) {
-                cb->tex_scale[i][0] = 1.0f / (float)w;
-                cb->tex_scale[i][1] = 1.0f / (float)h;
+                cb.tex_scale[i][0] = 1.0f / (float)w;
+                cb.tex_scale[i][1] = 1.0f / (float)h;
             }
             /* The host holds depth 0..1; the title's r/q is in the format's
              * own range, as the NV2A compares. */
             switch (format) {
             case D3DFMT_D24S8: case D3DFMT_LIN_D24S8:
-                cb->shadow_max[i] = 16777215.0f; break;
+                cb.shadow_max[i] = 16777215.0f; break;
             case D3DFMT_D16: case D3DFMT_LIN_D16:
-                cb->shadow_max[i] = 65535.0f; break;
+                cb.shadow_max[i] = 65535.0f; break;
             default:
-                cb->shadow_max[i] = 1.0f; break;
+                cb.shadow_max[i] = 1.0f; break;
             }
         }
         {
@@ -1663,10 +1769,9 @@ BOOL d3d8_combiners_prepare_draw(void)
                 const char *v = getenv("RECOMP_D3D8_SHADOW_VIEW");
                 view = v ? atoi(v) : 0;
             }
-            cb->shadow_func = rs[D3DRS_SHADOWFUNC];
-            cb->shadow_swap = (UINT)swap;
-            cb->shadow_pad[0] = (UINT)view;     /* shadow_func.z in the HLSL */
-            /* Say once what the first shadow-map draw compares with. */
+            cb.shadow_func = rs[D3DRS_SHADOWFUNC];
+            cb.shadow_swap = (UINT)swap;
+            cb.shadow_pad[0] = (UINT)view;     /* shadow_func.z in the HLSL */
             for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
                 static int said;
                 if (g_combiner_state.shadow[i] && !said) {
@@ -1679,8 +1784,29 @@ BOOL d3d8_combiners_prepare_draw(void)
                 }
             }
         }
+        if (sent_ok && memcmp(&cb, &sent, sizeof cb) == 0) {
+            skipped++;
+        } else {
+            mapped = rhi_buffer_map(g_combiner_cb, RHI_MAP_WRITE_DISCARD);
+            if (mapped) {
+                memcpy(mapped, &cb, sizeof cb);
+                rhi_buffer_unmap(g_combiner_cb);
+                sent = cb;
+                sent_ok = 1;
+                uploads++;
+            }
+        }
+        {
+            DWORD now = GetTickCount();
 
-        rhi_buffer_unmap(g_combiner_cb);
+            if (!report_at)
+                report_at = now;
+            else if (now - report_at >= 5000) {
+                fprintf(stderr, "[PS-CB] %lu uploaded, %lu unchanged\n", uploads, skipped);
+                uploads = skipped = 0;
+                report_at = now;
+            }
+        }
     }
 
     /* Bind the constant buffer to PS slot 0 */

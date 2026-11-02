@@ -154,10 +154,51 @@ static IDXGISwapChain      *g_swap;
 static ID3D11RenderTargetView *g_present_rtv;
 static RhiView             *g_present_view;
 
+/* What the context was last told. A race sets the same shader, blend state
+ * and texture several hundred times a frame; D3D11 does not notice, and the
+ * call itself was measurable. Cleared whenever the context changes. */
+static struct {
+    ID3D11VertexShader *vs;
+    ID3D11PixelShader  *ps;
+    int vs_ok, ps_ok;
+    ID3D11InputLayout *layout;
+    int layout_ok;
+    uint32_t topo;
+    int topo_ok;
+    ID3D11Buffer *vb;
+    UINT vb_stride, vb_off;
+    int vb_ok;
+    ID3D11Buffer *ib;
+    DXGI_FORMAT ib_fmt;
+    UINT ib_off;
+    int ib_ok;
+    ID3D11ShaderResourceView *srv[8];
+    uint8_t srv_ok;
+    ID3D11SamplerState *samp[8];
+    uint8_t samp_ok;
+    ID3D11Buffer *cb[2][8];
+    uint8_t cb_ok[2];
+    ID3D11BlendState *blend;
+    float factor[4];
+    uint32_t mask;
+    int blend_ok;
+    ID3D11DepthStencilState *depth;
+    uint32_t ref;
+    int depth_ok;
+    ID3D11RasterizerState *raster;
+    int raster_ok;
+} g_bind;
+
+static void bind_cache_clear(void)
+{
+    memset(&g_bind, 0, sizeof g_bind);
+}
+
 int rhi_d3d11_adopt(void *device, void *context)
 {
     g_dev = (ID3D11Device *)device;
     g_ctx = (ID3D11DeviceContext *)context;
+    bind_cache_clear();
     return g_dev && g_ctx ? 0 : -1;
 }
 
@@ -295,8 +336,69 @@ static HRESULT create_device_and_swap(DXGI_SWAP_CHAIN_DESC *scd, UINT *create_fl
     return hr;
 }
 
+/* Paced presents (d3d8_device.c) present from a thread of their own: the
+ * swap chain is guarded by this, and the context is made thread-safe. */
+static CRITICAL_SECTION g_present_cs;
+static int              g_present_cs_ready;
+
+static void present_lock(void)
+{
+    if (!g_present_cs_ready) {
+        InitializeCriticalSection(&g_present_cs);
+        g_present_cs_ready = 1;
+    }
+    EnterCriticalSection(&g_present_cs);
+}
+
+static void present_unlock(void)
+{
+    LeaveCriticalSection(&g_present_cs);
+}
+
+/* ID3D10Multithread, which the D3D11 immediate context answers to:
+ * SetMultithreadProtected(TRUE) puts its calls under one lock. */
+static void make_context_thread_safe(void)
+{
+    static const GUID iid_mt = { 0x9B7E4E00, 0x342C, 0x4106,
+                                 { 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0 } };
+    IUnknown *mt = NULL;
+    typedef BOOL (__stdcall *set_fn)(void *self, BOOL on);
+
+    if (!g_ctx || FAILED(ID3D11DeviceContext_QueryInterface(g_ctx, &iid_mt, (void **)&mt)) || !mt)
+        return;
+    ((set_fn)((*(void ***)mt)[5]))(mt, TRUE);
+    IUnknown_Release(mt);
+}
+
+int rhi_d3d11_paced_present(RhiImage *img, uint32_t interval)
+{
+    ID3D11Texture2D *bb = NULL;
+    UINT flags = (interval == 0 && g_vrr && g_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    int rc = -1;
+
+    if (!g_swap || !img || !img->res)
+        return -1;
+    present_lock();
+    if (SUCCEEDED(IDXGISwapChain_GetBuffer(g_swap, 0, &IID_ID3D11Texture2D, (void **)&bb))) {
+        D3D11_TEXTURE2D_DESC a, b;
+        ID3D11Texture2D_GetDesc(bb, &a);
+        ID3D11Texture2D_GetDesc((ID3D11Texture2D *)img->res, &b);
+        if (a.Width == b.Width && a.Height == b.Height && a.Format == b.Format)
+            ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)bb, img->res);
+        ID3D11Texture2D_Release(bb);
+        rc = (int)IDXGISwapChain_Present(g_swap, interval, flags);
+    }
+    present_unlock();
+    return rc;
+}
+
 static int d_device_create(const RhiDeviceDesc *dd)
 {
+    if (!g_present_cs_ready) {
+        InitializeCriticalSection(&g_present_cs);
+        g_present_cs_ready = 1;
+    }
+    {
     static const struct { DXGI_SWAP_EFFECT effect; UINT flags; const char *name; } tries[] = {
         { DXGI_SWAP_EFFECT_FLIP_DISCARD, D3D11_SC_FLAG_ALLOW_TEARING,
           "flip model, tearing allowed (variable refresh possible)" },
@@ -351,13 +453,21 @@ static int d_device_create(const RhiDeviceDesc *dd)
         g_swap = NULL;
         g_dev = NULL;
         g_ctx = NULL;
+        bind_cache_clear();
         return -1;
     }
     if (make_back_buffer_view() != 0) {
         fprintf(stderr, "D3D8: the swap chain's back buffer has no render-target view\n");
         return -1;
     }
+    {
+        const char *e = getenv("RECOMP_PACED_PRESENT");
+        if (e && e[0] == '1')
+            make_context_thread_safe();
+    }
+    bind_cache_clear();
     return 0;
+    }
 }
 
 static void d_device_destroy(void)
@@ -366,6 +476,7 @@ static void d_device_destroy(void)
     release_back_buffer_view();
     if (g_swap) { IDXGISwapChain_Release(g_swap); g_swap = NULL; }
     if (g_ctx)  { ID3D11DeviceContext_Release(g_ctx); g_ctx = NULL; }
+    bind_cache_clear();
     if (g_dev)  { ID3D11Device_Release(g_dev); g_dev = NULL; }
 }
 
@@ -387,16 +498,20 @@ static int d_swapchain_resize(uint32_t w, uint32_t h)
 
     if (!g_swap)
         return -1;
+    present_lock();
     /* ResizeBuffers wants every reference to the old back buffer gone,
      * including any the context still holds. */
     ID3D11DeviceContext_OMGetRenderTargets(g_ctx, 1, &saved_rtv, &saved_dsv);
     ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 0, NULL, NULL);
+    g_bind.srv_ok = 0;
     release_back_buffer_view();
     if (SUCCEEDED(IDXGISwapChain_ResizeBuffers(g_swap, 0, w, h, DXGI_FORMAT_UNKNOWN, g_swap_flags)))
         ok = make_back_buffer_view();
     ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 1, &saved_rtv, saved_dsv);
+    g_bind.srv_ok = 0;
     if (saved_rtv) ID3D11RenderTargetView_Release(saved_rtv);
     if (saved_dsv) ID3D11DepthStencilView_Release(saved_dsv);
+    present_unlock();
     return ok;
 }
 
@@ -426,7 +541,14 @@ static int32_t d_present(uint32_t interval)
 {
     UINT flags = (interval == 0 && g_vrr && g_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
 
-    return g_swap ? (int32_t)IDXGISwapChain_Present(g_swap, interval, flags) : -1;
+    int32_t rc;
+
+    if (!g_swap)
+        return -1;
+    present_lock();
+    rc = (int32_t)IDXGISwapChain_Present(g_swap, interval, flags);
+    present_unlock();
+    return rc;
 }
 
 static int d_image_readback(RhiImage *img, uint32_t sub, void *dst, uint32_t dst_pitch);
@@ -1117,6 +1239,9 @@ static void d_set_render_target(RhiView *color, RhiView *depth)
     ID3D11RenderTargetView *rtv = color ? (ID3D11RenderTargetView *)color->v : NULL;
     ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 1, &rtv,
                                            depth ? (ID3D11DepthStencilView *)depth->v : NULL);
+    /* Binding a target drops any shader view of that resource. The next
+     * SetTextures has to reach the context even if the pointer matches. */
+    g_bind.srv_ok = 0;
 }
 
 static void d_output_save(RhiOutputState *s)
@@ -1164,6 +1289,7 @@ static void d_output_restore(RhiOutputState *s)
     ID3D11DepthStencilView *dsv = (ID3D11DepthStencilView *)s->depth;
 
     ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 1, &rtv, dsv);
+    g_bind.srv_ok = 0;
     if (s->viewport_count)
         d_set_viewports(s->viewport_count, s->viewports);
     if (rtv) ID3D11RenderTargetView_Release(rtv);
@@ -1188,85 +1314,196 @@ static void d_set_scissor(const RhiRect *r)
 
 static void d_set_topology(uint32_t t)
 {
+    if (g_bind.topo_ok && g_bind.topo == t)
+        return;
+    g_bind.topo = t;
+    g_bind.topo_ok = 1;
     ID3D11DeviceContext_IASetPrimitiveTopology(g_ctx, (D3D11_PRIMITIVE_TOPOLOGY)t);
 }
 
 static void d_set_vertex_layout(RhiVertexLayout *l)
 {
-    ID3D11DeviceContext_IASetInputLayout(g_ctx, l ? l->il : NULL);
+    ID3D11InputLayout *il = l ? l->il : NULL;
+    if (g_bind.layout_ok && g_bind.layout == il)
+        return;
+    g_bind.layout = il;
+    g_bind.layout_ok = 1;
+    ID3D11DeviceContext_IASetInputLayout(g_ctx, il);
 }
 
 static void d_set_vertex_buffer(uint32_t slot, RhiBuffer *b, uint32_t stride, uint32_t offset)
 {
     ID3D11Buffer *nb = b ? b->b : NULL;
     UINT st = stride, off = offset;
+    if (slot == 0 && g_bind.vb_ok && g_bind.vb == nb &&
+        g_bind.vb_stride == st && g_bind.vb_off == off)
+        return;
     ID3D11DeviceContext_IASetVertexBuffers(g_ctx, slot, 1, &nb, &st, &off);
+    if (slot == 0) {
+        g_bind.vb = nb;
+        g_bind.vb_stride = st;
+        g_bind.vb_off = off;
+        g_bind.vb_ok = 1;
+    } else {
+        g_bind.vb_ok = 0;
+    }
 }
 
 static void d_set_index_buffer(RhiBuffer *b, uint32_t bits, uint32_t offset)
 {
-    ID3D11DeviceContext_IASetIndexBuffer(g_ctx, b ? b->b : NULL,
-                                         bits == 32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT,
-                                         offset);
+    ID3D11Buffer *nb = b ? b->b : NULL;
+    DXGI_FORMAT fmt = bits == 32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+    if (g_bind.ib_ok && g_bind.ib == nb && g_bind.ib_fmt == fmt && g_bind.ib_off == offset)
+        return;
+    g_bind.ib = nb;
+    g_bind.ib_fmt = fmt;
+    g_bind.ib_off = offset;
+    g_bind.ib_ok = 1;
+    ID3D11DeviceContext_IASetIndexBuffer(g_ctx, nb, fmt, offset);
 }
 
 static void d_set_shader(uint32_t stage, RhiShader *s)
 {
-    if (stage == RHI_STAGE_VERTEX)
-        ID3D11DeviceContext_VSSetShader(g_ctx, s ? (ID3D11VertexShader *)s->sh : NULL, NULL, 0);
-    else
-        ID3D11DeviceContext_PSSetShader(g_ctx, s ? (ID3D11PixelShader *)s->sh : NULL, NULL, 0);
+    if (stage == RHI_STAGE_VERTEX) {
+        ID3D11VertexShader *sh = s ? (ID3D11VertexShader *)s->sh : NULL;
+        if (g_bind.vs_ok && g_bind.vs == sh)
+            return;
+        g_bind.vs = sh;
+        g_bind.vs_ok = 1;
+        ID3D11DeviceContext_VSSetShader(g_ctx, sh, NULL, 0);
+    } else {
+        ID3D11PixelShader *sh = s ? (ID3D11PixelShader *)s->sh : NULL;
+        if (g_bind.ps_ok && g_bind.ps == sh)
+            return;
+        g_bind.ps = sh;
+        g_bind.ps_ok = 1;
+        ID3D11DeviceContext_PSSetShader(g_ctx, sh, NULL, 0);
+    }
 }
 
 static void d_set_uniform_buffers(uint32_t stage, uint32_t slot, uint32_t n, RhiBuffer *const *b)
 {
     ID3D11Buffer *nb[14];
-    uint32_t i;
+    uint32_t i, si;
+    int same;
 
     if (n > 14) n = 14;
     for (i = 0; i < n; i++)
         nb[i] = b[i] ? b[i]->b : NULL;
+    si = stage == RHI_STAGE_VERTEX ? 0u : 1u;
+    same = slot + n <= 8u;
+    for (i = 0; same && i < n; i++) {
+        uint32_t k = slot + i;
+        if (!(g_bind.cb_ok[si] & (1u << k)) || g_bind.cb[si][k] != nb[i])
+            same = 0;
+    }
+    if (same)
+        return;
     if (stage == RHI_STAGE_VERTEX)
         ID3D11DeviceContext_VSSetConstantBuffers(g_ctx, slot, n, nb);
     else
         ID3D11DeviceContext_PSSetConstantBuffers(g_ctx, slot, n, nb);
+    if (slot + n <= 8u) {
+        for (i = 0; i < n; i++) {
+            g_bind.cb[si][slot + i] = nb[i];
+            g_bind.cb_ok[si] |= (uint8_t)(1u << (slot + i));
+        }
+    } else {
+        g_bind.cb_ok[si] = 0;
+    }
 }
 
 static void d_set_textures(uint32_t slot, uint32_t n, RhiView *const *v)
 {
     ID3D11ShaderResourceView *srv[16];
     uint32_t i;
+    int same;
 
     if (n > 16) n = 16;
     for (i = 0; i < n; i++)
         srv[i] = v[i] ? (ID3D11ShaderResourceView *)v[i]->v : NULL;
+    same = slot + n <= 8u;
+    for (i = 0; same && i < n; i++) {
+        uint32_t k = slot + i;
+        if (!(g_bind.srv_ok & (1u << k)) || g_bind.srv[k] != srv[i])
+            same = 0;
+    }
+    if (same)
+        return;
     ID3D11DeviceContext_PSSetShaderResources(g_ctx, slot, n, srv);
+    if (slot + n <= 8u) {
+        for (i = 0; i < n; i++) {
+            g_bind.srv[slot + i] = srv[i];
+            g_bind.srv_ok |= (uint8_t)(1u << (slot + i));
+        }
+    } else {
+        g_bind.srv_ok = 0;
+    }
 }
 
 static void d_set_samplers(uint32_t slot, uint32_t n, RhiSampler *const *s)
 {
     ID3D11SamplerState *ns[16];
     uint32_t i;
+    int same;
 
     if (n > 16) n = 16;
     for (i = 0; i < n; i++)
         ns[i] = s[i] ? s[i]->s : NULL;
+    same = slot + n <= 8u;
+    for (i = 0; same && i < n; i++) {
+        uint32_t k = slot + i;
+        if (!(g_bind.samp_ok & (1u << k)) || g_bind.samp[k] != ns[i])
+            same = 0;
+    }
+    if (same)
+        return;
     ID3D11DeviceContext_PSSetSamplers(g_ctx, slot, n, ns);
+    if (slot + n <= 8u) {
+        for (i = 0; i < n; i++) {
+            g_bind.samp[slot + i] = ns[i];
+            g_bind.samp_ok |= (uint8_t)(1u << (slot + i));
+        }
+    } else {
+        g_bind.samp_ok = 0;
+    }
 }
 
 static void d_set_blend_state(RhiBlendState *s, const float *factor, uint32_t mask)
 {
-    ID3D11DeviceContext_OMSetBlendState(g_ctx, s ? s->s : NULL, factor, mask);
+    ID3D11BlendState *st = s ? s->s : NULL;
+    if (g_bind.blend_ok && g_bind.blend == st && g_bind.mask == mask &&
+        factor && memcmp(g_bind.factor, factor, sizeof g_bind.factor) == 0)
+        return;
+    g_bind.blend = st;
+    g_bind.mask = mask;
+    g_bind.blend_ok = 1;
+    if (factor)
+        memcpy(g_bind.factor, factor, sizeof g_bind.factor);
+    else
+        memset(g_bind.factor, 0, sizeof g_bind.factor);
+    ID3D11DeviceContext_OMSetBlendState(g_ctx, st, factor, mask);
 }
 
 static void d_set_depth_state(RhiDepthState *s, uint32_t ref)
 {
-    ID3D11DeviceContext_OMSetDepthStencilState(g_ctx, s ? s->s : NULL, ref);
+    ID3D11DepthStencilState *st = s ? s->s : NULL;
+    if (g_bind.depth_ok && g_bind.depth == st && g_bind.ref == ref)
+        return;
+    g_bind.depth = st;
+    g_bind.ref = ref;
+    g_bind.depth_ok = 1;
+    ID3D11DeviceContext_OMSetDepthStencilState(g_ctx, st, ref);
 }
 
 static void d_set_raster_state(RhiRasterState *s)
 {
-    ID3D11DeviceContext_RSSetState(g_ctx, s ? s->s : NULL);
+    ID3D11RasterizerState *st = s ? s->s : NULL;
+    if (g_bind.raster_ok && g_bind.raster == st)
+        return;
+    g_bind.raster = st;
+    g_bind.raster_ok = 1;
+    ID3D11DeviceContext_RSSetState(g_ctx, st);
 }
 
 static void d_draw(uint32_t n, uint32_t first)

@@ -73,3 +73,7 @@ else()
     # Linux: platform layer (Win32 primitives on POSIX) + SDL3 audio + libm
     target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
 endif()
+if(WIN32)
+    add_compile_definitions(_USE_MATH_DEFINES)
+endif()
+

@@ -23,13 +23,15 @@
 #include <string.h>
 /* malloc: without <stdlib.h> its pointer is truncated to int. */
 #include <stdlib.h>
+#include <stdint.h>
+#include <nmmintrin.h>                   /* CRC32C, stable index stamps */
 
 /* ================================================================
  * Internal device state
  * ================================================================ */
 
 /* Maximum tracked render states, texture stages, and transforms */
-#define MAX_RENDER_STATES    256
+#define MAX_RENDER_STATES    260  /* through D3DRS_POLY_FILL (259) */
 #define MAX_TEXTURE_STAGES   4
 #define MAX_TSS_STATES       32
 #define MAX_TRANSFORMS       512
@@ -525,7 +527,15 @@ static BOOL window_size(const D3D8DeviceState *s, UINT *w, UINT *h)
 #endif
 }
 
+static void present_scene_into(RhiView *target);
 static void present_scene(void)
+{
+    present_scene_into(NULL);
+}
+
+/* target NULL: the swap chain's back buffer. Otherwise an image the size of
+ * the swap chain (paced presents, below). */
+static void present_scene_into(RhiView *target)
 {
     D3D8DeviceState *s = &g_device_state;
     D3D8DisplayFit fit;
@@ -555,6 +565,10 @@ static void present_scene(void)
 
         d3d8_display_output_shape(s->width, s->height, &shape_w, &shape_h);
         fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
+    }
+    if (target) {
+        d3d8_display_resolve(s->rhi_scene_srv, s->width, s->height, target, fit);
+        return;
     }
     d3d8_display_resolve(s->rhi_scene_srv, s->width, s->height, rhi_swapchain_view(), fit);
     keep_presented();
@@ -635,6 +649,12 @@ BOOL d3d8_GetScissor(RhiRect *out)
 }
 UINT d3d8_GetGuestHeight(void) { return g_guest_height ? g_guest_height : g_device_state.present_height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
+/* The viewport's depth range, MaxZ - MinZ: what one unit of the vertex
+ * stage's z comes to in the depth buffer (d3d8_vsh.c, the W-buffer depth). */
+float                d3d8_GetViewportDepthSpan(void)
+{
+    return g_device_state.viewport.MaxZ - g_device_state.viewport.MinZ;
+}
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return (stage < 4) ? g_cur_textures[stage] : NULL; }
 const D3DMATRIX     *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type) {
@@ -1055,6 +1075,7 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
 {
     RhiRect host_rects[CLEAR_MAX_RECTS];
     UINT n_rects = 0, target_w, target_h;
+    int clear_mask = RHI_WRITE_ALL;
     float clear_color[4] = {
         ((Color >> 16) & 0xFF) / 255.0f,  /* R */
         ((Color >>  8) & 0xFF) / 255.0f,  /* G */
@@ -1075,6 +1096,30 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
      * clear below. */
     target_w = g_cur_rt ? g_cur_rt->width : g_device_state.width;
     target_h = g_cur_rt ? g_cur_rt->height : g_device_state.height;
+    /* Some colour channels only (D3D8_CLEAR_CHANNELS): a native clear has
+     * no channel mask, so it is the rectangle pass over the whole target,
+     * writing only those channels. */
+    if ((Flags & D3D8_CLEAR_CHANNELS) && (Flags & D3DCLEAR_TARGET)) {
+        clear_mask = 0;
+        if (Flags & 0x1000u) clear_mask |= RHI_WRITE_R;
+        if (Flags & 0x2000u) clear_mask |= RHI_WRITE_G;
+        if (Flags & 0x4000u) clear_mask |= RHI_WRITE_B;
+        if (Flags & 0x8000u) clear_mask |= RHI_WRITE_A;
+        if (!Count || !pRects) {
+            host_rects[0].left = host_rects[0].top = 0;
+            host_rects[0].right = (int32_t)target_w;
+            host_rects[0].bottom = (int32_t)target_h;
+            if (d3d8_clear_rects(rtv, dsv, target_w, target_h, host_rects, 1, clear_mask,
+                                 (Flags & D3DCLEAR_ZBUFFER) != 0,
+                                 (Flags & D3DCLEAR_STENCIL) != 0, clear_color, Z,
+                                 (uint8_t)Stencil) == 0) {
+                if ((Flags & D3DCLEAR_ZBUFFER) && g_cur_ds == g_auto_ds)
+                    g_wbuffer.valid = 0;
+                return S_OK;
+            }
+            clear_mask = RHI_WRITE_ALL;     /* the pass failed: clear as before */
+        }
+    }
     if (!clear_rects_to_host(Count, pRects, target_w, target_h, host_rects, &n_rects)) {
         /* A depth-only rectangle belongs to the 3D viewport it was worked
          * out for (Max Payne clears a portal's rectangle before drawing
@@ -1097,7 +1142,8 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
         }
         if (n_rects &&
             d3d8_clear_rects(rtv, dsv, target_w, target_h, host_rects, n_rects,
-                             (Flags & D3DCLEAR_TARGET) != 0, (Flags & D3DCLEAR_ZBUFFER) != 0,
+                             (Flags & D3DCLEAR_TARGET) ? clear_mask : 0,
+                             (Flags & D3DCLEAR_ZBUFFER) != 0,
                              (Flags & D3DCLEAR_STENCIL) != 0, clear_color, Z,
                              (uint8_t)Stencil) != 0) {
             static int said;
@@ -1197,11 +1243,21 @@ static RhiView *empty_stage_view(void)
     RhiSubresourceData init;
     RhiViewDesc vd;
     RhiImage *img;
-    static const uint32_t white = 0xFFFFFFFFu;
+    static uint32_t white = 0xFFFFFFFFu;
 
     if (view || tried || !rhi_device_ready())
         return view;
     tried = 1;
+    /* RECOMP_D3D8_EMPTY_STAGE=black: transparent black instead. Forza
+     * Motorsport draws its street lights four to a pass, one volume per
+     * stage, and leaves the stages of absent lights empty with their
+     * colour constants set: read as white, every such pass added the full
+     * constant and the road at night came out white. */
+    {
+        const char *e = getenv("RECOMP_D3D8_EMPTY_STAGE");
+        if (e && (e[0] == 'b' || e[0] == 'B' || e[0] == '0'))
+            white = 0;
+    }
     memset(&d, 0, sizeof d);
     d.type = RHI_IMAGE_2D;
     d.width = d.height = d.depth = d.mip_levels = d.samples = 1;
@@ -1420,6 +1476,390 @@ static void up_ring_shutdown(void)
     up_ring_release(&g_up_index_ring);
 }
 
+/* A converted mesh the expand cache keeps (hle_d3d8.c) used to be copied
+ * into the ring on every draw and again for the in-between frame: about
+ * 10 MB a frame, the largest single cost on the guest thread in a race.
+ * The bytes stay at one host address until their hash changes, so they are
+ * uploaded once into their own buffer and bound from there.
+ * RECOMP_STABLE_VB=0 goes back to copying every draw. */
+#define STABLE_VB_SLOTS 2048u
+#define STABLE_VB_PROBE 24u
+#define STABLE_VB_MAX   (2u * 1024u * 1024u)
+
+struct stable_vb {
+    const void *ptr;
+    unsigned long long stamp;
+    UINT size;
+    uint32_t used;
+    RhiBuffer *buf;
+};
+
+static struct stable_vb g_svb[STABLE_VB_SLOTS];
+static const void *g_svb_note_ptr;
+static unsigned long long g_svb_note_stamp;
+static int g_svb_note_set, g_svb_on = -1;
+static uint32_t g_svb_clock;
+static unsigned long long g_svb_hits, g_svb_uploads;
+
+static int stable_vb_on(void)
+{
+    if (g_svb_on < 0) {
+        const char *v = getenv("RECOMP_STABLE_VB");
+        g_svb_on = !(v && v[0] == '0');
+        fprintf(stderr, "[D3D8] stable vertex buffers %s (RECOMP_STABLE_VB)\n",
+                g_svb_on ? "on" : "off");
+    }
+    return g_svb_on;
+}
+
+void d3d8_stable_vertex_note(const void *ptr, unsigned long long stamp)
+{
+    if (!ptr || !stable_vb_on())
+        return;
+    g_svb_note_ptr = ptr;
+    g_svb_note_stamp = stamp;
+    g_svb_note_set = 1;
+}
+
+static struct stable_vb *stable_vb_find(const void *ptr, int make)
+{
+    /* Large meshes come back page-aligned, so a shift alone piles them
+     * into one probe. The multiply spreads those addresses out. */
+    uint32_t h = (uint32_t)((uintptr_t)ptr >> 4) * 0x9E3779B1u;
+    h ^= h >> 16;
+    uint32_t i;
+    struct stable_vb *empty = NULL;
+
+    for (i = 0; i < STABLE_VB_PROBE; i++) {
+        struct stable_vb *s = &g_svb[(h + i) & (STABLE_VB_SLOTS - 1u)];
+        if (s->buf && s->ptr == ptr)
+            return s;
+        if (!s->buf && !empty)
+            empty = s;
+    }
+    if (!make)
+        return NULL;
+    if (!empty) {
+        /* Only a slot this pointer hashes to, or the next lookup misses it. */
+        struct stable_vb *old = &g_svb[h & (STABLE_VB_SLOTS - 1u)];
+        for (i = 1; i < STABLE_VB_PROBE; i++) {
+            struct stable_vb *s = &g_svb[(h + i) & (STABLE_VB_SLOTS - 1u)];
+            if (s->used < old->used)
+                old = s;
+        }
+        if (old->buf)
+            rhi_buffer_destroy(old->buf);
+        memset(old, 0, sizeof *old);
+        empty = old;
+    }
+    return empty;
+}
+
+void d3d8_stable_vertex_drop(const void *ptr)
+{
+    struct stable_vb *s;
+    if (!ptr || g_svb_on == 0)
+        return;
+    s = stable_vb_find(ptr, 0);
+    if (!s)
+        return;
+    rhi_buffer_destroy(s->buf);
+    memset(s, 0, sizeof *s);
+    if (g_svb_note_ptr == ptr)
+        g_svb_note_set = 0;
+}
+
+static RhiBuffer *stable_vb_create(struct stable_vb *s, const void *data, UINT size,
+                                   unsigned long long stamp)
+{
+    RhiBufferDesc bd;
+    RhiBuffer *buf;
+
+    memset(&bd, 0, sizeof bd);
+    bd.size = size;
+    bd.usage = RHI_USAGE_DEFAULT;
+    bd.bind = RHI_BIND_VERTEX;
+    buf = rhi_buffer_create(&bd, data);
+    if (!buf)
+        return NULL;
+    if (s->buf)
+        rhi_buffer_destroy(s->buf);
+    s->ptr = data;
+    s->stamp = stamp;
+    s->size = size;
+    s->buf = buf;
+    s->used = ++g_svb_clock;
+    g_svb_uploads++;
+    return buf;
+}
+
+/* The buffer for this draw, or NULL and the ring is used. A noted stamp
+ * that no longer matches re-uploads; a redraw of the same address binds
+ * what the frame already uploaded. */
+static RhiBuffer *stable_vb_take(const void *data, UINT size)
+{
+    struct stable_vb *s;
+    int noted;
+    unsigned long long stamp;
+
+    if (!data || !size || size > STABLE_VB_MAX || !stable_vb_on())
+        return NULL;
+    noted = g_svb_note_set && g_svb_note_ptr == data;
+    stamp = noted ? g_svb_note_stamp : 0;
+    s = stable_vb_find(data, noted);
+    if (!s)
+        return NULL;
+    if (s->buf && s->ptr == data && s->size == size) {
+        if (noted && s->stamp != stamp) {
+            rhi_buffer_update(s->buf, data);
+            s->stamp = stamp;
+            g_svb_uploads++;
+        } else {
+            g_svb_hits++;
+        }
+        s->used = ++g_svb_clock;
+        return s->buf;
+    }
+    if (!noted)
+        return NULL;
+    return stable_vb_create(s, data, size, stamp);
+}
+
+void d3d8_stable_index_report(void);
+
+void d3d8_stable_vertex_report(void)
+{
+    if (g_svb_hits || g_svb_uploads)
+        fprintf(stderr, "[STABLE-VB] %llu draws from a kept buffer, %llu uploaded\n",
+                g_svb_hits, g_svb_uploads);
+    g_svb_hits = g_svb_uploads = 0;
+    d3d8_stable_index_report();
+}
+
+/* Index lists took the ring on every indexed draw: a map, a copy, and the
+ * same copy again into the in-between. The guest list's own bytes are the
+ * stamp. Unchanged, the converted list stays in the buffer uploaded for it.
+ * A list that already changed once this frame is left on the ring so the
+ * in-between still shows the first version. RECOMP_STABLE_VB=0 disables it
+ * with the vertex buffers. */
+#define STABLE_IB_SLOTS STABLE_VB_SLOTS
+#define STABLE_IB_PROBE STABLE_VB_PROBE
+
+struct stable_ib {
+    const void *ptr;
+    UINT count, topology, size, min_index, vertex_span;
+    unsigned long frame;
+    unsigned long long stamp;
+    uint32_t used;
+    RhiBuffer *buf;
+};
+
+static struct stable_ib g_sib[STABLE_IB_SLOTS];
+static uint32_t g_sib_clock;
+static unsigned long long g_sib_hits, g_sib_uploads;
+static int g_sib_arm;
+static RhiBuffer *g_sib_arm_buf;
+static UINT g_sib_arm_bytes, g_sib_arm_count, g_sib_arm_topo;
+static const void *g_sib_arm_key;
+static const void *g_sib_pub_key;
+static UINT g_sib_pub_count, g_sib_pub_topo, g_sib_pub_bytes;
+static struct stable_ib *g_sib_pending;
+static const void *g_sib_pending_ptr;
+static UINT g_sib_pending_count, g_sib_pending_topo;
+static UINT g_sib_pending_min, g_sib_pending_span;
+static unsigned long g_sib_pending_frame;
+static unsigned long long g_sib_pending_stamp;
+
+__attribute__((target("sse4.2")))
+static unsigned long long sib_hash(const uint16_t *idx, UINT count,
+                                   UINT *lo_out, UINT *hi_out)
+{
+    unsigned long long a = 0x9E3779B185EBCA87ull;
+    UINT lo = 0xFFFFu, hi = 0, i;
+
+    for (i = 0; i < count; i++) {
+        UINT v = idx[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+        a = _mm_crc32_u32((unsigned)a, v);
+    }
+    a ^= (unsigned long long)count * 0xC2B2AE3D27D4EB4Full;
+    *lo_out = lo;
+    *hi_out = hi;
+    return a;
+}
+
+static struct stable_ib *sib_lookup(const void *ptr, UINT count, UINT topo,
+                                    int make, unsigned long frame)
+{
+    uint32_t h = (uint32_t)((uintptr_t)ptr >> 4) * 0x9E3779B1u;
+    uint32_t i;
+    struct stable_ib *empty = NULL;
+
+    h ^= count * 0x85EBCA77u;
+    h ^= topo;
+    h ^= h >> 16;
+    for (i = 0; i < STABLE_IB_PROBE; i++) {
+        struct stable_ib *s = &g_sib[(h + i) & (STABLE_IB_SLOTS - 1u)];
+        if (s->buf && s->ptr == ptr && s->count == count && s->topology == topo)
+            return s;
+        if (!s->buf && !empty)
+            empty = s;
+    }
+    if (!make)
+        return NULL;
+    if (!empty) {
+        struct stable_ib *old = NULL;
+        for (i = 0; i < STABLE_IB_PROBE; i++) {
+            struct stable_ib *s = &g_sib[(h + i) & (STABLE_IB_SLOTS - 1u)];
+            if (s->frame == frame)
+                continue;
+            if (!old || s->used < old->used)
+                old = s;
+        }
+        if (!old)
+            return NULL;
+        if (old->buf)
+            rhi_buffer_destroy(old->buf);
+        memset(old, 0, sizeof *old);
+        empty = old;
+    }
+    return empty;
+}
+
+static void sib_arm_bind(struct stable_ib *s)
+{
+    g_sib_arm = 1;
+    g_sib_arm_buf = s->buf;
+    g_sib_arm_bytes = s->size;
+    g_sib_arm_key = s->ptr;
+    g_sib_arm_count = s->count;
+    g_sib_arm_topo = s->topology;
+    s->used = ++g_sib_clock;
+}
+
+void d3d8_stable_index_disarm(void)
+{
+    g_sib_arm = 0;
+    g_sib_arm_buf = NULL;
+    g_sib_pending = NULL;
+}
+
+int d3d8_stable_index_prepare(const void *guest, UINT index_count, UINT topology,
+                              unsigned long frame, UINT expect_bytes,
+                              UINT *min_index, UINT *vertex_span,
+                              unsigned long long *stamp)
+{
+    struct stable_ib *s;
+    UINT lo, hi;
+    unsigned long long sum;
+
+    d3d8_stable_index_disarm();
+    if (!guest || !index_count || index_count > (STABLE_VB_MAX / 2u) || !stable_vb_on())
+        return -2;
+    sum = sib_hash((const uint16_t *)guest, index_count, &lo, &hi);
+    *min_index = lo;
+    *vertex_span = hi - lo + 1u;
+    *stamp = sum;
+    s = sib_lookup(guest, index_count, topology, 0, frame);
+    if (s && s->stamp == sum && s->size == expect_bytes) {
+        sib_arm_bind(s);
+        *min_index = s->min_index;
+        *vertex_span = s->vertex_span;
+        return 1;
+    }
+    if (s && s->frame == frame)
+        return -1;
+    g_sib_pending_ptr = guest;
+    g_sib_pending_count = index_count;
+    g_sib_pending_topo = topology;
+    g_sib_pending_min = *min_index;
+    g_sib_pending_span = *vertex_span;
+    g_sib_pending_frame = frame;
+    g_sib_pending_stamp = sum;
+    g_sib_pending = s;
+    return 0;
+}
+
+int d3d8_stable_index_commit(const void *bytes, UINT size)
+{
+    struct stable_ib *s;
+    RhiBuffer *buf;
+
+    if (!bytes || !size || size > STABLE_VB_MAX || !g_sib_pending_ptr)
+        return 0;
+    s = g_sib_pending;
+    if (!s || s->ptr != g_sib_pending_ptr || s->count != g_sib_pending_count ||
+        s->topology != g_sib_pending_topo)
+        s = sib_lookup(g_sib_pending_ptr, g_sib_pending_count, g_sib_pending_topo,
+                       1, g_sib_pending_frame);
+    if (!s)
+        return 0;
+    if (s->buf && s->frame == g_sib_pending_frame && s->stamp != g_sib_pending_stamp)
+        return 0;
+    if (s->buf && s->size == size) {
+        rhi_buffer_update(s->buf, bytes);
+        buf = s->buf;
+    } else {
+        RhiBufferDesc bd;
+        memset(&bd, 0, sizeof bd);
+        bd.size = size;
+        bd.usage = RHI_USAGE_DEFAULT;
+        bd.bind = RHI_BIND_INDEX;
+        buf = rhi_buffer_create(&bd, bytes);
+        if (!buf)
+            return 0;
+        if (s->buf)
+            rhi_buffer_destroy(s->buf);
+        s->buf = buf;
+        s->size = size;
+    }
+    s->ptr = g_sib_pending_ptr;
+    s->count = g_sib_pending_count;
+    s->topology = g_sib_pending_topo;
+    s->min_index = g_sib_pending_min;
+    s->vertex_span = g_sib_pending_span;
+    s->frame = g_sib_pending_frame;
+    s->stamp = g_sib_pending_stamp;
+    g_sib_uploads++;
+    sib_arm_bind(s);
+    g_sib_pending = NULL;
+    return 1;
+}
+
+int d3d8_stable_index_rebind(const void *guest, UINT index_count, UINT topology, UINT size)
+{
+    struct stable_ib *s;
+
+    d3d8_stable_index_disarm();
+    if (!guest || !stable_vb_on())
+        return 0;
+    s = sib_lookup(guest, index_count, topology, 0, 0);
+    if (!s || !s->buf || s->size != size)
+        return 0;
+    sib_arm_bind(s);
+    return 1;
+}
+
+const void *d3d8_stable_index_bound_key(UINT *index_count, UINT *topology, UINT *size)
+{
+    if (!g_sib_pub_key)
+        return NULL;
+    if (index_count) *index_count = g_sib_pub_count;
+    if (topology) *topology = g_sib_pub_topo;
+    if (size) *size = g_sib_pub_bytes;
+    return g_sib_pub_key;
+}
+
+void d3d8_stable_index_report(void)
+{
+    if (!g_sib_hits && !g_sib_uploads)
+        return;
+    fprintf(stderr, "[STABLE-IB] %llu draws from a kept buffer, %llu uploaded\n",
+            g_sib_hits, g_sib_uploads);
+    g_sib_hits = g_sib_uploads = 0;
+}
+
 /* Append data to a ring, returns its byte offset. Returns (UINT)-1 on failure. */
 static UINT up_ring_upload(UpRing *ring, const void *data, UINT size)
 {
@@ -1619,7 +2059,34 @@ static void feedback_end(DWORD mask)
         }
 }
 
-static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
+/* Optional host-side timing. Draw time includes driver waits, not just CPU work. */
+static long long g_profile_draw_ticks,g_profile_texture_ticks;
+static unsigned long long g_profile_draw_calls,g_profile_texture_calls;
+long long d3d8_profile_clock(void)
+{
+    static int enabled=-1;
+    if(enabled<0){const char *v=getenv("RECOMP_FRAME_PROFILE");enabled=v && v[0]=='1';}
+    if(!enabled)return 0;
+    LARGE_INTEGER t;QueryPerformanceCounter(&t);return t.QuadPart;
+}
+void d3d8_profile_texture_end(long long start)
+{
+    if(!start)return;
+    g_profile_texture_ticks+=d3d8_profile_clock()-start;++g_profile_texture_calls;
+}
+void d3d8_profile_report(unsigned long frames)
+{
+    if(!frames || !d3d8_profile_clock())return;
+    LARGE_INTEGER freq;QueryPerformanceFrequency(&freq);
+    double ms=1000.0/(double)freq.QuadPart/(double)frames;
+    fprintf(stderr,"[FRAME-PROFILE] %lu frames: host draws %.3f ms/frame (%llu calls/frame), texture binding %.3f ms/frame (%llu calls/frame)\n",
+        frames,g_profile_draw_ticks*ms,g_profile_draw_calls/frames,
+        g_profile_texture_ticks*ms,g_profile_texture_calls/frames);
+    g_profile_draw_ticks=g_profile_texture_ticks=0;
+    g_profile_draw_calls=g_profile_texture_calls=0;
+}
+
+static HRESULT __stdcall dev_DrawPrimitive_profile_impl(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
 {
     (void)self;
     g_d3d_draw_count++;
@@ -1643,7 +2110,16 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     return S_OK;
 }
 
-static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount)
+static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
+{
+    long long start=d3d8_profile_clock();
+    HRESULT hr=dev_DrawPrimitive_profile_impl(self,PrimitiveType,StartVertex,PrimitiveCount);
+    if(start){g_profile_draw_ticks+=d3d8_profile_clock()-start;++g_profile_draw_calls;}
+    return hr;
+}
+
+
+static HRESULT __stdcall dev_DrawIndexedPrimitive_profile_impl(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount)
 {
     (void)self; (void)MinVertexIndex; (void)NumVertices;
     g_d3d_draw_count++;
@@ -1666,6 +2142,15 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     }
     return S_OK;
 }
+
+static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount)
+{
+    long long start=d3d8_profile_clock();
+    HRESULT hr=dev_DrawIndexedPrimitive_profile_impl(self,PrimitiveType,MinVertexIndex,NumVertices,StartIndex,PrimitiveCount);
+    if(start){g_profile_draw_ticks+=d3d8_profile_clock()-start;++g_profile_draw_calls;}
+    return hr;
+}
+
 
 UINT d3d8_up_vertices_read(D3DPRIMITIVETYPE type, UINT prims)
 {
@@ -1692,7 +2177,7 @@ UINT d3d8_up_indices_read(D3DPRIMITIVETYPE type, UINT prims)
     return n;
 }
 
-static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexData, UINT VertexStreamZeroStride)
+static HRESULT __stdcall dev_DrawPrimitiveUP_profile_impl(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexData, UINT VertexStreamZeroStride)
 {
     (void)self;
     g_d3d_draw_count++;
@@ -1719,6 +2204,17 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
 
     vb_size = vertex_count * VertexStreamZeroStride;
 
+    /* A mesh the expand cache kept is already on the GPU. */
+    {
+        /* A fan or a quad was rewritten into a temporary list. That pointer
+         * dies with this draw, so it must not be kept as a stable mesh. */
+        RhiBuffer *kept = converted ? NULL : stable_vb_take(draw_data, vb_size);
+        if (kept) {
+            rhi_set_vertex_buffer(0, kept, VertexStreamZeroStride, 0);
+            goto drawn_vertices;
+        }
+    }
+
     /* Upload to ring buffer */
     ring_offset = up_ring_upload(&g_up_vertex_ring, draw_data, vb_size);
     if (converted) free(converted);
@@ -1727,6 +2223,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
 
     /* Bind ring buffer at the right offset */
     rhi_set_vertex_buffer(0, g_up_vertex_ring.buffer, VertexStreamZeroStride, ring_offset);
+drawn_vertices:
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
@@ -1754,7 +2251,16 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     return S_OK;
 }
 
-static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat, const void *pVertexData, UINT VertexStreamZeroStride)
+static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexData, UINT VertexStreamZeroStride)
+{
+    long long start=d3d8_profile_clock();
+    HRESULT hr=dev_DrawPrimitiveUP_profile_impl(self,PrimitiveType,PrimitiveCount,pVertexData,VertexStreamZeroStride);
+    if(start){g_profile_draw_ticks+=d3d8_profile_clock()-start;++g_profile_draw_calls;}
+    return hr;
+}
+
+
+static HRESULT __stdcall dev_DrawIndexedPrimitiveUP_profile_impl(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat, const void *pVertexData, UINT VertexStreamZeroStride)
 {
     (void)self; (void)MinVertexIndex;
     g_d3d_draw_count++;
@@ -1763,10 +2269,18 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     UINT vb_offset, ib_offset;
     UINT idx_bytes;
 
-    if (!pVertexData || !pIndexData || !VertexStreamZeroStride) return E_INVALIDARG;
+    g_sib_pub_key = NULL;
+    if (!pVertexData || !VertexStreamZeroStride) {
+        g_sib_arm = 0;
+        return E_INVALIDARG;
+    }
+    if (!pIndexData && !g_sib_arm) return E_INVALIDARG;
 
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
-    if (index_count == 0) return E_INVALIDARG;
+    if (index_count == 0) {
+        g_sib_arm = 0;
+        return E_INVALIDARG;
+    }
 
 
     idx_bytes = (IndexDataFormat == D3DFMT_INDEX32) ? 4 : 2;
@@ -1774,15 +2288,41 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     ib_size = index_count * idx_bytes;
 
     /* Append vertices and indices to their rings; the draw reads them at
-     * the returned offsets. */
-    vb_offset = up_ring_upload(&g_up_vertex_ring, pVertexData, vb_size);
-    if (vb_offset == (UINT)-1) return E_OUTOFMEMORY;
-    ib_offset = up_ring_upload(&g_up_index_ring, pIndexData, ib_size);
-    if (ib_offset == (UINT)-1) return E_OUTOFMEMORY;
-
-    /* Bind, prepare, draw */
-    rhi_set_vertex_buffer(0, g_up_vertex_ring.buffer, VertexStreamZeroStride, vb_offset);
-    rhi_set_index_buffer(g_up_index_ring.buffer, idx_bytes * 8, ib_offset);
+     * the returned offsets. A mesh the expand cache kept skips the vertex
+     * copy and is bound from the buffer uploaded when its bytes changed. */
+    {
+        RhiBuffer *kept = stable_vb_take(pVertexData, vb_size);
+        if (kept)
+            rhi_set_vertex_buffer(0, kept, VertexStreamZeroStride, 0);
+        else {
+            vb_offset = up_ring_upload(&g_up_vertex_ring, pVertexData, vb_size);
+            if (vb_offset == (UINT)-1) {
+                g_sib_arm = 0;
+                return E_OUTOFMEMORY;
+            }
+            rhi_set_vertex_buffer(0, g_up_vertex_ring.buffer, VertexStreamZeroStride, vb_offset);
+        }
+    }
+    if (g_sib_arm && g_sib_arm_buf && ib_size == g_sib_arm_bytes && idx_bytes == 2) {
+        rhi_set_index_buffer(g_sib_arm_buf, 16, 0);
+        g_sib_pub_key = g_sib_arm_key;
+        g_sib_pub_count = g_sib_arm_count;
+        g_sib_pub_topo = g_sib_arm_topo;
+        g_sib_pub_bytes = g_sib_arm_bytes;
+        g_sib_hits++;
+    } else {
+        if (!pIndexData) {
+            g_sib_arm = 0;
+            return E_INVALIDARG;
+        }
+        ib_offset = up_ring_upload(&g_up_index_ring, pIndexData, ib_size);
+        if (ib_offset == (UINT)-1) {
+            g_sib_arm = 0;
+            return E_OUTOFMEMORY;
+        }
+        rhi_set_index_buffer(g_up_index_ring.buffer, idx_bytes * 8, ib_offset);
+    }
+    g_sib_arm = 0;
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
@@ -1813,6 +2353,15 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     }
     return S_OK;
 }
+
+static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat, const void *pVertexData, UINT VertexStreamZeroStride)
+{
+    long long start=d3d8_profile_clock();
+    HRESULT hr=dev_DrawIndexedPrimitiveUP_profile_impl(self,PrimitiveType,MinVertexIndex,NumVertices,PrimitiveCount,pIndexData,IndexDataFormat,pVertexData,VertexStreamZeroStride);
+    if(start){g_profile_draw_ticks+=d3d8_profile_clock()-start;++g_profile_draw_calls;}
+    return hr;
+}
+
 
 static HRESULT __stdcall dev_CreateTexture(IDirect3DDevice8 *self, UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture8 **ppTexture)
 {
@@ -2783,6 +3332,225 @@ static HRESULT __stdcall dev_EndPush(IDirect3DDevice8 *self, DWORD *pPush)
  * about 136 frames a second to 27 and cut how far a run got by two thirds. */
 static UINT g_present_interval = 1;
 
+/* ================================================================
+ * Paced presents (RECOMP_PACED_PRESENT=1, with frame interpolation)
+ *
+ * Frame interpolation draws its in-between frame while the title waits for
+ * the vblank, so the in-between can only be shown on time if the title's
+ * next frame is finished before the halfway point. Forza Motorsport takes
+ * 20-28 ms of a 33 ms period; the in-betweens came 10-16 ms late and the
+ * picture stuttered instead of running at 60.
+ *
+ * Here frames are not put on the screen where they are finished. Each is
+ * resolved into an image of its own with the moment it is due, and a
+ * thread of ours copies it to the swap chain and presents it then. The
+ * in-between N-1 -> N is drawn as soon as N is done and is due at N's
+ * vblank; N itself is due half a period later. That is half a period more
+ * latency, and an even 60. The device is made thread-safe for this
+ * (rhi_d3d11.c), and the thread only copies and presents.
+ * ================================================================ */
+enum { PACED_BETWEEN = 0, PACED_FRAME = 1, PACED_SLOTS = 2 };
+#if defined(_WIN32)
+int  rhi_d3d11_paced_present(RhiImage *img, uint32_t interval);   /* rhi_d3d11.c */
+
+static int            g_paced = -1;
+static RhiImage      *g_paced_img[PACED_SLOTS];
+static RhiView       *g_paced_rtv[PACED_SLOTS];
+static UINT           g_paced_w, g_paced_h;
+static volatile LONG  g_paced_busy[PACED_SLOTS];       /* queued, not yet shown */
+static volatile LONGLONG g_paced_due[PACED_SLOTS];
+static LONGLONG       g_paced_next_due;                /* for the next in-between */
+static LONGLONG       g_paced_qpf, g_paced_half;
+static HANDLE         g_paced_event;
+static unsigned long  g_paced_shown, g_paced_late, g_paced_waits;
+static double         g_paced_off_ms;
+static LONGLONG       g_paced_submit_ticks;
+static unsigned long  g_paced_submits;
+
+BOOL xbox_D3D8PacedOn(void)
+{
+    if (g_paced < 0) {
+        const char *e = getenv("RECOMP_PACED_PRESENT");
+        g_paced = e && e[0] == '1';
+        if (g_paced) {
+            LARGE_INTEGER f;
+            const char *hz = getenv("RECOMP_VBLANK_HZ");
+            double rate = hz && atof(hz) >= 1.0 ? atof(hz) : 60.0;
+            QueryPerformanceFrequency(&f);
+            g_paced_qpf = f.QuadPart;
+            g_paced_half = (LONGLONG)((double)f.QuadPart / rate / 2.0);
+            fprintf(stderr, "D3D8: paced presents: each frame shown %.1f ms after it is "
+                    "finished, an in-between before it (RECOMP_PACED_PRESENT)\n",
+                    1000.0 / rate / 2.0);
+            fflush(stderr);
+        }
+    }
+    return g_paced > 0;
+}
+
+void xbox_D3D8PacedDue(long long qpc)
+{
+    g_paced_next_due = qpc;
+}
+
+static double g_paced_hold_ms, g_paced_hold_max;
+
+static DWORD WINAPI paced_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        LARGE_INTEGER now;
+        int k, pick = -1;
+        LONGLONG due = 0;
+
+        for (k = 0; k < PACED_SLOTS; k++)
+            if (InterlockedCompareExchange(&g_paced_busy[k], 1, 1) == 1 &&
+                (pick < 0 || g_paced_due[k] < due)) {
+                pick = k;
+                due = g_paced_due[k];
+            }
+        if (pick < 0) {
+            WaitForSingleObject(g_paced_event, 5);
+            continue;
+        }
+        for (;;) {
+            LONGLONG left;
+            QueryPerformanceCounter(&now);
+            left = due - now.QuadPart;
+            if (left <= 0)
+                break;
+            if (left > g_paced_qpf / 500)          /* more than 2 ms: sleep */
+                Sleep(1);
+            else
+                YieldProcessor();
+        }
+        {
+            double off = (double)(now.QuadPart - due) * 1000.0 / (double)g_paced_qpf;
+            g_paced_off_ms += off;
+            if (off > 4.0)
+                g_paced_late++;
+        }
+        /* Interval 0: a present that waits for the vblank holds the device's
+         * lock while it waits (the context is thread-safe now), and the
+         * title's own drawing stalled behind it -- Forza fell to 15 fps.
+         * The pacing is ours; the flip model still shows each picture
+         * whole at the display's next refresh. */
+        {
+            LARGE_INTEGER h0, h1;
+            double ms;
+            QueryPerformanceCounter(&h0);
+            rhi_d3d11_paced_present(g_paced_img[pick], 0);
+            QueryPerformanceCounter(&h1);
+            ms = (double)(h1.QuadPart - h0.QuadPart) * 1000.0 / (double)g_paced_qpf;
+            g_paced_hold_ms += ms;
+            if (ms > g_paced_hold_max)
+                g_paced_hold_max = ms;
+        }
+        g_paced_shown++;
+        InterlockedExchange(&g_paced_busy[pick], 0);
+    }
+    return 0;
+}
+
+/* Resolve the scene into slot k, due at `due`. FALSE if paced presents
+ * cannot be had, and the caller presents as before. */
+static BOOL paced_submit(int k, LONGLONG due)
+{
+    D3D8DeviceState *s = &g_device_state;
+    int i;
+
+    if (!xbox_D3D8PacedOn() || !rhi_swapchain_view() || !s->rhi_scene_srv)
+        return FALSE;
+    if (!g_paced_event) {
+        g_paced_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!g_paced_event || !CreateThread(NULL, 0, paced_thread, NULL, 0, NULL)) {
+            g_paced = 0;
+            return FALSE;
+        }
+    }
+    /* The slot's last picture must be on the screen before it is drawn over. */
+    {
+        int spins = 0;
+        while (InterlockedCompareExchange(&g_paced_busy[k], 1, 1) == 1 && spins < 100) {
+            Sleep(1);
+            spins++;
+        }
+        if (spins)
+            g_paced_waits++;
+    }
+    /* Images the size of the swap chain. A window resize during the
+     * resolve below leaves one picture the old size; its copy is refused
+     * and the next frame makes them again. */
+    if (g_paced_w != s->swap_width || g_paced_h != s->swap_height) {
+        for (i = 0; i < PACED_SLOTS; i++) {
+            while (InterlockedCompareExchange(&g_paced_busy[i], 1, 1) == 1)
+                Sleep(1);
+            rhi_view_destroy(g_paced_rtv[i]); g_paced_rtv[i] = NULL;
+            rhi_image_destroy(g_paced_img[i]); g_paced_img[i] = NULL;
+        }
+        g_paced_w = g_paced_h = 0;
+        for (i = 0; i < PACED_SLOTS; i++) {
+            RhiImageDesc d;
+            memset(&d, 0, sizeof d);
+            d.type = RHI_IMAGE_2D;
+            d.width = s->swap_width;
+            d.height = s->swap_height;
+            d.depth = 1;
+            d.mip_levels = 1;
+            d.format = RHI_FORMAT_R8G8B8A8_UNORM;
+            d.samples = 1;
+            d.usage = RHI_USAGE_DEFAULT;
+            d.bind = RHI_BIND_RENDER_TARGET | RHI_BIND_SAMPLED;
+            g_paced_img[i] = rhi_image_create(&d, NULL);
+            g_paced_rtv[i] = g_paced_img[i] ?
+                rhi_view_create(g_paced_img[i], RHI_VIEW_RENDER_TARGET, NULL) : NULL;
+            if (!g_paced_rtv[i]) {
+                fprintf(stderr, "D3D8: paced presents: no image %ux%u; presenting as "
+                        "before\n", s->swap_width, s->swap_height);
+                g_paced = 0;
+                return FALSE;
+            }
+        }
+        g_paced_w = s->swap_width;
+        g_paced_h = s->swap_height;
+    }
+    {
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        present_scene_into(g_paced_rtv[k]);
+        QueryPerformanceCounter(&b);
+        g_paced_submit_ticks += b.QuadPart - a.QuadPart;
+        g_paced_submits++;
+    }
+    g_paced_due[k] = due;
+    InterlockedExchange(&g_paced_busy[k], 1);
+    SetEvent(g_paced_event);
+    return TRUE;
+}
+
+/* The five-second report, from the HLE's. */
+void xbox_D3D8PacedReport(void)
+{
+    if (g_paced <= 0 || !g_paced_shown)
+        return;
+    fprintf(stderr, "D3D8: paced presents: %lu shown, %.2f ms from their moment on "
+            "average, %lu more than 4 ms late, %lu waits for a slot; resolve %.2f ms each; present %.2f ms each, %.2f worst\n",
+            g_paced_shown, g_paced_off_ms / (double)g_paced_shown, g_paced_late, g_paced_waits,
+            g_paced_submits ? (double)g_paced_submit_ticks * 1000.0 / (double)g_paced_qpf /
+                              (double)g_paced_submits : 0.0,
+            g_paced_hold_ms / (double)g_paced_shown, g_paced_hold_max);
+    g_paced_hold_ms = g_paced_hold_max = 0.0;
+    g_paced_shown = g_paced_late = g_paced_waits = 0;
+    g_paced_submit_ticks = 0;
+    g_paced_submits = 0;
+    g_paced_off_ms = 0.0;
+}
+#else
+BOOL xbox_D3D8PacedOn(void) { return FALSE; }
+void xbox_D3D8PacedDue(long long qpc) { (void)qpc; }
+void xbox_D3D8PacedReport(void) {}
+#endif
+
 void xbox_D3D8SetPresentInterval(UINT interval)
 {
     g_present_interval = interval;
@@ -2802,6 +3570,21 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
         DispatchMessageA(&msg);
     }
 
+#if defined(_WIN32)
+    if (xbox_D3D8PacedOn()) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        follow_vrr();
+        two_d_tag_frame();
+        if (paced_submit(PACED_FRAME, now.QuadPart + g_paced_half)) {
+            d3d8_display_frame_done();
+            return S_OK;
+        }
+        present_scene();
+        d3d8_display_frame_done();
+        return (HRESULT)rhi_present(g_present_interval);
+    }
+#endif
     present_resolve();
     return (HRESULT)rhi_present(g_present_interval);
 }
@@ -2893,6 +3676,10 @@ void xbox_D3D8InterpPresent(void)
     if (!g_interp_on)
         return;
     follow_vrr();
+#if defined(_WIN32)
+    if (xbox_D3D8PacedOn() && paced_submit(PACED_BETWEEN, g_paced_next_due))
+        return;
+#endif
     present_scene();
     rhi_present(g_present_interval);
 }

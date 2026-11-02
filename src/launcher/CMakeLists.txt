@@ -24,13 +24,14 @@
 # ask which host it is on.
 
 function(recomp_add_launcher TARGET GAME_EXE)
-    cmake_parse_arguments(_launcher "NO_WIDESCREEN" "" "" ${ARGN})
+    cmake_parse_arguments(_launcher "NO_WIDESCREEN" "XBE_SHA1" "" ${ARGN})
     set(_dir ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
 
     if(WIN32)
         add_executable(${TARGET} WIN32
             ${_dir}/launcher.c
             ${_dir}/launcher_win32.c
+            ${_dir}/launcher_iso_win32.c
             ${_dir}/launcher_theme.c
             ${_dir}/launcher_theme_gdi.c
             ${_dir}/launcher_bindings.c
@@ -102,7 +103,7 @@ function(recomp_add_launcher TARGET GAME_EXE)
     target_link_libraries(${TARGET} PRIVATE xbox_config xbox_input xbox_net)
     if(WIN32)
         # The rest is in every Windows.
-        target_link_libraries(${TARGET} PRIVATE user32 gdi32)
+        target_link_libraries(${TARGET} PRIVATE user32 gdi32 comdlg32 bcrypt)
     else()
         target_link_libraries(${TARGET} PRIVATE SDL3::SDL3
             "-framework CoreText" "-framework CoreGraphics"
@@ -117,6 +118,13 @@ function(recomp_add_launcher TARGET GAME_EXE)
     # fighters cannot reach.
     if(_launcher_NO_WIDESCREEN)
         target_compile_definitions(${TARGET} PRIVATE LAUNCHER_NO_WIDESCREEN=1)
+    endif()
+    # recomp_add_launcher(<target> <exe> XBE_SHA1 <hex>): the XBE the code
+    # was lifted from. A port shared without the game takes the game from
+    # the player's disc image (launcher_iso_win32.c) and checks it is that one.
+    if(_launcher_XBE_SHA1)
+        target_compile_definitions(${TARGET} PRIVATE
+            LAUNCHER_XBE_SHA1="${_launcher_XBE_SHA1}")
     endif()
     if(MSVC)
         target_compile_options(${TARGET} PRIVATE

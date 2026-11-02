@@ -35,6 +35,13 @@ static __inline DWORD xbox_clear_flags_to_host(uint32_t xbox_flags)
 
     if (xbox_flags & 0xF0)
         host |= D3DCLEAR_TARGET;
+    /* Some of the colour channels only (D3DCLEAR_TARGET_R 0x10, G 0x20,
+     * B 0x40, A 0x80): passed on as D3D8_CLEAR_CHANNELS (d3d8_xbox.h) so the
+     * host clears just those. Forza's car selection clears the alpha
+     * channel alone (0x83) over its showroom backdrop; cleared whole, the
+     * backdrop went black behind the car. */
+    if ((xbox_flags & 0xF0) && (xbox_flags & 0xF0) != 0xF0)
+        host |= D3D8_CLEAR_CHANNELS | ((xbox_flags & 0xF0u) << 8);
     if (xbox_flags & 0x01)
         host |= D3DCLEAR_ZBUFFER;
     if (xbox_flags & 0x02)

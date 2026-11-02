@@ -44,7 +44,9 @@
 
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
+#include "dxt5_decode.h"
 #include "hle_d3d8_record.h"
+#include <nmmintrin.h>                   /* CRC32C, level0_checksum */
 
 /* Reads a RECOMP_* switch; see xbox_memory_layout.h. Declared here rather than
  * including the kernel header, which this file otherwise has no need of. */
@@ -105,6 +107,28 @@ typedef struct {
 
 static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
+
+/* The entries the host draws into (rendered), for the lookups that only
+ * want those. Every bind asked rendered_surface_for, and that walked the
+ * whole cache -- hundreds of entries, a thousand binds a frame in a race.
+ * The list is the same entries in the same order, rebuilt when one becomes
+ * rendered (the only way into it; an entry cleared or reused fails the
+ * checks the lookups make anyway). */
+static unsigned g_rendered_gen = 1, g_rendered_list_gen;
+static int      g_rendered_list[TEXTURE_CACHE], g_rendered_n;
+
+static void rendered_list_refresh(void)
+{
+    int i;
+
+    if (g_rendered_list_gen == g_rendered_gen)
+        return;
+    g_rendered_n = 0;
+    for (i = 0; i < g_texture_count; i++)
+        if (g_textures[i].rendered)
+            g_rendered_list[g_rendered_n++] = i;
+    g_rendered_list_gen = g_rendered_gen;
+}
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
 /* The Size word of what each stage last had bound: the image rectangle and
  * pitch the hardware keeps when SwitchTexture changes only the offset and
@@ -339,6 +363,35 @@ static int read_layout(uint32_t va, texture_layout *t)
  * Word at a time, so hashing the few megabytes a frame binds costs about a
  * millisecond. RECOMP_HLE_D3D8_TEX_SAMPLED=1 restores the old sample, for
  * comparison. */
+/* Four CRC32C lanes, as the vertex cache's hash (hle_d3d8.c ec_hash): a
+ * memory load per instruction, where one multiply chain waited on itself
+ * every eight bytes. Compared only with this process's own earlier sums. */
+__attribute__((target("sse4.2")))
+static uint32_t level0_crc(const uint8_t *p, uint32_t n)
+{
+    uint64_t a = 0x9E3779B185EBCA87ull, b = 0xC2B2AE3D27D4EB4Full;
+    uint64_t c = 0x165667B19E3779F9ull, d = 0x85EBCA77C2B2AE63ull;
+    uint32_t i = 0;
+
+    for (; i + 32u <= n; i += 32u) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, p + i, 8u);
+        memcpy(&w1, p + i + 8u, 8u);
+        memcpy(&w2, p + i + 16u, 8u);
+        memcpy(&w3, p + i + 24u, 8u);
+        a = _mm_crc32_u64(a, w0);
+        b = _mm_crc32_u64(b, w1);
+        c = _mm_crc32_u64(c, w2);
+        d = _mm_crc32_u64(d, w3);
+    }
+    for (; i < n; i++)
+        a = _mm_crc32_u8((uint32_t)a, p[i]);
+    a ^= (b << 32) ^ c ^ (d << 17) ^ ((uint64_t)n * 0xC2B2AE3D27D4EB4Full);
+    a ^= a >> 33;
+    a *= 0x9E3779B185EBCA87ull;
+    return (uint32_t)(a ^ (a >> 32));
+}
+
 static uint32_t level0_checksum(const texture_layout *t)
 {
     static int sampled = -1;
@@ -358,19 +411,7 @@ static uint32_t level0_checksum(const texture_layout *t)
         }
         return h;
     }
-    {
-        uint64_t h = 0x9E3779B97F4A7C15ull, w;
-        uint32_t n = t->bytes, i;
-
-        for (i = 0; i + 8 <= n; i += 8) {
-            memcpy(&w, p + i, 8);
-            h = (h ^ w) * 0x100000001B3ull;
-            h ^= h >> 29;
-        }
-        for (; i < n; i++)
-            h = (h ^ p[i]) * 0x100000001B3ull;
-        return (uint32_t)(h ^ (h >> 32));
-    }
+    return level0_crc(p, t->bytes);
 }
 
 /* A cheap look at level 0: 1,024 eight-byte words spread across it.
@@ -389,14 +430,24 @@ static uint32_t texel_sample(const texture_layout *t)
                       0x9E3779B97F4A7C15ull, 0x7F4A7C159E3779B9ull };
     uint64_t w;
     uint32_t i, k, words = n / 8, step;
+    /* RECOMP_HLE_D3D8_TEX_SAMPLE_WORDS (default 256, was 1024): each word is
+     * a cache line and often a page of its own, so the sample of a race's
+     * few hundred textures a frame was mostly waiting on memory. A texture
+     * rewritten wholesale still moves it; a small edit is the full hash's,
+     * every RECOMP_HLE_D3D8_TEX_FULL_EVERY frames, as before. */
+    static uint32_t want;
 
+    if (!want) {
+        const char *v = getenv("RECOMP_HLE_D3D8_TEX_SAMPLE_WORDS");
+        want = v && atoi(v) > 0 ? (uint32_t)atoi(v) : 256u;
+    }
     if (!words) {
         uint32_t s = 2166136261u;
         for (i = 0; i < n; i++)
             s = (s ^ p[i]) * 16777619u;
         return s;
     }
-    step = words > 1024 ? words / 1024 : 1;
+    step = words > want ? words / want : 1;
     for (i = 0, k = 0; i < words; i += step, k = (k + 1) & 3) {
         memcpy(&w, p + (size_t)i * 8, 8);
         h[k] = (h[k] ^ w) * 0x100000001B3ull;
@@ -762,6 +813,7 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
         }
         e->va = va;
         e->rendered = 1;
+    g_rendered_gen++;
         e->framebuffer = source;
         fprintf(stderr, "[HLE-D3D8] the title binds its own %s as a texture "
                 "0x%08X (%ux%u, format 0x%02X, data 0x%08X); filling it from the "
@@ -834,6 +886,102 @@ static int tex_trace_data(uint32_t data, unsigned long now)
     return 1;
 }
 
+/* The last textures a frame bound. A race binds about a thousand times a
+ * frame and almost all of them are the same few; scanning the whole cache
+ * for each one was the bind. A slot the cache reuses fails the header check
+ * and falls through to the scan. */
+#define TEX_HOT 24
+struct tex_hot_slot {
+    int idx;
+    uint32_t va, data, format, size;
+};
+static struct tex_hot_slot g_tex_hot[TEX_HOT];
+static int g_tex_hot_n;
+static texture_entry *g_tex_resolved;
+
+static texture_entry *tex_hot_find(uint32_t va, uint32_t data, uint32_t format, uint32_t size)
+{
+    int i;
+
+    for (i = 0; i < g_tex_hot_n; i++) {
+        struct tex_hot_slot *h = &g_tex_hot[i];
+        texture_entry *e;
+
+        if (h->va != va || h->data != data || h->format != format || h->size != size)
+            continue;
+        if (h->idx < 0 || h->idx >= g_texture_count)
+            continue;
+        e = &g_textures[h->idx];
+        if (e->host && e->va == va && e->data == data && e->format == format && e->size == size)
+            return e;
+    }
+    return NULL;
+}
+
+/* Behind the hot list: a direct-mapped index of where each texture was
+ * last found, checked like the hot list is. A race binds a few hundred
+ * different textures a frame, more than the hot list holds, and each miss
+ * walked the whole cache. A stale slot fails the check and the walk runs. */
+#define TEX_INDEX 4096u
+static int16_t g_tex_index[TEX_INDEX];
+static int     g_tex_index_ready;
+
+static unsigned tex_index_slot(uint32_t va, uint32_t data, uint32_t format, uint32_t size)
+{
+    uint64_t k = ((uint64_t)va * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)data * 0xC2B2AE3D27D4EB4Full) ^
+                 ((uint64_t)format * 0x165667B19E3779F9ull) ^ size;
+    k ^= k >> 29;
+    return (unsigned)(k ^ (k >> 32)) & (TEX_INDEX - 1u);
+}
+
+static texture_entry *tex_index_find(uint32_t va, uint32_t data, uint32_t format, uint32_t size)
+{
+    int idx;
+    texture_entry *e;
+
+    if (!g_tex_index_ready)
+        return NULL;
+    idx = g_tex_index[tex_index_slot(va, data, format, size)];
+    if (idx < 0 || idx >= g_texture_count)
+        return NULL;
+    e = &g_textures[idx];
+    if (e->host && e->va == va && e->data == data && e->format == format && e->size == size)
+        return e;
+    return NULL;
+}
+
+static void tex_index_put(texture_entry *e)
+{
+    if (!g_tex_index_ready) {
+        memset(g_tex_index, 0xFF, sizeof g_tex_index);
+        g_tex_index_ready = 1;
+    }
+    g_tex_index[tex_index_slot(e->va, e->data, e->format, e->size)] = (int16_t)(e - g_textures);
+}
+
+static void tex_hot_remember(texture_entry *e)
+{
+    int idx = (int)(e - g_textures);
+    int i, n;
+    struct tex_hot_slot h;
+
+    tex_index_put(e);
+    h.idx = idx;
+    h.va = e->va;
+    h.data = e->data;
+    h.format = e->format;
+    h.size = e->size;
+    for (i = 0; i < g_tex_hot_n; i++)
+        if (g_tex_hot[i].idx == idx)
+            break;
+    n = i < g_tex_hot_n ? i : (g_tex_hot_n < TEX_HOT ? g_tex_hot_n : TEX_HOT - 1);
+    if (n == g_tex_hot_n)
+        g_tex_hot_n++;
+    if (n > 0)
+        memmove(&g_tex_hot[1], &g_tex_hot[0], (size_t)n * sizeof g_tex_hot[0]);
+    g_tex_hot[0] = h;
+}
+
 static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
 {
     unsigned long now = hle_d3d8_shadow_swaps();
@@ -841,6 +989,8 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     texture_entry *e = NULL;
     uint32_t data = obj_field(va, 4), format = obj_field(va, 12), size = obj_field(va, 16);
     int i;
+
+    g_tex_resolved = NULL;
 
     /* Memory the title rendered into as a bare surface: the host's drawing
      * is the content (hle_d3d8_render_surface). First, even over frame-buffer
@@ -905,11 +1055,16 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
             return fb;
     }
 
-    for (i = 0; i < g_texture_count; i++) {
-        texture_entry *c = &g_textures[i];
-        if (c->host && c->va == va && c->data == data && c->format == format && c->size == size) {
-            e = c;
-            break;
+    e = tex_hot_find(va, data, format, size);
+    if (!e)
+        e = tex_index_find(va, data, format, size);
+    if (!e) {
+        for (i = 0; i < g_texture_count; i++) {
+            texture_entry *c = &g_textures[i];
+            if (c->host && c->va == va && c->data == data && c->format == format && c->size == size) {
+                e = c;
+                break;
+            }
         }
     }
     /* RECOMP_HLE_D3D8_TEX_PROBE=<w>x<h>: every lookup of a texture that size,
@@ -972,6 +1127,8 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
                 }
             }
         }
+        g_tex_resolved = e;
+        tex_hot_remember(e);
         return e->host;
     }
 
@@ -1014,6 +1171,8 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     g_uploads++;
     entry_count(e, &t);
     enforce_budget(now);         /* this one was used now, so it stays */
+    g_tex_resolved = e;
+    tex_hot_remember(e);
     return e->host;
 }
 
@@ -1484,8 +1643,8 @@ static void upload_static_cube(IDirect3DCubeTexture8 *host, uint32_t phys, uint3
 static IDirect3DCubeTexture8 *static_cube(IDirect3DDevice8 *dev, uint32_t va)
 {
     static int full_every = -1;
-    uint32_t common = HLE_MEM32(va + 0), data = HLE_MEM32(va + 4);
-    uint32_t format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+    uint32_t common = obj_field(va, 0), data = obj_field(va, 4);
+    uint32_t format = obj_field(va, 12), size = obj_field(va, 16);
     uint32_t fmt = (format >> 8) & 0xFF, levels = (format >> 16) & 0xF;
     uint32_t edge = 1u << ((format >> 20) & 0xF);
     uint32_t phys = data & 0x0FFFFFFFu, chain, stride, total;
@@ -1551,6 +1710,109 @@ static IDirect3DCubeTexture8 *static_cube(IDirect3DDevice8 *dev, uint32_t va)
     return g_static_cubes[i].host;
 }
 
+/* D3D11 cannot sample BC1/BC3 as a 3D image. Expand each guest slice to
+ * RGBA before uploading, retaining the volume and its mip chain. */
+static IDirect3DVolumeTexture8 *static_volume(IDirect3DDevice8 *dev, uint32_t va)
+{
+    static struct { uint32_t data, format, hash; unsigned long checked, used;
+        IDirect3DVolumeTexture8 *host; } cache[512];
+    static unsigned count;
+    uint32_t format = obj_field(va, 12), data = obj_field(va, 4);
+    uint32_t fmt = (format >> 8) & 255, levels = (format >> 16) & 15;
+    uint32_t w = 1u << ((format >> 20) & 15), h = 1u << ((format >> 24) & 15);
+    uint32_t d = 1u << ((format >> 28) & 15), phys = data & 0x0FFFFFFF;
+    uint64_t total = 0;
+    unsigned i, l;
+    unsigned long now = hle_d3d8_shadow_swaps();
+    if (((format >> 4) & 15) != 3 || (fmt != D3DFMT_DXT5 && fmt != D3DFMT_DXT1) || !levels ||
+        !data || obj_field(va, 16)) return NULL;
+    for (l = 0; l < levels; ++l)
+        total += (uint64_t)d3d8_row_pitch((D3DFORMAT)fmt, level_dim(w,l)) *
+                 level_rows(fmt, level_dim(h,l)) * level_dim(d,l);
+    if ((uint64_t)phys + total > CONTIG_SIZE) return NULL;
+    /* Optional bounded guest-byte dump: compare decoding with the actual
+     * source slab, independently of the host capture's expanded copy. */
+    {
+        static unsigned dumped;
+        static const char *prefix;
+        static int looked;
+        if(!looked){prefix=getenv("RECOMP_HLE_D3D8_VOLUME_DUMP");looked=1;}
+        if(prefix && *prefix && dumped<8) {
+            static uint32_t seen_data[8],seen_format[8];
+            unsigned n;
+            for(n=0;n<dumped;++n) if(seen_data[n]==data && seen_format[n]==format)break;
+            if(n==dumped) {
+                char path[1024];
+                snprintf(path,sizeof path,"%s_%02u.bin",prefix,dumped);
+                FILE *f=fopen(path,"wb");
+                if(f) {
+                    uint32_t header[7]={format,w,h,d,levels,data,(uint32_t)total};
+                    fwrite(header,sizeof header,1,f);
+                    fwrite(HLE_PTR(CONTIG_BASE+phys),1,(size_t)total,f);fclose(f);
+                    seen_data[dumped]=data;seen_format[dumped]=format;++dumped;
+                }
+            }
+        }
+    }
+    for (i = 0; i < count; ++i)
+        if (cache[i].data == data && cache[i].format == format) break;
+    if (i == count) {
+        if (count == 512) {
+            IDirect3DBaseTexture8 *bound[4] = {0};
+            unsigned victim = 512;
+            for (unsigned stage=0;stage<4;++stage)
+                dev->lpVtbl->GetTexture(dev,stage,&bound[stage]);
+            for (unsigned candidate=0;candidate<count;++candidate) {
+                int active=0;
+                for (unsigned stage=0;stage<4;++stage)
+                    if ((IDirect3DBaseTexture8 *)cache[candidate].host==bound[stage]) active=1;
+                if (!active && (victim==512 || cache[candidate].used<cache[victim].used))
+                    victim=candidate;
+            }
+            for (unsigned stage=0;stage<4;++stage)
+                if (bound[stage]) bound[stage]->lpVtbl->Release(bound[stage]);
+            if (victim==512) return NULL;
+            i=victim;
+        }
+        IDirect3DVolumeTexture8 *host = NULL;
+        if (FAILED(dev->lpVtbl->CreateVolumeTexture(dev,w,h,d,levels,0,
+            D3DFMT_LIN_A8B8G8R8,D3DPOOL_MANAGED,&host)) || !host) return NULL;
+        if (i<count) host_ReleaseTexture((IDirect3DTexture8 *)cache[i].host);
+        else ++count;
+        memset(&cache[i],0,sizeof cache[i]);
+        cache[i].data=data; cache[i].format=format; cache[i].host=host;
+        cache[i].used=now;
+        fprintf(stderr,"[HLE-D3D8] BC1/BC3 volume mirrored: %ux%ux%u, %u levels\n",w,h,d,levels);
+    } else {
+        cache[i].used=now;
+        if (now - cache[i].checked < 8) return cache[i].host;
+    }
+    cache[i].checked=now;
+    uint32_t hash=guest_bytes_hash(phys,(uint32_t)total);
+    if (hash == cache[i].hash && cache[i].hash) return cache[i].host;
+    const uint8_t *src=(const uint8_t *)HLE_PTR(CONTIG_BASE+phys);
+    for (l=0;l<levels;++l) {
+        uint32_t lw=level_dim(w,l),lh=level_dim(h,l),ld=level_dim(d,l);
+        uint32_t pitch=d3d8_row_pitch((D3DFORMAT)fmt,lw),slice=pitch*level_rows(fmt,lh);
+        D3DLOCKED_BOX box;
+        uint8_t *rgba=malloc((size_t)lw*lh*4);
+        if (!rgba) return cache[i].host;
+        if (FAILED(cache[i].host->lpVtbl->LockBox(cache[i].host,l,&box,NULL,0))) {
+            free(rgba); return cache[i].host;
+        }
+        for (uint32_t z=0;z<ld;++z) {
+            xbr_decode_dxt_volume_slice(src,lw,lh,ld,z,fmt==D3DFMT_DXT1,rgba);
+            for (uint32_t y=0;y<lh;++y)
+                memcpy((uint8_t *)box.pBits+(size_t)z*box.SlicePitch+(size_t)y*box.RowPitch,
+                       rgba+(size_t)y*lw*4,(size_t)lw*4);
+        }
+        cache[i].host->lpVtbl->UnlockBox(cache[i].host,l);
+        free(rgba); src+=(size_t)slice*ld;
+    }
+    cache[i].hash=hash;
+    return cache[i].host;
+}
+
 /* The host render target for a 2D guest texture the title renders into, for
  * hle_d3d8.c's SetRenderTarget. The same cache entry SetTexture finds, so a
  * texture drawn into and then bound samples what was drawn. A texture already
@@ -1606,6 +1868,7 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
     e->format = format;
     e->size = size;
     e->rendered = 1;
+    g_rendered_gen++;
     e->checked_swap = e->used_swap = now;
     fprintf(stderr, "[HLE-D3D8] shadow render target texture 0x%08X: format 0x%02X "
             "%ux%u, %u level(s)\n", va, t.fmt, t.width, t.height, t.levels);
@@ -1665,6 +1928,7 @@ IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surfa
     e->format = format;
     e->size = size;
     e->rendered = 1;
+    g_rendered_gen++;
     e->checked_swap = e->used_swap = e->drawn_swap = now;
     fprintf(stderr, "[HLE-D3D8] shadow render target surface 0x%08X: format 0x%02X %ux%u "
             "at 0x%08X, sampled by any texture over that memory\n",
@@ -1678,8 +1942,9 @@ static void rendered_surface_drawn(uint32_t data, uint32_t format, uint32_t size
 {
     int i;
 
-    for (i = 0; i < g_texture_count; i++) {
-        texture_entry *c = &g_textures[i];
+    rendered_list_refresh();
+    for (i = 0; i < g_rendered_n; i++) {
+        texture_entry *c = &g_textures[g_rendered_list[i]];
         if (c->host && c->rendered && c->va == 0 && c->data == data &&
             same_pixels(c->format, c->size, format, size))
             c->drawn_swap = now;
@@ -1693,8 +1958,9 @@ static int rendered_surface_recent(uint32_t data, uint32_t format, uint32_t size
 {
     int i;
 
-    for (i = 0; i < g_texture_count; i++) {
-        texture_entry *c = &g_textures[i];
+    rendered_list_refresh();
+    for (i = 0; i < g_rendered_n; i++) {
+        texture_entry *c = &g_textures[g_rendered_list[i]];
         if (c->host && c->rendered && c->va == 0 && c->data == data &&
             same_pixels(c->format, c->size, format, size))
             return now - c->drawn_swap <= 2u;
@@ -1709,9 +1975,15 @@ static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, u
 {
     int i;
 
-    for (i = 0; i < g_texture_count; i++) {
-        texture_entry *c = &g_textures[i];
-        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+    rendered_list_refresh();
+    for (i = 0; i < g_rendered_n; i++) {
+        texture_entry *c = &g_textures[g_rendered_list[i]];
+        /* Depth images may be rendered through a parent texture and sampled
+         * through another container. Match their pixels, not container identity.
+         * Keep colour aliasing limited to the existing bare-surface path. */
+        if (c->host && c->rendered &&
+            (c->va == 0 || d3d8_format_is_depth((D3DFORMAT)((format >> 8) & 0xFFu))) &&
+            (c->data & 0x0FFFFFFFu) == (data & 0x0FFFFFFFu) &&
             same_pixels(c->format, c->size, format, size)) {
             c->used_swap = now;
             return c->host;
@@ -1801,10 +2073,44 @@ static void report(void)
 HLE_ORIGINAL(D3DDevice_SetTexture);
 
 static void shadow_set_texture(uint32_t stage, uint32_t texture);
+/* Deferred binds carry the texture object's header as it was when the title
+ * bound it: Forza Motorsport points one object at its movie frame, at small
+ * glyph pages and at the screen within a single frame, and read when the
+ * queue ran, every bind saw the last of them -- the menu came out as one
+ * colour. The header is put back for the bind and the current one restored
+ * after. a[2] says whether a[3..8] hold it. */
+#define DEFER_TEX_WORDS 6
 static void op_set_texture(const void *arg)
 {
     const uint32_t *a = (const uint32_t *)arg;
-    shadow_set_texture(a[0], a[1]);
+    uint32_t va = a[1], now[DEFER_TEX_WORDS];
+    int k, swap = a[2] && va && !is_synth(va);
+
+    if (swap)
+        for (k = 0; k < DEFER_TEX_WORDS; k++) {
+            now[k] = HLE_MEM32(va + 4u * k);
+            HLE_MEM32(va + 4u * k) = a[3 + k];
+        }
+    shadow_set_texture(a[0], va);
+    if (swap)
+        for (k = 0; k < DEFER_TEX_WORDS; k++)
+            HLE_MEM32(va + 4u * k) = now[k];
+}
+
+static void defer_set_texture(uint32_t stage, uint32_t va)
+{
+    uint32_t a[3 + DEFER_TEX_WORDS];
+    int k;
+
+    memset(a, 0, sizeof a);
+    a[0] = stage;
+    a[1] = va;
+    if (va && !is_synth(va)) {
+        a[2] = 1;
+        for (k = 0; k < DEFER_TEX_WORDS; k++)
+            a[3 + k] = HLE_MEM32(va + 4u * k);
+    }
+    hle_d3d8_defer_op(op_set_texture, a, sizeof a);
 }
 
 /* HRESULT D3DDevice_SetTexture(DWORD Stage, IDirect3DBaseTexture8 *pTexture) */
@@ -1946,10 +2252,7 @@ HLE_EXPORT(D3DDevice_SetTexture)
      * executed, so the texels are read then -- as the NV2A reads them when it
      * reaches the draw, not when the title issued it. */
     if (hle_d3d8_defer_recording()) {
-        uint32_t a[2];
-        a[0] = stage;
-        a[1] = texture;
-        hle_d3d8_defer_op(op_set_texture, a, sizeof a);
+        defer_set_texture(stage, texture);
     } else {
         shadow_set_texture(stage, texture);
     }
@@ -2052,7 +2355,7 @@ void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format)
         /* Not one SetTexture has bound: a swizzled or compressed texture is
          * described completely by its Format, so it is mirrored from that. */
         if (!va && !d3d8_format_is_linear((D3DFORMAT)((format >> 8) & 0xFFu)) &&
-            ((format >> 4) & 0xFu) == 2u && !(format & FORMAT_CUBEMAP))
+            (((format >> 4) & 0xFu) == 2u || ((format >> 4) & 0xFu) == 3u) && !(format & FORMAT_CUBEMAP))
             va = synth_key(data, format);
         if (!va) {
             if (g_switch_misses++ < 3)
@@ -2063,17 +2366,14 @@ void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format)
         }
         g_switch_hits++;
         if (hle_d3d8_defer_recording()) {
-            uint32_t a[2];
-            a[0] = stage;
-            a[1] = va;
-            hle_d3d8_defer_op(op_set_texture, a, sizeof a);
+            defer_set_texture(stage, va);
         } else {
             shadow_set_texture(stage, va);
         }
     }
 }
 
-static void shadow_set_texture(uint32_t stage, uint32_t texture)
+static void shadow_set_texture_profile_impl(uint32_t stage, uint32_t texture)
 {
     {
         IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
@@ -2103,30 +2403,49 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
                 report();
                 return;
             }
+            IDirect3DVolumeTexture8 *volume = static_volume(dev, texture);
+            if (volume) {
+                g_bound[stage] = NULL;
+                g_bound_entry[stage] = NULL;
+                host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)volume);
+                g_bound_count++;
+                return;
+            }
             host = host_texture(dev, texture);
         }
         hle_d3d8_note_stage_texels(stage, texture ? obj_field(texture, 4) & 0x0FFFFFFFu : 0u);
         g_bound[stage] = host;
         g_bound_entry[stage] = NULL;
+        /* The entry behind the host texture, and for stage 0 whether this
+         * draw is one of the title's full-screen passes over its own frame:
+         * nothing else binds the frame buffer as stage 0, so it identifies
+         * them without matching a shader or a size. One pass over the cache
+         * for both; they were two, each up to every entry, at every bind. */
         {
-            int i;
-            for (i = 0; host && i < g_texture_count; i++)
-                if (g_textures[i].host == host) {
+            int i, want_fb = stage == 0;
+
+            /* host_texture just resolved this entry. The scan below is the
+             * path for a surface or a frame buffer it answered itself. */
+            if (g_tex_resolved && g_tex_resolved->host == host) {
+                g_bound_entry[stage] = g_tex_resolved;
+                if (want_fb)
+                    g_stage0_framebuffer = g_tex_resolved->framebuffer == FB_SCREEN;
+            } else {
+            if (want_fb)
+                g_stage0_framebuffer = 0;
+            for (i = 0; host && i < g_texture_count; i++) {
+                if (g_textures[i].host != host)
+                    continue;
+                if (!g_bound_entry[stage])
                     g_bound_entry[stage] = &g_textures[i];
-                    break;
-                }
-        }
-        if (stage == 0) {
-            /* Whether this draw is one of the title's full-screen passes over
-             * its own frame. Nothing else binds the frame buffer as stage 0,
-             * so it identifies them without matching a shader or a size. */
-            int i;
-            g_stage0_framebuffer = 0;
-            for (i = 0; host && i < g_texture_count; i++)
-                if (g_textures[i].host == host && g_textures[i].framebuffer == FB_SCREEN) {
+                if (want_fb && g_textures[i].framebuffer == FB_SCREEN) {
                     g_stage0_framebuffer = 1;
-                    break;
+                    want_fb = 0;
                 }
+                if (!want_fb)
+                    break;
+            }
+            }
         }
         /* The host pixel shader samples every stage whatever its operation
          * (d3d8_shaders.c), and an unbound D3D11 slot reads as zero, so a
@@ -2159,6 +2478,16 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
         report();
     }
 }
+
+extern long long d3d8_profile_clock(void);
+extern void d3d8_profile_texture_end(long long start);
+static void shadow_set_texture(uint32_t stage,uint32_t texture)
+{
+    long long start=d3d8_profile_clock();
+    shadow_set_texture_profile_impl(stage,texture);
+    d3d8_profile_texture_end(start);
+}
+
 
 /* Does the draw about to be made sample the title's own frame at stage 0?
  *
@@ -2235,3 +2564,4 @@ HLE_EXPORT(D3DDevice_SetPalette)
         set_pal_data(stage, data);
     }
 }
+

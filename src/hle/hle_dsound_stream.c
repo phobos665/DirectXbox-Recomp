@@ -464,6 +464,71 @@ static Stream *find_by_object(uint32_t object)
     return best;
 }
 
+/* Called after a successful guest SetFormat by a title binding. The format
+ * captured at CreateSoundStream is only the initial one: Forza creates PCM
+ * 48 kHz streams and then changes them before supplying the first packet.
+ * Keeping the initial format plays 44.1 kHz music too fast and reads ADPCM
+ * effect packets as PCM noise. Preserve the guest's own setter and update
+ * only the host side, once its old packets have all been drained. */
+void hle_dsound_stream_format_changed(uint32_t object, uint32_t wfx)
+{
+    Stream *s;
+    uint32_t tag, channels, rate, align, bits;
+    static unsigned reported;
+
+    if (!wfx || !guest_readable(wfx, 16u))
+        return;
+    tag = HLE_MEM32(wfx) & 0xFFFFu;
+    channels = HLE_MEM32(wfx) >> 16;
+    rate = HLE_MEM32(wfx + 4u);
+    align = HLE_MEM32(wfx + 12u) & 0xFFFFu;
+    bits = HLE_MEM32(wfx + 12u) >> 16;
+    if (!channels || !rate || !align)
+        return;
+
+    lock();
+    s = find_by_iface(object);
+    if (!s) s = find_by_object(object);
+    if (!s) {
+        unlock();
+        return;
+    }
+    if (s->count) {
+        /* Reinterpreting packets already counted in the old format would
+         * corrupt completion positions. A setter on a busy stream needs
+         * the title to flush it first; retain the evidence rather than
+         * silently throwing its packets away. */
+        fprintf(stderr, "[DSOUND] SetFormat stream %08X not applied: %d packets pending\n",
+                s->iface, s->count);
+        unlock();
+        return;
+    }
+    if (s->tag != tag || s->channels != channels || s->rate != rate ||
+        s->align != align || s->bits != bits) {
+        release_voice(s);
+        s->tag = tag;
+        s->channels = channels;
+        s->rate = rate;
+        s->align = align;
+        s->bits = bits;
+        s->output = channels >= 1u && channels <= 2u &&
+                    rate >= 1000u && rate <= 200000u &&
+                    ((tag == TAG_PCM && (bits == 8u || bits == 16u) &&
+                      align == channels * (bits / 8u)) ||
+                     (tag == TAG_ADPCM && bits == 4u &&
+                      align == XBOX_ADPCM_BLOCK_BYTES * channels));
+        s->consumed_base = s->sent = s->queued;
+        s->play_origin = s->queued;
+        s->play_anchored = 0;
+        s->resumed_ms = 0;
+        if (reported++ < 32u)
+            fprintf(stderr, "[DSOUND] SetFormat stream %08X: tag %04X %u ch %u Hz "
+                    "%u bit align %u, %s\n", s->iface, tag, channels, rate,
+                    bits, align, s->output ? "output" : "clock only");
+    }
+    unlock();
+}
+
 /* Complete one packet: status, size, then the callback or the event. The
  * callback is LPFNXMEDIAOBJECTCALLBACK, __stdcall (pStreamContext,
  * pPacketContext, dwStatus); its `ret 12` pops the arguments and the dummy

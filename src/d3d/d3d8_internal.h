@@ -53,7 +53,7 @@ void d3d8_SetTwoDSqueeze(BOOL on);
  * depth and stencil as asked, the scissor and viewport ignored. 0 done (or
  * nothing to do), -1 if the pass could not be made. */
 int  d3d8_clear_rects(RhiView *rtv, RhiView *dsv, UINT width, UINT height,
-                      const RhiRect *rects, UINT count, int color, int depth, int stencil,
+                      const RhiRect *rects, UINT count, int color_mask, int depth, int stencil,
                       const float rgba[4], float z, uint8_t stencil_value);
 void d3d8_clear_shutdown(void);
 
@@ -85,6 +85,8 @@ UINT                 d3d8_GetBackbufferHeight(void);
 
 /* Current render state array accessor */
 const DWORD         *d3d8_GetRenderStates(void);
+/* MaxZ - MinZ of the current viewport. */
+float                d3d8_GetViewportDepthSpan(void);
 const DWORD         *d3d8_GetTSS(DWORD stage);
 
 /* Base texture currently bound to a texture stage (2D/cube/volume),

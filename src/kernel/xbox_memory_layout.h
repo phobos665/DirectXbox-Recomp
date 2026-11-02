@@ -365,6 +365,8 @@ void xbox_ProtectMirrorsForDebug(void);
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
  * does nothing unless that variable is set. */
 void xbox_WatchdogStart(void);
+/* Each present: the thread RECOMP_WATCHDOG_STALL watches. */
+void xbox_WatchdogNotePresent(void);
 
 /* Frame rate at the HLE boundary (recomp_fps.c). RECOMP_FPS=<seconds> prints
  * swaps and delivered vblanks per window; the counts cost an interlocked

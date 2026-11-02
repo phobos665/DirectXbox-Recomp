@@ -78,8 +78,8 @@
  *     the host's system-memory copy, which rendering never writes, so a
  *     target drawn in an earlier frame and only sampled in this one replays
  *     as zeros.
- *   - volume textures, which shadow mode does not create. One bound on a
- *     stage would be recorded as nothing bound.
+ *   - volume formats other than expanded linear RGBA. Version 11 records
+ *     expanded RGBA volumes and all their mip slices.
  *   - the contents of a cube a title renders into (they live on the GPU and
  *     are drawn again on replay). A cube filled from memory has its texels
  *     recorded (CUBE_LEVEL, version 7).
@@ -109,7 +109,7 @@ extern "C" {
  * version 8 the screen copies (a title reading its own frame back into a
  * texture), version 9 the scene's pixels as the frame begins, version 10
  * the depth copies (a title reading its depth buffer as a colour texture). */
-#define D3D8CAP_VERSION      10u
+#define D3D8CAP_VERSION      12u
 /* The oldest version the reader still accepts. A bump that only adds chunk
  * kinds leaves an older file a valid newer one that happens not to contain
  * them (version 6 added three; version 5 one), so it leaves this alone. A
@@ -159,7 +159,9 @@ enum {
     D3D8CAP_SCREEN_COPY         = 31, /* D3D8CapScreenCopy (version 8) */
     D3D8CAP_SCENE               = 32, /* D3D8CapScene + rows (version 9) */
     D3D8CAP_DEPTH_COPY          = 33, /* D3D8CapScreenCopy, has_rect 0 (version 10) */
-    D3D8CAP_CHUNK_KINDS         = 34  /* one past the last, for per-kind counters */
+    D3D8CAP_VOLUME_TEXTURE      = 34, /* D3D8CapVolumeTexture + packed levels */
+    D3D8CAP_DEPTH_ALIAS         = 35, /* two uint32 words: depth id, texture id */
+    D3D8CAP_CHUNK_KINDS         = 36  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -235,6 +237,10 @@ typedef struct {
 typedef struct {
     uint32_t id, format, width, height, levels, usage;
 } D3D8CapTexture;
+typedef struct {
+    uint32_t id, format, width, height, depth, levels, usage;
+} D3D8CapVolumeTexture;
+
 typedef struct { uint32_t pitch, rows, bytes; } D3D8CapLevel;
 
 /* One level filled again: shadow mode locked and unlocked a texture the

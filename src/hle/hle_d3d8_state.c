@@ -126,7 +126,15 @@ static void unmapped(const char *what, uint32_t value)
     }
 }
 
-static int state_ready(void)
+static int state_ready_check(void);
+
+/* Asked several times a draw; the answer is settled after the first. */
+static inline int state_ready(void)
+{
+    return g_state_ready >= 0 ? g_state_ready : state_ready_check();
+}
+
+static int state_ready_check(void)
 {
     uint32_t rs = hle_var_D3D_g_RenderState;
 
@@ -417,6 +425,15 @@ static const struct {
     /* XDK 5849 numbering: SHADOWFUNC sits after MULTISAMPLERENDERTARGETMODE.
      * The compare a shadow-map stage makes (d3d8_combiners.c). */
     { 157, D3DRS_SHADOWFUNC,       CMP },
+    /* Polygon offset. The slope and the bias are float bits; the three
+     * enables gate point, line and solid. Applied as D3D11 depth bias for
+     * the current fill mode, so a decal or a contact shadow sits on the
+     * road instead of fighting it. */
+    {  77, D3DRS_POLY_SLOPE,       AS_IS },
+    {  78, D3DRS_POLY_BIAS,        AS_IS },
+    {  79, D3DRS_POLY_POINT,       AS_IS },
+    {  80, D3DRS_POLY_LINE,        AS_IS },
+    {  81, D3DRS_POLY_FILL,        AS_IS },
 };
 
 static DWORD rs_to_host(uint8_t kind, uint32_t v)
@@ -444,6 +461,7 @@ static const struct {
 } g_ts_map[] = {
     {  0, D3DTSS_ADDRESSU,      TS_ADDRESS },
     {  1, D3DTSS_ADDRESSV,      TS_ADDRESS },
+    {  2, D3DTSS_ADDRESSW,      TS_ADDRESS },
     {  3, D3DTSS_MAGFILTER,     TS_FILTER },
     {  4, D3DTSS_MINFILTER,     TS_FILTER },
     {  5, D3DTSS_MIPFILTER,     TS_FILTER },
@@ -1081,6 +1099,52 @@ int hle_d3d8_state_store_simple(uint32_t method, uint32_t value)
         }
     }
     return 0;
+}
+
+/* Face culling as the push buffer sets it: NV097_SET_CULL_FACE_ENABLE
+ * (0x0308), NV097_SET_CULL_FACE (0x039C: 0x404 front, 0x405 back, 0x408
+ * both) and NV097_SET_FRONT_FACE (0x03A0: 0x900 CW, 0x901 CCW), folded into
+ * the D3DRS_CULLMODE slot (the faces of that winding are culled). A title
+ * that records its own push buffers sets culling in them, and only there:
+ * the slot kept whatever the API last set, and Forza Motorsport's
+ * billboards, signs and grandstands drew their back faces too, fighting
+ * the front ones for the same depth -- flicker as the camera moved.
+ * RECOMP_PB_CULL=0 leaves the slot to the API alone. */
+void hle_d3d8_state_store_cull(uint32_t enable, uint32_t face, uint32_t front)
+{
+    static int on = -1;
+    uint32_t v;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_CULL");
+        on = e ? atoi(e) : 1;
+    }
+    if (!on || !hle_var_D3D_g_RenderState || state_ready() != 1 || rs_slot(147u) < 0)
+        return;
+    if (!enable)
+        v = 0;
+    else if (face == 0x408u)
+        return;                              /* both: no host equivalent */
+    else {
+        /* The XDK writes the D3DCULL value itself as the front face (its
+         * screen is y-down, the winding names the culled side): Forza's own
+         * D3DCULL_CCW came with back faces culled and the front CCW. */
+        v = front == 0x900u ? 0x900u : 0x901u;
+        if (face == 0x404u)
+            v ^= 1u;                         /* the front is culled instead */
+        if (on == 2)
+            v ^= 1u;                         /* the other reading, to compare */
+    }
+    {
+        static int said;
+        uint32_t old = HLE_MEM32(hle_var_D3D_g_RenderState + 4u * (uint32_t)rs_slot(147u));
+        if (said < 24 && old != v) {
+            said++;
+            fprintf(stderr, "[PB-CULL] enable %u face 0x%03X front 0x%03X: cull mode "
+                    "0x%03X (was 0x%03X)\n", enable, face, front, v, old);
+        }
+    }
+    HLE_MEM32(hle_var_D3D_g_RenderState + 4u * (uint32_t)rs_slot(147u)) = v;
 }
 
 uint32_t hle_d3d8_push_position(void);          /* hle_d3d8_vertex.c */

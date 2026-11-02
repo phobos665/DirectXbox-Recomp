@@ -2407,6 +2407,8 @@ static void bridge_NtPulseEvent(void)
  */
 static HANDLE bridge_resolve_handle(uint32_t token);
 
+static volatile LONG s_long_wait_lines;
+
 static void bridge_NtWaitForSingleObjectEx(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
@@ -2423,6 +2425,38 @@ static void bridge_NtWaitForSingleObjectEx(void)
     if (bridge_wait_on_self(STACK_ARG(0), alertable, timeout_ptr))
         return;
 
+    /* A wait with no end that does not end says nothing on its own: a hang
+     * shows as a still picture and a log that stops. So an infinite wait,
+     * not alertable, is made in ten-second pieces, and each piece that
+     * runs out says which object and from where (the guest stack above the
+     * arguments: the wrapper's and its callers' return addresses) -- then
+     * waits on, exactly as before. Forza froze once on the way into its
+     * Arcade menu with nothing in the log to say what it waited for. */
+    if (!timeout_ptr && !alertable && handle) {
+        DWORD r, waited = 0;
+        for (;;) {
+            r = WaitForSingleObjectEx(handle, 10000, FALSE);
+            if (r != WAIT_TIMEOUT)
+                break;
+            waited += 10;
+            /* Idle workers wait like this too, for work that does not come:
+             * a cap keeps them from filling the log. */
+            if (InterlockedIncrement(&s_long_wait_lines) <= 300) {
+                uint32_t k;
+                fprintf(stderr, "  [KERNEL] still waiting after %lus: token=0x%08X "
+                        "handle=%p thread %lu; guest stack from 0x%08X:",
+                        (unsigned long)waited, STACK_ARG(0), handle,
+                        (unsigned long)GetCurrentThreadId(), g_esp);
+                for (k = 0; k < 24; k++)
+                    fprintf(stderr, " %08X", (uint32_t)BRIDGE_MEM32(g_esp + 16 + k * 4));
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        }
+        g_eax = r == WAIT_OBJECT_0 ? 0u
+              : r == WAIT_ABANDONED_0 ? 0x00000080u      /* STATUS_ABANDONED */
+              : 0xC0000001u;
+    } else
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
@@ -4681,8 +4715,14 @@ static void bridge_NtReadFile(void)
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
-     * identical from inside the title -- the first bytes settle it. */
-    {
+     * identical from inside the title -- the first bytes settle it.
+     *
+     * RECOMP_READ_LOG=1 only: a streaming title reads all race long, and two
+     * lines and an fflush per read cost Forza about 1 ms a frame. */
+    static int read_log = -1;
+    if (read_log < 0)
+        read_log = xbox_EnvSwitch("RECOMP_READ_LOG", 0);
+    if (read_log) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
         /* The offset matters as much as the length. A title streaming a pack
@@ -4779,9 +4819,10 @@ static void bridge_NtReadFile(void)
          * loader thread with exit status 0x103, which is STATUS_PENDING, so
          * whether this call is the source of that is exactly the question
          * the log has to be able to answer. */
-        fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> 0x%08X%s\n",
-                STACK_ARG(1), STACK_ARG(2), g_eax,
-                g_eax == 0x00000103u ? " STATUS_PENDING" : "");
+        if (read_log)
+            fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> 0x%08X%s\n",
+                    STACK_ARG(1), STACK_ARG(2), g_eax,
+                    g_eax == 0x00000103u ? " STATUS_PENDING" : "");
         /* RECOMP_FILE_SYNC=1 reports the read finished, for a title whose
          * loader does not come back for the result. Burnout 2 needs the
          * opposite -- its stream reader only accepts a short count on the

@@ -551,6 +551,9 @@ class FunctionTranslator:
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
         self.trace_functions = set(trace_functions or ())
+        # Functions whose guest registers live in C locals (regpromote.py):
+        # a set of addresses, "all", or None. Set by tools.recomp --regpromote.
+        self.regpromote = None
         # Emit an entry hook in *every* function, so the profiler can report
         # how many distinct functions a run reached. That count is the only
         # frontier measure here that rises monotonically with progress: kernel
@@ -1299,6 +1302,11 @@ class FunctionTranslator:
             self._edge_needs_cf = False
             code = self._translate_function_once(func_addr, func_info,
                                                  force_cf=True)
+        promote = getattr(self, 'regpromote', None)
+        if code and promote and (promote == 'all' or func_addr in promote):
+            from . import regpromote
+            name = _func_ident(func_addr, func_info.get("name", f"sub_{func_addr:08X}"))
+            code, _why = regpromote.promote(code, name)
         return code
 
     def translate_isolated(self, func_addr, func_info):

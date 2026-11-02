@@ -8,6 +8,7 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_swizzle.h"
+#include "dxt5_decode.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
@@ -1457,6 +1458,18 @@ static void d3d8_upload_mip_level(RhiImage *image, D3DFORMAT fmt,
 
     if (!rhi_device_ready() || !image) return;
 
+    RhiImageDesc storage;
+    rhi_image_get_desc(image, &storage);
+    if ((fmt == D3DFMT_DXT5 || fmt == D3DFMT_DXT1) && storage.format == RHI_FORMAT_R8G8B8A8_UNORM) {
+        BYTE *rgba = (BYTE *)malloc((size_t)w * h * 4);
+        if (!rgba) return;
+        if (fmt == D3DFMT_DXT1) xbr_decode_dxt1_rgba(src_data, src_row_pitch, w, h, rgba);
+        else xbr_decode_dxt5_rgba(src_data, src_row_pitch, w, h, rgba);
+        rhi_image_update(image, subresource, NULL, rgba, w * 4, w * h * 4);
+        free(rgba);
+        return;
+    }
+
     /* Step 1: unswizzle swizzled formats into linear storage. */
     if (!d3d8_format_is_compressed(fmt) && d3d8_format_is_swizzled(fmt)) {
         linear = (BYTE *)malloc((size_t)w * h * bpp);
@@ -1558,6 +1571,8 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
 
     tex->d3d8_format = Format;
     tex->host_format = d3d8_to_dxgi_format(Format);
+    if ((Format == D3DFMT_DXT5 || Format == D3DFMT_DXT1) && ((Width & 3) || (Height & 3)))
+        tex->host_format = RHI_FORMAT_R8G8B8A8_UNORM;
     /* F16 is float depth, which D3D11 has no format for. As a texture it
      * mapped to R16_FLOAT and was then bound as depth (it is a depth format),
      * which no backend accepts: MK Shaolin Monks' 256x256 LIN_F16 shadow
@@ -2031,6 +2046,30 @@ BOOL d3d8_cube_level(IDirect3DBaseTexture8 *texture, UINT face, UINT level,
         face >= 6 || level >= cube->levels || !bits || !pitch || !rows)
         return FALSE;
     w = cube_level_width(cube, level);
+    /* A capture must start with the GPU's existing environment map, not
+     * the zero-filled CPU allocation of a render target. Titles update
+     * only some faces per frame. These formats have identical host/Xbox
+     * byte channels; only the Xbox swizzle needs restoring for replay. */
+    if (cube->usage & D3DUSAGE_RENDERTARGET) {
+        BYTE *linear;
+        if (cube->d3d8_format != D3DFMT_A8R8G8B8 &&
+            cube->d3d8_format != D3DFMT_LIN_A8R8G8B8 &&
+            cube->d3d8_format != D3DFMT_X8R8G8B8 &&
+            cube->d3d8_format != D3DFMT_LIN_X8R8G8B8)
+            return FALSE;
+        linear = (BYTE *)malloc((size_t)w * w * 4);
+        if (!linear) return FALSE;
+        if (rhi_image_readback(cube->image, face * cube->levels + level,
+                               linear, w * 4) != 0) {
+            free(linear);
+            return FALSE;
+        }
+        if (d3d8_format_is_swizzled(cube->d3d8_format))
+            xbox_swizzle_rect(cube_level_ptr(cube, face, level), linear, w, w, 4);
+        else
+            memcpy(cube_level_ptr(cube, face, level), linear, (size_t)w * w * 4);
+        free(linear);
+    }
     *bits  = cube_level_ptr(cube, face, level);
     *pitch = d3d8_row_pitch(cube->d3d8_format, w);
     *rows  = d3d8_format_is_compressed(cube->d3d8_format) ? (w + 3) / 4 : w;

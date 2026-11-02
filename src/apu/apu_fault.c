@@ -92,8 +92,8 @@ static void say_undecoded(const char *what, recomp_fault *f, uint32_t va)
     fprintf(stderr, "[%s] undecoded access at 0x%08X, host insn %s\n", what, va, insn);
     fflush(stderr);
 }
-#endif
 
+#endif
 /* ---- the three range handlers -------------------------------------------- */
 
 static int pcrtc_fault(recomp_fault *f, uint32_t va)

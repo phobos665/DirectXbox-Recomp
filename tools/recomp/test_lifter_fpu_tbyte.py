@@ -113,7 +113,8 @@ class TbyteHelpersCompiledTest(unittest.TestCase):
             cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
             if cc:
                 exe = os.path.join(d, "f80")
-                built = subprocess.run([cc, "-O2", c, "-o", exe, "-lm"],
+                built = subprocess.run([cc, "-O2", c, "-o", exe]
+                                       + ([] if os.name == "nt" else ["-lm"]),
                                        capture_output=True, text=True)
             else:
                 from tools.conformance import __main__ as runner
