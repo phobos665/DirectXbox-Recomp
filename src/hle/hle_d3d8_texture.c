@@ -105,6 +105,48 @@ typedef struct {
 
 static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
+
+/* A memo in front of the lookup by identity (va, data, format, size): with
+ * the cache full, scanning 512 entries at every bind was TimeSplitters 2's
+ * largest host-side cost. A memo holds only while g_tex_gen is what it was
+ * when the memo was made. The generation moves whenever an entry is handed
+ * out, emptied or given another identity, so a memo gives exactly what the
+ * scan would, the first of two matches (a P8 variant) included. */
+#define TEX_MEMO 1024
+typedef struct { uint32_t va, data, format, size, gen; int idx; } tex_memo;
+static tex_memo g_tex_memo[TEX_MEMO];
+static uint32_t g_tex_gen = 1;
+
+static tex_memo *tex_memo_slot(uint32_t va, uint32_t data, uint32_t format, uint32_t size)
+{
+    uint32_t h = va * 0x9E3779B1u ^ data * 0x85EBCA77u ^ format * 0xC2B2AE3Du ^ size;
+    return &g_tex_memo[(h ^ h >> 16) & (TEX_MEMO - 1)];
+}
+
+/* The first cache entry with this identity and a host texture, or NULL. */
+static texture_entry *tex_lookup(uint32_t va, uint32_t data, uint32_t format, uint32_t size)
+{
+    tex_memo *m = tex_memo_slot(va, data, format, size);
+    int i;
+
+    if (m->gen == g_tex_gen && m->va == va && m->data == data && m->format == format &&
+        m->size == size)
+        return m->idx < 0 ? NULL : &g_textures[m->idx];
+    m->va = va;
+    m->data = data;
+    m->format = format;
+    m->size = size;
+    m->gen = g_tex_gen;
+    m->idx = -1;
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->va == va && c->data == data && c->format == format && c->size == size) {
+            m->idx = i;
+            return c;
+        }
+    }
+    return NULL;
+}
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
 /* The Size word of what each stage last had bound: the image rectangle and
  * pitch the hardware keeps when SwitchTexture changes only the offset and
@@ -554,6 +596,7 @@ static void entry_release(texture_entry *e)
         host_ReleaseTexture(e->host);
     g_tex_bytes -= e->bytes;
     memset(e, 0, sizeof *e);
+    g_tex_gen++;
 }
 
 /* Whether the budget or the age-out may release this entry; see above. */
@@ -617,6 +660,7 @@ static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
     texture_entry *victim = NULL;
     int i, s;
 
+    g_tex_gen++;                 /* the caller gives the slot an identity */
     if (g_tex_holes) {
         for (i = 0; i < g_texture_count; i++)
             if (!g_textures[i].host) {
@@ -769,6 +813,8 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
                 t->width, t->height, t->fmt, data);
         fflush(stderr);
     }
+    if (e->data != data || e->format != format || e->size != size)
+        g_tex_gen++;
     e->data = data;
     e->format = format;
     e->size = size;
@@ -905,13 +951,7 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
             return fb;
     }
 
-    for (i = 0; i < g_texture_count; i++) {
-        texture_entry *c = &g_textures[i];
-        if (c->host && c->va == va && c->data == data && c->format == format && c->size == size) {
-            e = c;
-            break;
-        }
-    }
+    e = tex_lookup(va, data, format, size);
     /* RECOMP_HLE_D3D8_TEX_PROBE=<w>x<h>: every lookup of a texture that size,
      * with where its texels are and whether any are non-zero. */
     {
@@ -1562,15 +1602,8 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
     texture_layout t;
     texture_entry *e = NULL;
     uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
-    int i;
 
-    for (i = 0; i < g_texture_count; i++) {
-        texture_entry *c = &g_textures[i];
-        if (c->host && c->va == va && c->data == data && c->format == format && c->size == size) {
-            e = c;
-            break;
-        }
-    }
+    e = tex_lookup(va, data, format, size);
     if (e && e->rendered) {
         e->used_swap = now;
         return e->host;
