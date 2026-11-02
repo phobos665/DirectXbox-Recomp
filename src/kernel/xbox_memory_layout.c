@@ -2631,19 +2631,31 @@ static void framebuffer_probe_tick(void)
  * seconds, this thread's CPU time and how many changes a pass found right
  * after a sleep (each of those may have waited for the sleep to end).
  *
- * Why the busy backoff is off by default. TimeSplitters 2 in its level on an
- * M4, quiet machine, back-to-back runs (Oct 2026): with the old spin this
+ * Why the busy backoff is on by default off Windows. TimeSplitters 2 in its
+ * level on an M4, quiet machine, back-to-back runs (Oct 2026): with the old spin this
  * thread used 21% of a core, with RECOMP_NV2A_ACK_BUSY_US=50 1.7%, and
  * D3D_BlockOnTime -- the fence wait -- never waited in either (63 calls a
  * second, ~7 us a second in total, none over 20 us); frame rate, "title's
  * Swap" and "rest of frame" stayed within 0.1 ms. But ~170 changes a second
  * were found right after a sleep, and a title that waits on the FIFO's GET
  * or on a fence more often than TimeSplitters 2 does (Burnout 2 and OutRun 2
- * pace on the fence) would wait out the sleep each time. Turn it on after
- * those have been measured. */
+ * pace on the fence) would wait out the sleep each time.
+ *
+ * Measured on an M4 (Nov 2026), 0 against 50, alternated runs: OutRun 2, which
+ * paces on the fence, held 60 fps with the same frame times capped and
+ * uncapped while this thread went from 8% of a core to 1.7%; TimeSplitters 2
+ * went from 20-28% to 2-3% and Constantine from 25-35% to 2%, at a cost of
+ * 1.5-3% of their uncapped frame rate (117 against 119 fps, 92 against 94)
+ * and nothing measurable at 60. A fifth of a core is the larger cost on a
+ * laptop or a phone, so it is 50 off Windows. Windows keeps 0 until it has
+ * been measured there; Burnout 2 has not been measured anywhere. */
 #define ACK_BUSY_YIELDS 8
 #ifndef ACK_BUSY_US_DEFAULT
-#define ACK_BUSY_US_DEFAULT 0
+#  ifdef _WIN32
+#    define ACK_BUSY_US_DEFAULT 0
+#  else
+#    define ACK_BUSY_US_DEFAULT 50
+#  endif
 #endif
 
 /* The idle wait, RECOMP_NV2A_ACK_IDLE_US. On POSIX it is a plain sleep
