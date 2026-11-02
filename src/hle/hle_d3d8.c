@@ -5093,6 +5093,36 @@ HLE_EXPORT(D3DDevice_SetViewport)
     }
 }
 
+/* void D3DDevice_SetGammaRamp(DWORD dwFlags, const D3DGAMMARAMP *pRamp)
+ *
+ * The Xbox's ramp is BYTE red[256], green[256], blue[256], and the console
+ * applies it in the DAC as each frame is scanned out (at the next vblank, or
+ * at once with D3DSGR_IMMEDIATE), so nothing drawn ever carries it. Here it
+ * is applied at the present's resolve (d3d8_display_set_gamma). Constantine
+ * sets one from its Brightness option, and without it every frame was the
+ * darker, uncorrected picture. */
+void d3d8_display_set_gamma(const uint8_t red[256], const uint8_t green[256],
+                            const uint8_t blue[256]);
+HLE_ORIGINAL(D3DDevice_SetGammaRamp);
+HLE_EXPORT(D3DDevice_SetGammaRamp)
+{
+    static int seen;
+    static unsigned long calls;
+    uint32_t flags = HLE_ARG(0), ramp = HLE_ARG(1);
+
+    first_call(&seen, "D3DDevice_SetGammaRamp", flags);
+    if (original_missing(hle_original_D3DDevice_SetGammaRamp, "D3DDevice_SetGammaRamp"))
+        return;
+    if (ramp) {
+        const uint8_t *r = (const uint8_t *)HLE_PTR(ramp);
+        d3d8_display_set_gamma(r, r + 256, r + 512);
+        if (calls++ < 4)
+            fprintf(stderr, "[HLE-D3D8] gamma ramp (flags 0x%X): red 0->%u 64->%u 128->%u "
+                    "192->%u 255->%u\n", flags, r[0], r[64], r[128], r[192], r[255]);
+    }
+    HLE_CALL_ORIGINAL(D3DDevice_SetGammaRamp);
+}
+
 /* void D3DDevice_SetScissors(DWORD Count, BOOL Exclusive, const D3DRECT *pRects)
  * Xbox-only: clip drawing to (or, with Exclusive, outside) up to eight
  * rectangles of the render target; Count 0 turns it off. TimeSplitters 2

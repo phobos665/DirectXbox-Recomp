@@ -256,7 +256,7 @@ D3D8DisplayFit d3d8_display_fit(UINT shape_w, UINT shape_h, UINT bb_w, UINT bb_h
  * that makes the supersampling exact. */
 typedef struct {
     float origin_x, origin_y, ratio_x, ratio_y;
-    float texel_x, texel_y, inv_taps, pad;
+    float texel_x, texel_y, inv_taps, gamma;   /* gamma: 1 to look up the ramp */
 } ResolveConstants;
 
 static const char kSource[] =
@@ -269,6 +269,7 @@ static const char kSource[] =
     "    return o;\n"
     "}\n"
     "Texture2D<float4> scene : register(t9);\n"
+    "Texture2D<float4> ramp : register(t10);\n"
     "SamplerState smp : register(s9);\n"
     "float4 ps_main(VSOut i) : SV_Target {\n"
     /* The footprint's corner: SV_Position is the pixel's centre (x + 0.5),
@@ -284,7 +285,15 @@ static const char kSource[] =
     "        [unroll] for (int x = 0; x < TAPS; x++)\n"
     "            sum += scene.SampleLevel(smp,\n"
     "                       (base + (float2(x, y) + 0.5) * step) * q.xy, 0);\n"
-    "    return sum * q.z;\n"
+    "    float4 c = sum * q.z;\n"
+    /* The title's gamma ramp (d3d8_display_set_gamma), as the console's DAC
+     * applies it at scan-out: each channel looked up in its own column. */
+    "    if (q.w > 0.5) {\n"
+    "        int3 k = int3(saturate(c.rgb) * 255.0 + 0.5);\n"
+    "        c.rgb = float3(ramp.Load(int3(k.r, 0, 0)).r, ramp.Load(int3(k.g, 0, 0)).g,\n"
+    "                       ramp.Load(int3(k.b, 0, 0)).b);\n"
+    "    }\n"
+    "    return c;\n"
     "}\n";
 
 static struct {
@@ -295,9 +304,68 @@ static struct {
     RhiDepthState  *depth;
     RhiRasterState *raster;
     RhiSampler     *sampler;
+    RhiImage       *ramp_img;           /* 256x1: the gamma ramp, R G B in place */
+    RhiView        *ramp_view;
     UINT            taps;                /* what the shaders were built for */
     int             tried, failed;
 } g;
+
+/* The title's gamma ramp (D3DDevice_SetGammaRamp, hle_d3d8.c). The console
+ * applies it in the DAC as each frame is scanned out, so nothing drawn
+ * shows it and only the present can; an identity ramp costs nothing. */
+static struct {
+    uint8_t rgba[256 * 4];
+    int     on, dirty;
+} g_gamma;
+
+void d3d8_display_set_gamma(const uint8_t red[256], const uint8_t green[256],
+                            const uint8_t blue[256])
+{
+    int i, identity = 1;
+
+    for (i = 0; i < 256; i++) {
+        g_gamma.rgba[i * 4 + 0] = red[i];
+        g_gamma.rgba[i * 4 + 1] = green[i];
+        g_gamma.rgba[i * 4 + 2] = blue[i];
+        g_gamma.rgba[i * 4 + 3] = 0xFF;
+        if (red[i] != i || green[i] != i || blue[i] != i)
+            identity = 0;
+    }
+    g_gamma.on = !identity;
+    g_gamma.dirty = 1;
+}
+
+/* The ramp as a texture the resolve reads, made and refilled here, on the
+ * thread that presents. 1 when it should be applied. */
+static int gamma_ready(void)
+{
+    if (!g_gamma.on)
+        return 0;
+    if (!g.ramp_img) {
+        RhiImageDesc d;
+        memset(&d, 0, sizeof d);
+        d.type = RHI_IMAGE_2D;
+        d.width = 256;
+        d.height = 1;
+        d.depth = 1;
+        d.mip_levels = 1;
+        d.format = RHI_FORMAT_R8G8B8A8_UNORM;
+        d.samples = 1;
+        d.usage = RHI_USAGE_DEFAULT;
+        d.bind = RHI_BIND_SAMPLED;
+        if (!(g.ramp_img = rhi_image_create(&d, NULL)) ||
+            !(g.ramp_view = rhi_view_create(g.ramp_img, RHI_VIEW_SAMPLED, NULL))) {
+            g_gamma.on = 0;
+            return 0;
+        }
+        g_gamma.dirty = 1;
+    }
+    if (g_gamma.dirty) {
+        rhi_image_update(g.ramp_img, 0, NULL, g_gamma.rgba, 256 * 4, 256 * 4);
+        g_gamma.dirty = 0;
+    }
+    return 1;
+}
 
 static void fail(const char *what)
 {
@@ -431,7 +499,7 @@ HRESULT d3d8_display_resolve(RhiView *scene, UINT scene_w, UINT scene_h,
         c.texel_x = 1.0f / (float)scene_w;
         c.texel_y = 1.0f / (float)scene_h;
         c.inv_taps = 1.0f / (float)(taps * taps);
-        c.pad = 0.0f;
+        c.gamma = gamma_ready() ? 1.0f : 0.0f;
         memcpy(mapped, &c, sizeof c);
         rhi_buffer_unmap(g.cb);
     }
@@ -456,6 +524,7 @@ HRESULT d3d8_display_resolve(RhiView *scene, UINT scene_w, UINT scene_h,
     rhi_set_shader(RHI_STAGE_PIXEL, g.ps);
     rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 7, 1, &g.cb);
     rhi_set_textures(9, 1, &scene);
+    rhi_set_textures(10, 1, g_gamma.on ? &g.ramp_view : &scene);   /* bound either way */
     rhi_set_samplers(9, 1, &g.sampler);
     rhi_set_blend_state(g.blend, blend_factor, 0xFFFFFFFF);
     rhi_set_depth_state(g.depth, 0);
@@ -467,6 +536,7 @@ HRESULT d3d8_display_resolve(RhiView *scene, UINT scene_w, UINT scene_h,
     {
         RhiView *none = NULL;
         rhi_set_textures(9, 1, &none);
+        rhi_set_textures(10, 1, &none);
     }
     rhi_output_restore(&saved);
     return S_OK;
@@ -481,6 +551,8 @@ void d3d8_display_shutdown(void)
     rhi_depth_state_destroy(g.depth);    g.depth = NULL;
     rhi_raster_state_destroy(g.raster);  g.raster = NULL;
     rhi_sampler_destroy(g.sampler);      g.sampler = NULL;
+    rhi_view_destroy(g.ramp_view);       g.ramp_view = NULL;
+    rhi_image_destroy(g.ramp_img);       g.ramp_img = NULL;
     g.tried = 0;
     g.failed = 0;
 }
