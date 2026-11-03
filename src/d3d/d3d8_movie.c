@@ -36,11 +36,15 @@ static struct {
     uint32_t        frame_w, frame_h;
     int             dirty;       /* not uploaded yet */
     int             have;        /* a frame to draw */
+    uint32_t        bars;        /* black rows above and below the picture */
+    uint32_t        grow_to;     /* bars a run of frames has shown, not taken yet */
+    int             grow_frames;
 } g = { 0, 0, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, SRWLOCK_INIT };
 
 typedef struct {
     float x, y, w, h;          /* the picture's rectangle, clip space */
-    float tex_w, tex_h, pad0, pad1;
+    float tex_w, vis_h;        /* the texels shown: all columns, vis_h rows */
+    float first_row, tex_h;    /* from this row; the texture's own height */
 } MovieConstants;
 
 static const char kShaderSource[] =
@@ -53,12 +57,12 @@ static const char kShaderSource[] =
     "    float2 c = float2(id & 1, id >> 1);\n"
     "    VSOut o;\n"
     "    o.pos = float4(rect.x + c.x * rect.z, rect.y - c.y * rect.w, 0, 1);\n"
-    "    o.uv  = c * size.xy;\n"
+    "    o.uv  = float2(c.x * size.x, size.z + c.y * size.y);\n"
     "    return o;\n"
     "}\n"
     "Texture2D<float4> tex : register(t9);\n"
     "float4 texel(int2 p) {\n"
-    "    p = clamp(p, int2(0, 0), int2(size.xy) - 1);\n"
+    "    p = clamp(p, int2(0, 0), int2(size.xw) - 1);\n"
     "    return tex.Load(int3(p, 0));\n"
     "}\n"
     "float4 ps_main(VSOut i) : SV_Target {\n"
@@ -172,6 +176,69 @@ static int movie_texture(uint32_t w, uint32_t h)
     return 1;
 }
 
+/* Rows of near-black from the top (dir 1) or the bottom (dir -1) of a BGRA
+ * frame, looking at every eighth pixel of a row. */
+static uint32_t black_rows(const uint8_t *bgra, uint32_t w, uint32_t h, int dir)
+{
+    uint32_t n, x;
+
+    for (n = 0; n < h / 2u; n++) {
+        const uint8_t *row = bgra + (size_t)(dir > 0 ? n : h - 1u - n) * w * 4u;
+        for (x = 0; x < w; x += 8u) {
+            const uint8_t *q = row + (size_t)x * 4u;
+            if (q[0] > 28 || q[1] > 28 || q[2] > 28)
+                return n;
+        }
+    }
+    return n;
+}
+
+/* A widescreen movie inside a 4:3 frame -- Forza Motorsport's attract loop and
+ * its "press start" screen are 16:9 pictures between black bars -- would
+ * be drawn small in the middle of a wide window, with black all round. The
+ * bars are found and left off, so the picture itself fills the window's
+ * height at its own shape. Never cut into the picture: a frame whose picture
+ * reaches into the bars takes them back at once; wider bars are only taken
+ * once 20 frames in a row have shown them, so one dark frame does not zoom.
+ * A frame that is black almost throughout says nothing and changes nothing.
+ * RECOMP_MOVIE_LETTERBOX=0 shows the whole frame, as before. */
+static void note_bars(const uint8_t *bgra, uint32_t w, uint32_t h)
+{
+    static int on = -1;
+    uint32_t top, bottom, b;
+
+    if (on < 0) {
+        const char *v = getenv("RECOMP_MOVIE_LETTERBOX");
+        on = !(v && v[0] == '0');
+    }
+    if (!on || h < 64u) {
+        g.bars = 0;
+        return;
+    }
+    top = black_rows(bgra, w, h, 1);
+    bottom = black_rows(bgra, w, h, -1);
+    b = top < bottom ? top : bottom;
+    if (b >= h / 4u)
+        return;                               /* nearly all black: no news */
+    if (b < h / 24u)
+        b = 0;                                /* a thin edge is not a bar */
+    b &= ~1u;
+    if (b <= g.bars) {
+        g.bars = b;
+        g.grow_frames = 0;
+        return;
+    }
+    if (g.grow_frames && b == g.grow_to) {
+        if (++g.grow_frames >= 20) {
+            g.bars = b;
+            g.grow_frames = 0;
+        }
+    } else {
+        g.grow_to = b;
+        g.grow_frames = 1;
+    }
+}
+
 void d3d8_movie_set_frame(const uint8_t *bgra, uint32_t width, uint32_t height)
 {
     size_t bytes = (size_t)width * height * 4u;
@@ -180,6 +247,8 @@ void d3d8_movie_set_frame(const uint8_t *bgra, uint32_t width, uint32_t height)
         return;
     AcquireSRWLockExclusive(&g.lock);
     if (g.frame_w != width || g.frame_h != height) {
+        g.bars = 0;
+        g.grow_frames = 0;
         free(g.frame);
         g.frame = (uint8_t *)malloc(bytes);
         g.frame_w = g.frame ? width : 0;
@@ -188,6 +257,7 @@ void d3d8_movie_set_frame(const uint8_t *bgra, uint32_t width, uint32_t height)
     if (g.frame) {
         memcpy(g.frame, bgra, bytes);
         g.dirty = g.have = 1;
+        note_bars(bgra, width, height);
     }
     ReleaseSRWLockExclusive(&g.lock);
 }
@@ -208,7 +278,7 @@ void d3d8_movie_draw(void)
     MovieConstants c;
     float blend_factor[4] = { 1, 1, 1, 1 }, black[4] = { 0, 0, 0, 1 };
     float fa, ba;
-    uint32_t w, h;
+    uint32_t w, h, bars;
     void *mapped;
 
     if (!rtv || !bw || !bh || !g.have || !movie_create())
@@ -225,6 +295,7 @@ void d3d8_movie_draw(void)
         rhi_image_update(g.texture, 0, NULL, g.frame, w * 4u, 0);
         g.dirty = 0;
     }
+    bars = g.bars;
     ReleaseSRWLockExclusive(&g.lock);
 
     rhi_output_save(&saved);
@@ -239,7 +310,9 @@ void d3d8_movie_draw(void)
     rhi_clear_color(rtv, black);
     if (!(mapped = rhi_buffer_map(g.cb, RHI_MAP_WRITE_DISCARD)))
         goto restore;
-    fa = 4.0f / 3.0f;
+    /* 4:3 for the whole frame; the rows between the bars are that much
+     * wider for their height. */
+    fa = 4.0f / 3.0f * (float)h / (float)(h - 2u * bars);
     {
         UINT sw = bw, sh = bh;
 
@@ -251,8 +324,9 @@ void d3d8_movie_draw(void)
     c.x = -c.w / 2.0f;
     c.y = c.h / 2.0f;
     c.tex_w = (float)w;
+    c.vis_h = (float)(h - 2u * bars);
+    c.first_row = (float)bars;
     c.tex_h = (float)h;
-    c.pad0 = c.pad1 = 0.0f;
     memcpy(mapped, &c, sizeof c);
     rhi_buffer_unmap(g.cb);
 

@@ -75,6 +75,11 @@ if(MSVC)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+    if(WIN32)
+        # The clang driver on Windows: same reason as /Zi above. Without it a
+        # sampled profile credits nv2a_ack_thread to xbox_GetMappingHandle.
+        target_compile_options(xbox_kernel PRIVATE -g -gcodeview)
+    endif()
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)

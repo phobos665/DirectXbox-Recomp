@@ -75,6 +75,8 @@ static int cap_put(D3D8CapWriter *w, const void *p, size_t n)
     return 0;
 }
 
+static volatile char g_cap_lock;
+
 int d3d8cap_chunk(D3D8CapWriter *w, uint32_t type,
                   const void *p0, size_t n0,
                   const void *p1, size_t n1,
@@ -94,11 +96,20 @@ int d3d8cap_chunk(D3D8CapWriter *w, uint32_t type,
     }
     head[0] = type;
     head[1] = (uint32_t)total;
+    /* One chunk at a time: Forza's background loader uploads textures on a
+     * thread of its own while the frame is being written, and two chunks
+     * written into each other left a capture nothing could read past the
+     * first car. */
+    while (__atomic_test_and_set(&g_cap_lock, __ATOMIC_ACQUIRE))
+        ;
     if (cap_put(w, head, sizeof head) ||
         cap_put(w, p0, n0) || cap_put(w, p1, n1) || cap_put(w, p2, n2) ||
-        cap_put(w, zeros, cap_pad(total)))
+        cap_put(w, zeros, cap_pad(total))) {
+        __atomic_clear(&g_cap_lock, __ATOMIC_RELEASE);
         return -1;
+    }
     w->chunks++;
+    __atomic_clear(&g_cap_lock, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -277,7 +288,7 @@ const char *d3d8cap_chunk_name(uint32_t type)
         "vs_screenspace", "ps_token", "depth_surface", "set_render_target",
         "vs_vertex_data", "cube_texture", "scissors", "material", "light",
         "light_enable", "two_d_placement", "cube_level", "palette", "screen_copy", "scene",
-        "depth_copy"
+        "depth_copy", "volume_texture", "depth_alias"
     };
 
     return type < D3D8CAP_CHUNK_KINDS ? names[type] : "unknown";

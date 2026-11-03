@@ -1,5 +1,6 @@
 """Completed host reduction must clear the x87 C2 polling bit."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +18,8 @@ def build_run(source):
         c.write_text(source, encoding='utf-8')
         args = ([cc, '/nologo', '/W0', '/O2', str(c), '/Fe:'+str(exe)]
                 if Path(cc).stem.lower() == 'cl' else
-                [cc, '-O2', str(c), '-o', str(exe), '-lm'])
+                [cc, '-O2', str(c), '-o', str(exe)]
+                + ([] if os.name == 'nt' else ['-lm']))
         built = subprocess.run(args, cwd=tmp, capture_output=True, text=True)
         assert built.returncode == 0, built.stdout+built.stderr
         return subprocess.run([str(exe)], cwd=tmp, capture_output=True, text=True, timeout=5)

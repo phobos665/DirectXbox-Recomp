@@ -45,7 +45,7 @@ static struct {
     int             tried, failed;
     RhiShader      *vs, *ps;
     RhiBuffer      *cb;
-    RhiBlendState  *blend[2];       /* [writes colour] */
+    RhiBlendState  *blend[16];      /* [RHI_WRITE_* mask], made when first asked */
     RhiDepthState  *depth[4];       /* [writes depth | writes stencil << 1] */
     RhiRasterState *raster;
 } g;
@@ -99,9 +99,9 @@ static int create(void)
     bd.cpu_access = RHI_CPU_WRITE;
     if (!(g.cb = rhi_buffer_create(&bd, NULL))) { fail("CreateBuffer"); return 0; }
 
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < 16; i += 15) {
         memset(&bl, 0, sizeof bl);
-        bl.write_mask = i ? RHI_WRITE_ALL : 0;
+        bl.write_mask = (uint32_t)i;
         if (!(g.blend[i] = rhi_blend_state_create(&bl))) { fail("CreateBlendState"); return 0; }
     }
     for (i = 0; i < 4; i++) {
@@ -131,13 +131,14 @@ static int create(void)
 }
 
 int d3d8_clear_rects(RhiView *rtv, RhiView *dsv, UINT width, UINT height,
-                     const RhiRect *rects, UINT count, int color, int depth, int stencil,
+                     const RhiRect *rects, UINT count, int color_mask, int depth, int stencil,
                      const float rgba[4], float z, uint8_t stencil_value)
 {
     RhiOutputState saved;
     RhiViewport vp;
     float blend_factor[4] = { 1, 1, 1, 1 };
     UINT i;
+    int color = color_mask & RHI_WRITE_ALL;
 
     if (!width || !height || (!color && !depth && !stencil))
         return 0;
@@ -167,7 +168,15 @@ int d3d8_clear_rects(RhiView *rtv, RhiView *dsv, UINT width, UINT height,
     rhi_set_shader(RHI_STAGE_PIXEL, g.ps);
     rhi_set_uniform_buffers(RHI_STAGE_VERTEX, 7, 1, &g.cb);
     rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 7, 1, &g.cb);
-    rhi_set_blend_state(g.blend[color ? 1 : 0], blend_factor, 0xFFFFFFFF);
+    if (!g.blend[color]) {
+        RhiBlendDesc bl;
+        memset(&bl, 0, sizeof bl);
+        bl.write_mask = (uint32_t)color;
+        g.blend[color] = rhi_blend_state_create(&bl);
+        if (!g.blend[color])
+            color = RHI_WRITE_ALL;           /* the whole colour, as before */
+    }
+    rhi_set_blend_state(g.blend[color], blend_factor, 0xFFFFFFFF);
     rhi_set_depth_state(g.depth[(depth ? 1 : 0) | (stencil ? 2 : 0)], stencil_value);
     rhi_set_raster_state(g.raster);
 

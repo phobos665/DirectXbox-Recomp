@@ -55,6 +55,18 @@ static const char kSource[] =
     "}\n"
     "Texture2D<float4> screen : register(t9);\n"
     "float4 ps_main(VSOut i) : SV_Target {\n"
+    /* Preserve supersampling during integer downscales into a title's
+     * postprocess texture. Point loading discarded the extra samples. */
+    "    float2 taps = round(scale.xy);\n"
+    "    if (all(taps >= 1) && all(taps <= 4) &&\n"
+    "        all(abs(taps - scale.xy) < 0.00001) && any(taps > 1)) {\n"
+    "        int2 first = int2(floor((i.pos.xy - 0.5) * scale.xy + scale.zw));\n"
+    "        float4 sum = 0;\n"
+    "        [loop] for (int y = 0; y < (int)taps.y; ++y)\n"
+    "            [loop] for (int x = 0; x < (int)taps.x; ++x)\n"
+    "                sum += screen.Load(int3(first + int2(x, y), 0));\n"
+    "        return sum / (taps.x * taps.y);\n"
+    "    }\n"
     "    int2 p = int2(i.pos.xy * scale.xy + scale.zw);\n"
     "    return screen.Load(int3(p, 0));\n"
     "}\n";

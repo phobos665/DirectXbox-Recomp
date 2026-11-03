@@ -162,6 +162,8 @@ def build_commands(args, xbe: Path, analysis_json: Path):
         lift += ["--game-name", args.game_name]
     if args.trace_all_entries:
         lift.append("--trace-all-entries")
+    if getattr(args, "regpromote_file", None):
+        lift += ["--regpromote", str(args.regpromote_file)]
     # XDK functions with a name-keyed replacement (tools/recomp/hle.py), used
     # whenever tools.xdk_symbols has been run for this XBE.
     hle_symbols = xbe.with_name(xbe.stem + "_xdk_symbols.json")
@@ -329,6 +331,14 @@ def main() -> int:
         entries = json.loads(sec_file.read_text(encoding="utf-8")).get("data", [])
         args.data_sections = [e["pattern"] for e in entries]
         print(f"data sections: {', '.join(args.data_sections)} ({sec_file.name})")
+
+    # Functions whose guest registers are kept in C locals
+    # (tools/recomp/regpromote.py): the title's profile's hottest, per title.
+    args.regpromote_file = None
+    rp_file = config_file(args, "regpromote", title or "")
+    if title and rp_file.is_file():
+        args.regpromote_file = rp_file
+        print(f"register promotion: {rp_file.name}")
 
     if not args.dry_run and not xbe.is_file():
         print(f"error: XBE not found: {xbe}", file=sys.stderr)

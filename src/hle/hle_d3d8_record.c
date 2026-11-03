@@ -26,8 +26,8 @@
  * is what the device actually had.
  *
  * Not handled:
- *   - a stage bound to a volume texture is recorded as nothing bound, and
- *     counted. src/hle does not create them, so this does not happen today.
+ *   - a volume outside the expanded linear RGBA diagnostic path is
+ *     recorded as nothing bound, and counted.
  *   - more than CAPTURE_MAX_TEXTURES distinct textures in one frame: the rest
  *     are recorded as nothing bound, and counted.
  *   - calls made while the capture file is being closed on another thread;
@@ -49,13 +49,14 @@
 
 /* hle_d3d8.c: the shadow device, or NULL. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void);
+void hle_d3d8_note_deferred_draw(void);   /* hle_d3d8.c */
 
 #define CAPTURE_DEFAULT_SWAP    120
 #define CAPTURE_MAX_TEXTURES    1024
 static int g_max_files = 24;   /* RECOMP_D3D8_CAPTURE_MAX, as RECOMP_HLE_D3D8_DUMP */
 #define CAPTURE_MAX_LEVELS      16
 #define CAPTURE_STAGES          4    /* d3d8_device.c MAX_TEXTURE_STAGES */
-#define CAPTURE_RENDER_STATES   256  /* d3d8_device.c MAX_RENDER_STATES */
+#define CAPTURE_RENDER_STATES   260  /* d3d8_device.c MAX_RENDER_STATES */
 #define CAPTURE_STAGE_STATES    32   /* d3d8_device.c MAX_TSS_STATES */
 
 static D3D8CapWriter *g_cap;
@@ -131,8 +132,11 @@ static void cube_level_write(IDirect3DBaseTexture8 *object, uint32_t id,
     const BYTE *bits;
     UINT pitch, rows;
 
-    if (!d3d8_cube_level(object, face, level, &bits, &pitch, &rows))
+    if (!d3d8_cube_level(object, face, level, &bits, &pitch, &rows)) {
+        fprintf(stderr, "[HLE-D3D8] capture: cube %u face %u level %u "
+                "could not be read; reflection snapshot incomplete\n", id, face, level);
         return;
+    }
     c.id    = id;
     c.face  = face;
     c.level = level;
@@ -143,10 +147,10 @@ static void cube_level_write(IDirect3DBaseTexture8 *object, uint32_t id,
     g_texture_bytes += c.bytes;
 }
 
-/* A cube texture's creation, then its texels unless the title renders into
- * it: a cube filled from memory (hle_d3d8_texture.c, static_cube) would
- * otherwise replay empty, and every surface lit through it -- a
- * normalisation cube's dot product, an environment map -- with it.
+/* A cube texture's creation, then its starting texels. Render targets need
+ * a GPU snapshot too: a title may update only three faces this frame, using
+ * the other three from previous frames. d3d8_cube_level reads supported
+ * render-target formats back into Xbox packing for the existing replay.
  * d3d8_cube_info is also the type test: it answers only for a cube. */
 static int cube_write(IDirect3DBaseTexture8 *object, uint32_t id)
 {
@@ -162,7 +166,7 @@ static int cube_write(IDirect3DBaseTexture8 *object, uint32_t id)
     head.usage  = info.usage;
     chunk(D3D8CAP_CUBE_TEXTURE, &head, sizeof head, NULL, 0, NULL, 0);
     g_texture_writes++;
-    if (!(info.usage & D3DUSAGE_RENDERTARGET)) {
+    {
         UINT f, l;
 
         for (f = 0; f < 6; f++)
@@ -215,6 +219,25 @@ static int texture_write(IDirect3DBaseTexture8 *object, uint32_t id)
     return 1;
 }
 
+/* Record the host's expanded RGBA volume, including every mip slice. */
+static int volume_write(IDirect3DBaseTexture8 *object, uint32_t id)
+{
+    if (object->lpVtbl->GetType(object) != D3DRTYPE_VOLUMETEXTURE) return 0;
+    D3D8VolumeTexture *v=(D3D8VolumeTexture *)object;
+    if (v->d3d8_format != D3DFMT_LIN_A8B8G8R8 || !v->sys_mem || !v->levels ||
+        v->levels>CAPTURE_MAX_LEVELS) return 0;
+    D3D8CapVolumeTexture head={id,v->d3d8_format,v->width,v->height,v->depth,v->levels,v->usage};
+    size_t bytes=0;
+    for (unsigned l=0;l<v->levels;++l) {
+        unsigned w=v->width>>l,h=v->height>>l,d=v->depth>>l;
+        if(!w)w=1;if(!h)h=1;if(!d)d=1;
+        bytes+=(size_t)w*h*d*4;
+    }
+    chunk(D3D8CAP_VOLUME_TEXTURE,&head,sizeof head,v->sys_mem,bytes,NULL,0);
+    g_texture_writes++;g_texture_bytes+=bytes;
+    return 1;
+}
+
 /* The capture id for a texture about to be bound, writing it first if the
  * capture does not hold it yet. 0 for NULL, and for a texture that cannot be
  * recorded (counted). */
@@ -229,7 +252,8 @@ static uint32_t texture_id(IDirect3DBaseTexture8 *object)
         return g_textures[i].id;
     if (g_texture_count >= CAPTURE_MAX_TEXTURES ||
         (!texture_write(object, g_next_texture_id) &&
-         !cube_write(object, g_next_texture_id))) {
+         !cube_write(object, g_next_texture_id) &&
+         !volume_write(object, g_next_texture_id))) {
         g_unrecorded_binds++;
         return 0;
     }
@@ -434,6 +458,16 @@ static void rec_ps_token(DWORD token)
 
 /* The capture id for a depth surface, writing it first if needed. 0 for
  * NULL, and for one that cannot be recorded (the caller counts it). */
+static struct {IDirect3DSurface8 *surface;IDirect3DTexture8 *texture;} g_depth_alias[16];
+void host_NoteDepthAlias(IDirect3DSurface8 *surface,IDirect3DTexture8 *texture)
+{
+    if(!surface||!texture)return;
+    unsigned i;
+    for(i=0;i<16;++i)if(!g_depth_alias[i].surface || g_depth_alias[i].surface==surface)break;
+    if(i==16)i=0;
+    g_depth_alias[i].surface=surface;g_depth_alias[i].texture=texture;
+}
+
 static uint32_t depth_id(IDirect3DSurface8 *object)
 {
     D3DSURFACE_DESC desc;
@@ -452,6 +486,10 @@ static uint32_t depth_id(IDirect3DSurface8 *object)
         return 0;
     g_depth_objects[g_depth_count++] = object;
     c.id     = (uint32_t)g_depth_count;
+    for(unsigned alias=0;alias<16;++alias)if(g_depth_alias[alias].surface==object){
+        uint32_t id=texture_id((IDirect3DBaseTexture8 *)g_depth_alias[alias].texture);
+        if(id){uint32_t pair[2]={c.id,id};chunk(D3D8CAP_DEPTH_ALIAS,pair,sizeof pair,NULL,0,NULL,0);return c.id;}
+    }
     c.width  = desc.Width;
     c.height = desc.Height;
     c.format = (uint32_t)desc.Format;
@@ -909,6 +947,19 @@ static void retain_call(void (*fn)(const void *), const void *fixed, size_t fixe
     uint8_t stack[256], *p = stack;
     size_t total = DEFER_ALIGN(fixed_size) + DEFER_ALIGN(a_size) + b_size;
 
+    /* A draw is laid out straight into the list: copying it here first and
+     * there again, through a malloc, was most of what keeping a frame cost. */
+    if (key) {
+        p = (uint8_t *)hle_d3d8_interp_draw_reserve(fn, total, key);
+        if (!p)
+            return;
+        memcpy(p, fixed, fixed_size);
+        if (a_size)
+            memcpy(p + DEFER_ALIGN(fixed_size), a, a_size);
+        if (b_size)
+            memcpy(p + DEFER_ALIGN(fixed_size) + DEFER_ALIGN(a_size), b, b_size);
+        return;
+    }
     if (total > sizeof stack) {
         p = (uint8_t *)malloc(total);
         if (!p)
@@ -944,6 +995,26 @@ static uint64_t hash_bytes(uint64_t h, const void *data, size_t n)
     }
     while (n--)
         h = (h ^ *b++) * 0x100000001B3ull;
+    return h;
+}
+
+/* The same, for a draw's identity, reading at most about a kilobyte: the
+ * whole buffer hashed cost Forza's race several milliseconds a frame. A
+ * small buffer (2D text, sprites) is still read whole, so two strings of
+ * the same length are told apart; a large one is told by its length and
+ * sixteen spans across it, and the key carries the program, the textures
+ * and the counts besides. */
+static uint64_t hash_sampled(uint64_t h, const void *data, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)data;
+    uint64_t len = (uint64_t)n;
+    size_t i;
+
+    if (n <= 2048)
+        return hash_bytes(h, data, n);
+    h = hash_bytes(h, &len, sizeof len);
+    for (i = 0; i < 16; i++)
+        h = hash_bytes(h, b + (n - 64) * i / 15, 64);
     return h;
 }
 
@@ -1316,8 +1387,9 @@ typedef struct { DWORD type; UINT prims, stride; } dq_draw_up;
 static void op_draw_up(const void *arg)
 {
     const dq_draw_up *p = (const dq_draw_up *)arg;
-    host_DrawPrimitiveUP(hle_d3d8_shadow_device(), (D3DPRIMITIVETYPE)p->type, p->prims,
-                         DEFER_PART_A(arg, dq_draw_up), p->stride);
+    if (SUCCEEDED(host_DrawPrimitiveUP(hle_d3d8_shadow_device(), (D3DPRIMITIVETYPE)p->type,
+                                       p->prims, DEFER_PART_A(arg, dq_draw_up), p->stride)))
+        hle_d3d8_note_deferred_draw();
 }
 
 typedef struct {
@@ -1330,12 +1402,62 @@ typedef struct {
 static void op_draw_indexed_up(const void *arg)
 {
     const dq_draw_indexed_up *p = (const dq_draw_indexed_up *)arg;
-    host_DrawIndexedPrimitiveUP(hle_d3d8_shadow_device(), (D3DPRIMITIVETYPE)p->type,
+    if (SUCCEEDED(host_DrawIndexedPrimitiveUP(hle_d3d8_shadow_device(), (D3DPRIMITIVETYPE)p->type,
                                 p->min_index, p->num_vertices, p->prims,
                                 DEFER_PART_A(arg, dq_draw_indexed_up),
                                 (D3DFORMAT)p->index_format,
                                 DEFER_PART_B(arg, dq_draw_indexed_up, p->index_bytes),
-                                p->stride);
+                                p->stride)))
+        hle_d3d8_note_deferred_draw();
+}
+
+/* A kept draw whose vertices stay where they are until the in-between is
+ * drawn (hle_d3d8_vertices_stable): only where they are is kept. A race
+ * start kept 30 MB of them a frame, 3 ms of copying. */
+typedef struct {
+    DWORD type, prims, stride;
+    const void *vertices;
+} dq_draw_up_ref;
+
+static void op_draw_up_ref(const void *arg)
+{
+    const dq_draw_up_ref *p = (const dq_draw_up_ref *)arg;
+    if (SUCCEEDED(host_DrawPrimitiveUP(hle_d3d8_shadow_device(), (D3DPRIMITIVETYPE)p->type,
+                                       p->prims, p->vertices, p->stride)))
+        hle_d3d8_note_deferred_draw();
+}
+
+int d3d8_stable_index_rebind(const void *guest, unsigned index_count, unsigned topology,
+                             unsigned size);
+const void *d3d8_stable_index_bound_key(unsigned *index_count, unsigned *topology,
+                                        unsigned *size);
+void d3d8_stable_index_disarm(void);
+
+typedef struct {
+    DWORD type, min_index, num_vertices, prims, stride, index_format;
+    uint32_t index_bytes;
+    const void *vertices;
+    const void *index_key;          /* kept list: no index bytes follow */
+    UINT index_count, index_topology;
+} dq_draw_indexed_up_ref;
+
+static void op_draw_indexed_up_ref(const void *arg)
+{
+    const dq_draw_indexed_up_ref *p = (const dq_draw_indexed_up_ref *)arg;
+    const void *indices;
+
+    if (p->index_key) {
+        if (!d3d8_stable_index_rebind(p->index_key, p->index_count, p->index_topology,
+                                      p->index_bytes))
+            return;
+        indices = p->index_key;
+    } else {
+        indices = DEFER_PART_A(arg, dq_draw_indexed_up_ref);
+    }
+    if (SUCCEEDED(host_DrawIndexedPrimitiveUP(hle_d3d8_shadow_device(), (D3DPRIMITIVETYPE)p->type,
+                                p->min_index, p->num_vertices, p->prims,
+                                indices, (D3DFORMAT)p->index_format, p->vertices, p->stride)))
+        hle_d3d8_note_deferred_draw();
 }
 
 HRESULT host_DrawPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type,
@@ -1373,12 +1495,25 @@ HRESULT host_DrawPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type,
             dq_draw_up p;
             HleInterpDrawKey k;
 
+            LARGE_INTEGER keep_t0, keep_t1;
+            QueryPerformanceCounter(&keep_t0);
             draw_key(&k, (DWORD)type, prims, stride, 0);
-            k.content = hash_bytes(0xCBF29CE484222325ull, vertices, (size_t)bytes);
-            p.type = (DWORD)type;
-            p.prims = prims;
-            p.stride = stride;
-            retain_call(op_draw_up, &p, sizeof p, vertices, (size_t)bytes, NULL, 0, &k);
+            k.content = hash_sampled(0xCBF29CE484222325ull, vertices, (size_t)bytes);
+            if (hle_d3d8_vertices_stable(vertices)) {
+                dq_draw_up_ref r;
+                r.type = (DWORD)type;
+                r.prims = prims;
+                r.stride = stride;
+                r.vertices = vertices;
+                retain_call(op_draw_up_ref, &r, sizeof r, NULL, 0, NULL, 0, &k);
+            } else {
+                p.type = (DWORD)type;
+                p.prims = prims;
+                p.stride = stride;
+                retain_call(op_draw_up, &p, sizeof p, vertices, (size_t)bytes, NULL, 0, &k);
+            }
+            QueryPerformanceCounter(&keep_t1);
+            hle_d3d8_interp_keep_ticks(keep_t1.QuadPart - keep_t0.QuadPart);
         }
         return hr;
     }
@@ -1393,6 +1528,7 @@ HRESULT host_DrawIndexedPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type
         dq_draw_indexed_up p;
         UINT index_size = index_format == D3DFMT_INDEX32 ? 4u : 2u;
         uint64_t ibytes = (uint64_t)d3d8_up_indices_read(type, prims) * index_size;
+        d3d8_stable_index_disarm();
         /* From the base the indices are relative to, through the last vertex. */
         uint64_t vbytes = (uint64_t)(min_index + num_vertices) * stride;
         if (ibytes > DEFER_LIMIT || vbytes > DEFER_LIMIT)
@@ -1441,18 +1577,42 @@ HRESULT host_DrawIndexedPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type
             dq_draw_indexed_up p;
             HleInterpDrawKey k;
 
+            LARGE_INTEGER keep_t0, keep_t1;
+            QueryPerformanceCounter(&keep_t0);
             draw_key(&k, (DWORD)type, prims, stride, (DWORD)index_format);
-            k.content = hash_bytes(hash_bytes(0xCBF29CE484222325ull, indices, (size_t)ibytes),
-                                   vertices, (size_t)vbytes);
-            p.type = (DWORD)type;
-            p.min_index = min_index;
-            p.num_vertices = num_vertices;
-            p.prims = prims;
-            p.stride = stride;
-            p.index_format = (DWORD)index_format;
-            p.index_bytes = (uint32_t)ibytes;
-            retain_call(op_draw_indexed_up, &p, sizeof p, indices, (size_t)ibytes,
-                        vertices, (size_t)vbytes, &k);
+            k.content = hash_sampled(hash_sampled(0xCBF29CE484222325ull, indices, (size_t)ibytes),
+                                     vertices, (size_t)vbytes);
+            if (hle_d3d8_vertices_stable(vertices)) {
+                dq_draw_indexed_up_ref r;
+                UINT ik_count = 0, ik_topo = 0, ik_size = 0;
+                const void *ikey = d3d8_stable_index_bound_key(&ik_count, &ik_topo, &ik_size);
+                r.type = (DWORD)type;
+                r.min_index = min_index;
+                r.num_vertices = num_vertices;
+                r.prims = prims;
+                r.stride = stride;
+                r.index_format = (DWORD)index_format;
+                r.vertices = vertices;
+                r.index_key = ikey;
+                r.index_count = ik_count;
+                r.index_topology = ik_topo;
+                r.index_bytes = ikey ? ik_size : (uint32_t)ibytes;
+                retain_call(op_draw_indexed_up_ref, &r, sizeof r,
+                            ikey ? NULL : indices, ikey ? 0 : (size_t)ibytes,
+                            NULL, 0, &k);
+            } else {
+                p.type = (DWORD)type;
+                p.min_index = min_index;
+                p.num_vertices = num_vertices;
+                p.prims = prims;
+                p.stride = stride;
+                p.index_format = (DWORD)index_format;
+                p.index_bytes = (uint32_t)ibytes;
+                retain_call(op_draw_indexed_up, &p, sizeof p, indices, (size_t)ibytes,
+                            vertices, (size_t)vbytes, &k);
+            }
+            QueryPerformanceCounter(&keep_t1);
+            hle_d3d8_interp_keep_ticks(keep_t1.QuadPart - keep_t0.QuadPart);
         }
         return hr;
     }
@@ -1808,8 +1968,31 @@ void host_vsh_set_constant(int first_reg, const float *data, int count)
     d3d8_vsh_set_constant(first_reg, data, count);
 }
 
+/* A program's layout changes inside a frame: the inline and register draws
+ * (hle_d3d8.c draw_registers) set sixteen float4 registers for theirs and
+ * put the program's own back after. Not kept, an in-between drew every
+ * draw with the layout the frame ended on -- Forza's menus came out as flat
+ * colours every other frame. */
+typedef struct { DWORD handle; int count; } dq_declaration;
+
+static void op_vsh_declaration(const void *arg)
+{
+    const dq_declaration *p = (const dq_declaration *)arg;
+    d3d8_vsh_set_declaration(p->handle,
+                             p->count ? (const D3D8VshInput *)DEFER_PART_A(arg, dq_declaration)
+                                      : NULL,
+                             p->count);
+}
+
 HRESULT host_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int count)
 {
+    if (hle_d3d8_interp_rec && count >= 0 && (count == 0 || inputs)) {
+        dq_declaration p;
+        p.handle = handle;
+        p.count = count;
+        retain_call(op_vsh_declaration, &p, sizeof p, inputs,
+                    (size_t)count * sizeof *inputs, NULL, 0, NULL);
+    }
     if (g_cap)
         rec_vs_declaration(handle, inputs, count);
     return d3d8_vsh_set_declaration(handle, inputs, count);
@@ -1916,6 +2099,16 @@ static void rec_screen_copy(IDirect3DTexture8 *dst, const RECT *src, const POINT
 
 HRESULT host_CopyBackBufferToTexture(IDirect3DTexture8 *dst)
 {
+    /* Deferred frames: the copy reads what the frame drew before it, so it
+     * runs in the queue, in its place, not now -- now the queue's draws
+     * have not happened and it copied the frame before. */
+    if (hle_d3d8_defer_recording()) {
+        dq_screen_copy p;
+        memset(&p, 0, sizeof p);
+        p.dst = dst;
+        hle_d3d8_defer_op(op_screen_copy, &p, sizeof p);
+        return S_OK;
+    }
     if (g_cap && dst)
         rec_screen_copy(dst, NULL, NULL);
     if (hle_d3d8_interp_rec) {
@@ -1930,6 +2123,17 @@ HRESULT host_CopyBackBufferToTexture(IDirect3DTexture8 *dst)
 HRESULT host_CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src,
                                          const POINT *at)
 {
+    if (hle_d3d8_defer_recording() && src) {
+        dq_screen_copy p;
+        memset(&p, 0, sizeof p);
+        p.dst = dst;
+        p.has_rect = 1;
+        p.src = *src;
+        if (at)
+            p.at = *at;
+        hle_d3d8_defer_op(op_screen_copy, &p, sizeof p);
+        return S_OK;
+    }
     if (g_cap && dst && src)
         rec_screen_copy(dst, src, at);
     if (hle_d3d8_interp_rec && src) {
@@ -1958,6 +2162,10 @@ static void op_depth_copy(const void *arg)
 
 HRESULT host_CopyDepthToTexture(IDirect3DTexture8 *dst)
 {
+    if (hle_d3d8_defer_recording()) {
+        hle_d3d8_defer_op(op_depth_copy, &dst, sizeof dst);
+        return S_OK;
+    }
     if (g_cap && dst) {
         D3D8CapScreenCopy c;
 

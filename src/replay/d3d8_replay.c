@@ -888,6 +888,55 @@ static void do_cube_texture(Replay *r, const D3D8CapChunk *c)
     slot->is_cube = 1;
 }
 
+/* The diagnostic volume format stores tightly packed RGBA mip slabs. */
+static void do_volume_texture(Replay *r,const D3D8CapChunk *c)
+{
+    const D3D8CapVolumeTexture *t=c->data;
+    if(c->bytes<sizeof *t || t->format!=D3DFMT_LIN_A8B8G8R8 || !t->width ||
+       !t->height || !t->depth || t->width>2048 || t->height>2048 || t->depth>2048 ||
+       !t->levels || t->levels>16) {r->malformed++;return;}
+    size_t total=0;
+    for(unsigned l=0;l<t->levels;++l){
+        unsigned w=t->width>>l,h=t->height>>l,d=t->depth>>l;
+        if(!w)w=1;if(!h)h=1;if(!d)d=1;
+        total+=(size_t)w*h*d*4;
+    }
+    const uint8_t *src=d3d8cap_tail(c,sizeof *t,total);
+    if(!src){r->malformed++;return;}
+    ReplayTexture *slot=texture_slot(r,t->id,1);
+    if(!slot){r->malformed++;return;}
+    IDirect3DVolumeTexture8 *v=NULL;
+    if(FAILED(r->dev->lpVtbl->CreateVolumeTexture(r->dev,t->width,t->height,t->depth,
+        t->levels,t->usage,(D3DFORMAT)t->format,D3DPOOL_MANAGED,&v)) || !v){r->failed++;return;}
+    for(unsigned l=0;l<t->levels;++l){
+        unsigned w=t->width>>l,h=t->height>>l,d=t->depth>>l;
+        if(!w)w=1;if(!h)h=1;if(!d)d=1;
+        D3DLOCKED_BOX box;
+        if(FAILED(v->lpVtbl->LockBox(v,l,&box,NULL,0))){v->lpVtbl->Release(v);r->failed++;return;}
+        for(unsigned z=0;z<d;++z)for(unsigned y=0;y<h;++y)
+            memcpy((uint8_t *)box.pBits+(size_t)z*box.SlicePitch+(size_t)y*box.RowPitch,
+                   src+((size_t)z*h+y)*w*4,(size_t)w*4);
+        if(FAILED(v->lpVtbl->UnlockBox(v,l))){v->lpVtbl->Release(v);r->failed++;return;}
+        src+=(size_t)w*h*d*4;
+    }
+    release_slot(slot);slot->tex=(IDirect3DBaseTexture8 *)v;slot->is_cube=0;slot->p8=0;
+}
+
+static void do_depth_alias(Replay *r,const D3D8CapChunk *c)
+{
+    if(c->bytes!=8){r->malformed++;return;}
+    const uint32_t *pair=c->data;
+    ReplayTexture *tex=texture_slot(r,pair[1],0);
+    if(!pair[0] || pair[0]>REPLAY_MAX_DEPTHS || !tex || !tex->tex ||
+       tex->tex->lpVtbl->GetType(tex->tex)!=D3DRTYPE_TEXTURE){r->malformed++;return;}
+    IDirect3DSurface8 *surface=NULL;
+    IDirect3DTexture8 *object=(IDirect3DTexture8 *)tex->tex;
+    if(FAILED(object->lpVtbl->GetSurfaceLevel(object,0,&surface)) || !surface){r->failed++;return;}
+    IDirect3DSurface8 **slot=&r->depths[pair[0]-1];
+    if(*slot)(*slot)->lpVtbl->Release(*slot);
+    *slot=surface;
+}
+
 static void do_depth_surface(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapDepthSurface *d = c->data;
@@ -1561,6 +1610,12 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         break;
     case D3D8CAP_DRAW_INDEXED_UP:
         do_draw_indexed_up(r, c);
+        break;
+    case D3D8CAP_DEPTH_ALIAS:
+        do_depth_alias(r,c);
+        break;
+    case D3D8CAP_VOLUME_TEXTURE:
+        do_volume_texture(r,c);
         break;
     case D3D8CAP_TEXTURE:
         do_texture(r, c);

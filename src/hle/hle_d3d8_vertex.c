@@ -332,7 +332,7 @@ static uint32_t g_pb_load;              /* the NV2A's constant load pointer */
 static float    g_pb_cur[4];
 static float    g_pb_run[MAX_CONSTANT_REGISTERS][4];
 static int      g_pb_run_first = -1, g_pb_run_count;
-static unsigned long g_pb_constants, g_pb_resyncs, g_pb_walks;
+static unsigned long g_pb_constants, g_pb_resyncs, g_pb_walks, g_pb_fast;
 
 static void pb_flush(void)
 {
@@ -469,6 +469,7 @@ static int pb_array_method(uint32_t method)
  * which are hardware state, not the title's: stored in the array the XDK
  * itself reads, they broke TimeSplitters 2's front end. */
 int hle_d3d8_state_store_simple(uint32_t method, uint32_t value);
+void hle_d3d8_state_store_cull(uint32_t enable, uint32_t face, uint32_t front);
 int  hle_d3d8_title_ltcg(void);
 int  hle_d3d8_simple_states_by_walk(void);   /* below */
 /* ...and the title's own clears: SET_ZSTENCIL_CLEAR_VALUE (0x1D8C),
@@ -848,26 +849,59 @@ int hle_d3d8_pb_walking(void)
 static struct { uint32_t lo, hi, method, value; } g_simple_q[SIMPLE_QUEUE];
 static uint32_t g_simple_n;
 static unsigned long g_simple_by_walk;
+/* The preview loader and render thread both reach this queue. A concurrent
+ * flush used to reset the count between a match and its removal, underflowing
+ * the memmove length to almost 64 GiB. Keep the count and entries together. */
+static SRWLOCK g_simple_lock = SRWLOCK_INIT;
 
 int hle_d3d8_queue_simple_state(uint32_t lo, uint32_t hi, uint32_t method, uint32_t value)
 {
-    if (!hle_d3d8_simple_states_by_walk() || g_simple_n >= SIMPLE_QUEUE)
+    if (!hle_d3d8_simple_states_by_walk())
         return 0;
+    AcquireSRWLockExclusive(&g_simple_lock);
+    if (g_simple_n >= SIMPLE_QUEUE) {
+        ReleaseSRWLockExclusive(&g_simple_lock);
+        return 0;
+    }
     g_simple_q[g_simple_n].lo = lo;
     g_simple_q[g_simple_n].hi = hi;
     g_simple_q[g_simple_n].method = method;
     g_simple_q[g_simple_n].value = value;
     g_simple_n++;
     g_simple_by_walk++;
+    ReleaseSRWLockExclusive(&g_simple_lock);
     return 1;
 }
 
 /* A simple-state method the walk met at addr: stored if an API call put it
  * there. A range that wrapped round the buffer has hi below lo. */
-static void walk_simple_state(uint32_t addr, uint32_t method)
+/* Face culling the push buffer sets (hle_d3d8_state_store_cull). The
+ * hardware's defaults until a buffer says otherwise. */
+static uint32_t g_cull_enable, g_cull_face = 0x405u, g_cull_front = 0x901u;
+
+#define PB_CULL_ENABLE  0x0308u
+#define PB_CULL_FACE    0x039Cu
+#define PB_FRONT_FACE   0x03A0u
+
+static void walk_cull_method(uint32_t method, uint32_t value)
+{
+    if (method == PB_CULL_ENABLE)
+        g_cull_enable = value != 0u;
+    else if (method == PB_CULL_FACE)
+        g_cull_face = value;
+    else if (method == PB_FRONT_FACE)
+        g_cull_front = value;
+    else
+        return;
+    pb_flush();                         /* the draws before it keep theirs */
+    hle_d3d8_state_store_cull(g_cull_enable, g_cull_face, g_cull_front);
+}
+
+static int walk_simple_state(uint32_t addr, uint32_t method)
 {
     uint32_t i;
 
+    AcquireSRWLockExclusive(&g_simple_lock);
     for (i = 0; i < g_simple_n; i++) {
         uint32_t lo = g_simple_q[i].lo, hi = g_simple_q[i].hi;
         int in = lo <= hi ? (addr >= lo && addr < hi) : (addr >= lo || addr < hi);
@@ -877,17 +911,40 @@ static void walk_simple_state(uint32_t addr, uint32_t method)
         (void)hle_d3d8_state_store_simple(method, g_simple_q[i].value);
         g_simple_n--;
         memmove(&g_simple_q[i], &g_simple_q[i + 1], (g_simple_n - i) * sizeof g_simple_q[0]);
-        return;
+        ReleaseSRWLockExclusive(&g_simple_lock);
+        return 1;
     }
+    ReleaseSRWLockExclusive(&g_simple_lock);
+    return 0;
+}
+
+/* Polygon offset that no API call put in the buffer: a push buffer the title
+ * recorded itself sets it there, and only there. Forza Motorsport draws its
+ * billboards' adverts over a blank board in the same plane, pushed forward
+ * this way; without it the board won wherever its depth came out a hair
+ * nearer -- white wedges over the advert that changed every frame the
+ * camera moved. RECOMP_PB_POLYOFFSET=0 leaves them to the API alone. */
+static int pb_polyoffset_method(uint32_t m)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_POLYOFFSET");
+        on = !(e && e[0] == '0');
+    }
+    return on && (m == 0x0384u || m == 0x0388u || m == 0x0330u || m == 0x0334u ||
+                  m == 0x0338u);
 }
 
 static void flush_simple_states(void)
 {
     uint32_t i;
 
+    AcquireSRWLockExclusive(&g_simple_lock);
     for (i = 0; i < g_simple_n; i++)
         (void)hle_d3d8_state_store_simple(g_simple_q[i].method, g_simple_q[i].value);
     g_simple_n = 0;
+    ReleaseSRWLockExclusive(&g_simple_lock);
 }
 
 void hle_d3d8_push_constants_sync(void)
@@ -895,6 +952,7 @@ void hle_d3d8_push_constants_sync(void)
     uint32_t device, put, va, ret = 0, words = 0;
     int jumps = 0;
     int inl = hle_d3d8_pb_inline_on();
+    int trace, strace;
     /* Not re-entrant: an immediate-mode draw from the walk goes through
      * hle_d3d8_shadow_draw, which syncs before drawing. The walk in progress
      * is already applying everything in order, so the nested call has
@@ -916,9 +974,84 @@ void hle_d3d8_push_constants_sync(void)
         g_pb_scan = put;
         return;
     }
+    /* Most syncs find the buffer where the last walk left it: a draw, a
+     * vertex, a texture call, and nothing was pushed between them. Parsing
+     * that empty span was most of this function's time in a race. Anything
+     * a finished walk still owes (a constant run, a simple state, a bind
+     * held past the put pointer) is flushed, which is what falling through
+     * the empty walk did. */
+    if (put == g_pb_scan) {
+        if (g_pb_run_first >= 0)
+            pb_flush();
+        flush_simple_states();
+        hle_d3d8_texture_queue_flush();
+        return;
+    }
     g_pb_walks++;
     walking = 1;
+    /* Read once: the swap does not move during a walk, and asking per method
+     * header was two calls each. */
+    trace = pb_trace();
+    strace = pb_surface_trace();
     va = g_pb_scan;
+    /* A replaced call walks its own push so the scan stays level with put,
+     * then draws the vertices itself. When that span is only the methods
+     * the walk would ignore (inline vertices, its own begin/end, its own
+     * element list), the interpreter's per-word dispatch is the whole cost.
+     * Trace stays on the slow walk so a method log is not missing lines. */
+    if (g_w_nodraw && inl && !trace && !strace && va <= put) {
+        uint32_t scan = va;
+        int pure = 1;
+
+        while (scan != put) {
+            uint32_t w, count, method, n, next;
+            int noninc;
+
+            if (!guest_readable(scan, 4u)) {
+                pure = 0;
+                break;
+            }
+            w = HLE_MEM32(scan);
+            if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u || (w & 3u) == 2u ||
+                w == 0x00020000u || (w & 0xA0030003u) != 0u) {
+                pure = 0;
+                break;
+            }
+            count = (w >> 18) & 0x7FFu;
+            method = w & 0x1FFCu;
+            if (count && !guest_readable(scan + 4u, 4ull * count)) {
+                pure = 0;
+                break;
+            }
+            noninc = (w & 0x40000000u) != 0u;
+            for (n = 0; n < count; n++) {
+                uint32_t m = noninc ? method : method + 4u * n;
+
+                if (!(pb_inline_method(m) || m == PB_ELEM16 || m == PB_ELEM32 ||
+                      m == PB_DRAW_ARRAYS || m == PB_INLINE_ARRAY)) {
+                    pure = 0;
+                    break;
+                }
+            }
+            if (!pure)
+                break;
+            next = scan + 4u + 4u * count;
+            if (next < scan || next > put) {
+                pure = 0;
+                break;
+            }
+            scan = next;
+        }
+        if (pure && scan == put) {
+            g_pb_fast++;
+            pb_flush();
+            flush_simple_states();
+            hle_d3d8_texture_queue_flush();
+            g_pb_scan = put;
+            walking = 0;
+            return;
+        }
+    }
     while (va != put) {
         uint32_t w, count, method, i;
 
@@ -930,7 +1063,7 @@ void hle_d3d8_push_constants_sync(void)
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
             if (++jumps > PB_MAX_JUMPS)
                 goto resync;
-            if (pb_trace())
+            if (trace)
                 fprintf(stderr, "[PB swap %lu] 0x%08X jump -> 0x%08X\n",
                         hle_d3d8_shadow_swaps(), va, CONTIG_BASE | (target & 0x0FFFFFFFu));
             va = CONTIG_BASE | (target & 0x0FFFFFFFu);
@@ -941,7 +1074,7 @@ void hle_d3d8_push_constants_sync(void)
                 goto resync;
             ret = va + 4u;
             va = CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
-            if (pb_trace())
+            if (trace)
                 fprintf(stderr, "[PB swap %lu] call -> 0x%08X\n", hle_d3d8_shadow_swaps(), va);
             continue;
         }
@@ -958,7 +1091,7 @@ void hle_d3d8_push_constants_sync(void)
         method = w & 0x1FFCu;
         if (inl)
             hle_d3d8_texture_queue_reach(va);
-        if (pb_trace()) {
+        if (trace) {
             uint32_t k;
             for (k = 0; k < count && k < 64u && guest_readable(va + 4u + 4u * k, 4u); k++)
                 fprintf(stderr, "[PB swap %lu] 0x%08X method 0x%04X = 0x%08X%s\n",
@@ -990,7 +1123,7 @@ void hle_d3d8_push_constants_sync(void)
                 }
             }
         }
-        if (pb_surface_trace() && method + 4u * count > 0x0200u && method < 0x0220u) {
+        if (strace && method + 4u * count > 0x0200u && method < 0x0220u) {
             uint32_t k;
             for (k = 0; k < count && guest_readable(va + 4u + 4u * k, 4u); k++)
                 fprintf(stderr, "[PB-SURF swap %lu] method 0x%04X = 0x%08X%s\n",
@@ -1004,23 +1137,45 @@ void hle_d3d8_push_constants_sync(void)
                      (method + 4u * count > PB_ARRAYS_FIRST && method < PB_ARRAYS_END) ||
                      (method >= PB_ELEM16 && method <= PB_INLINE_ARRAY) ||
                      (method + 4u * count > PB_SIMPLE_FIRST && method < PB_SIMPLE_END) ||
+                     (method + 4u * count > PB_CULL_FACE && method <= PB_FRONT_FACE) ||
                      (method + 4u * count > PB_CLEAR_FIRST && method < PB_CLEAR_END) ||
                      method == PB_SWATH))) {
             int noninc = (w & 0x40000000u) != 0u;
 
             if (!guest_readable(va + 4u, 4ull * count))
                 goto resync;
+            /* A run of vertex shader constants, which is most of what a race
+             * pushes: straight to the four-word register, without asking
+             * each word about every other kind of method. The same as the
+             * loop below gives them, by way of pb_method. */
+            if (!noninc && method >= PB_CONST_FIRST && method + 4u * count <= PB_CONST_END) {
+                for (i = 0; i < count; i++) {
+                    uint32_t comp = ((method + 4u * i - PB_CONST_FIRST) / 4u) & 3u;
+                    uint32_t v = HLE_MEM32(va + 4u + 4u * i);
+
+                    memcpy(&g_pb_cur[comp], &v, sizeof v);
+                    if (comp == 3u)
+                        pb_constant(g_pb_load++, g_pb_cur);
+                }
+            } else
             for (i = 0; i < count; i++) {
                 uint32_t m = noninc ? method : method + 4u * i;
                 uint32_t v = HLE_MEM32(va + 4u + 4u * i);
-                if (inl && ((m >= PB_SIMPLE_FIRST && m < PB_SIMPLE_END) || m == PB_SWATH)) {
+                if (inl && (m == PB_CULL_ENABLE || m == PB_CULL_FACE || m == PB_FRONT_FACE)) {
+                    walk_cull_method(m, v);
+                } else if (inl && m >= PB_SIMPLE_END && m < PB_FRONT_FACE + 4u) {
+                    /* between the simple states and the cull methods: not ours */
+                } else if (inl && ((m >= PB_SIMPLE_FIRST && m < PB_SIMPLE_END) || m == PB_SWATH)) {
                     if (!g_w_nodraw && hle_d3d8_title_ltcg())
                         (void)hle_d3d8_state_store_simple(m, v);
-                    else
-                        walk_simple_state(va + 4u + 4u * i, m);
+                    else if (!walk_simple_state(va + 4u + 4u * i, m) &&
+                             !g_w_nodraw && pb_polyoffset_method(m)) {
+                        pb_flush();
+                        (void)hle_d3d8_state_store_simple(m, v);
+                    }
                 } else if (inl && m >= PB_CLEAR_FIRST && m < PB_CLEAR_END) {
                     g_clear_reg[(m - PB_CLEAR_FIRST) / 4u] = v;
-                    if (pb_surface_trace())
+                    if (strace)
                         fprintf(stderr, "[PB-SURF swap %lu] method 0x%04X = 0x%08X%s\n",
                                 hle_d3d8_shadow_swaps(), m, v,
                                 g_w_nodraw ? " (replaced call)" : "");
@@ -1150,7 +1305,8 @@ static void report(void)
                 g_skip_no_stream, g_skip_range, g_push_draws, g_push_failed);
         if (g_pb_walks)
             fprintf(stderr, "[HLE-D3D8] push buffer constants: %lu applied over %lu walks, "
-                    "%lu resync(s)\n", g_pb_constants, g_pb_walks, g_pb_resyncs);
+                    "%lu of them only the call's own vertices, %lu resync(s)\n",
+                    g_pb_constants, g_pb_walks, g_pb_fast, g_pb_resyncs);
         last = now;
     }
 }
@@ -1271,6 +1427,37 @@ static void wait_point(const char *name, int *seen)
     }
 }
 
+/* Optional timing at the wait boundary. Parent waits may contain nested
+ * calls, so the per-function totals must not be added together. */
+struct wait_profile {const char *name;long long since,sync,body,max;unsigned long calls,slow;};
+static struct wait_profile g_wait_profile[5]={
+    {"CDevice_KickOff"},{"KickOffAndWaitForIdle"},{"BlockOnTime"},
+    {"BlockOnResource"},{"ResourceBlockUntilNotBusy"}};
+static long long wait_profile_clock(void)
+{
+    static int enabled=-1;
+    if(enabled<0){const char *v=getenv("RECOMP_WAIT_PROFILE");enabled=v && v[0]=='1';}
+    if(!enabled)return 0;
+    LARGE_INTEGER t;QueryPerformanceCounter(&t);return t.QuadPart;
+}
+static void wait_profile_note(unsigned slot,long long start,long long middle)
+{
+    if(!start)return;
+    LARGE_INTEGER frequency;QueryPerformanceFrequency(&frequency);
+    long long end=wait_profile_clock(),body=end-middle;
+    struct wait_profile *p=&g_wait_profile[slot];
+    if(!p->since)p->since=start;
+    p->sync+=middle-start;p->body+=body;++p->calls;
+    if(body>p->max)p->max=body;
+    if(body>frequency.QuadPart/10000)++p->slow;
+    if(end-p->since>=frequency.QuadPart*5){
+        double ms=1000.0/(double)frequency.QuadPart;
+        fprintf(stderr,"[WAIT-PROFILE] %s over %.2fs: %lu calls, sync %.3f ms, original %.3f ms, max %.3f ms, %lu original calls over100us\n",
+            p->name,(end-p->since)*ms/1000.0,p->calls,p->sync*ms,p->body*ms,p->max*ms,p->slow);
+        p->since=end;p->sync=p->body=p->max=0;p->calls=p->slow=0;
+    }
+}
+
 HLE_ORIGINAL(CDevice_KickOff);
 HLE_ORIGINAL(D3D_KickOffAndWaitForIdle);
 HLE_ORIGINAL(D3D_BlockOnTime);
@@ -1279,42 +1466,57 @@ HLE_ORIGINAL(D3DResource_BlockUntilNotBusy);
 
 HLE_EXPORT(CDevice_KickOff)
 {
+    long long start=wait_profile_clock();
     static int seen;
     wait_point("CDevice_KickOff", &seen);
+    long long middle=start?wait_profile_clock():0;
     if (hle_original_CDevice_KickOff)
         HLE_CALL_ORIGINAL(CDevice_KickOff);
+    wait_profile_note(0,start,middle);
 }
 
 HLE_EXPORT(D3D_KickOffAndWaitForIdle)
 {
+    long long start=wait_profile_clock();
     static int seen;
     wait_point("D3D_KickOffAndWaitForIdle", &seen);
+    long long middle=start?wait_profile_clock():0;
     if (hle_original_D3D_KickOffAndWaitForIdle)
         HLE_CALL_ORIGINAL(D3D_KickOffAndWaitForIdle);
+    wait_profile_note(1,start,middle);
 }
 
 HLE_EXPORT(D3D_BlockOnTime)
 {
+    long long start=wait_profile_clock();
     static int seen;
     wait_point("D3D_BlockOnTime", &seen);
+    long long middle=start?wait_profile_clock():0;
     if (hle_original_D3D_BlockOnTime)
         HLE_CALL_ORIGINAL(D3D_BlockOnTime);
+    wait_profile_note(2,start,middle);
 }
 
 HLE_EXPORT(D3D_BlockOnResource)
 {
+    long long start=wait_profile_clock();
     static int seen;
     wait_point("D3D_BlockOnResource", &seen);
+    long long middle=start?wait_profile_clock():0;
     if (hle_original_D3D_BlockOnResource)
         HLE_CALL_ORIGINAL(D3D_BlockOnResource);
+    wait_profile_note(3,start,middle);
 }
 
 HLE_EXPORT(D3DResource_BlockUntilNotBusy)
 {
+    long long start=wait_profile_clock();
     static int seen;
     wait_point("D3DResource_BlockUntilNotBusy", &seen);
+    long long middle=start?wait_profile_clock():0;
     if (hle_original_D3DResource_BlockUntilNotBusy)
         HLE_CALL_ORIGINAL(D3DResource_BlockUntilNotBusy);
+    wait_profile_note(4,start,middle);
 }
 
 /* A replaced draw with no stream buffer to read: its stream setup was

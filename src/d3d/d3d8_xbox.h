@@ -415,6 +415,16 @@ typedef enum D3DRENDERSTATETYPE {
      * with the texture coordinate's r/q (a shadow map). A D3DCMPFUNC; 0
      * while the title has not set it. */
     D3DRS_SHADOWFUNC               = 254,
+    /* Xbox polygon offset, forwarded as D3D11 depth bias. Slope and bias
+     * are float bits (NV097_SET_POLYGON_OFFSET_SCALE_FACTOR and
+     * NV097_SET_POLYGON_OFFSET_BIAS). The three enables select which fill
+     * mode the offset applies to. Host-only numbers, past the last Xbox
+     * state the combiners read. */
+    D3DRS_POLY_SLOPE               = 255,
+    D3DRS_POLY_BIAS                = 256,
+    D3DRS_POLY_POINT               = 257,
+    D3DRS_POLY_LINE                = 258,
+    D3DRS_POLY_FILL                = 259,
 } D3DRENDERSTATETYPE;
 
 #define D3D8_PSTEXTUREMODES_XBOX 0x80000000u
@@ -450,6 +460,7 @@ typedef enum D3DTEXTURESTAGESTATETYPE {
     D3DTSS_COLORARG0    = 26,
     D3DTSS_ALPHAARG0    = 27,
     D3DTSS_RESULTARG    = 28,
+    D3DTSS_ADDRESSW     = 29, /* host extension: depth-axis addressing */
 } D3DTEXTURESTAGESTATETYPE;
 
 typedef enum D3DTEXTUREOP {
@@ -1350,6 +1361,16 @@ void          xbox_D3D8DepthCopyShutdown(void);
    waits to be shown; Present shows it without counting a frame; End puts
    the scene target back. FALSE from Begin: no second image, draw nothing. */
 BOOL xbox_D3D8InterpBegin(void);
+/* Paced presents (d3d8_device.c): on, the next in-between's due moment
+ * (QueryPerformanceCounter), and the five-second report. */
+BOOL xbox_D3D8PacedOn(void);
+void xbox_D3D8PacedDue(long long qpc);
+void xbox_D3D8PacedReport(void);
+
+/* A Clear flag beside the PC's D3DCLEAR_*: only some colour channels are
+ * cleared, the ones in bits 12-15 (R 0x1000, G 0x2000, B 0x4000, A 0x8000),
+ * as the Xbox's D3DCLEAR_TARGET_R/G/B/A ask (hle d3d8_xbox_map.h). */
+#define D3D8_CLEAR_CHANNELS 0x00010000u
 void xbox_D3D8InterpPresent(void);
 void xbox_D3D8InterpEnd(void);
 

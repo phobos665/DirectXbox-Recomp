@@ -422,8 +422,25 @@ int nv2a_intr_handle_write(PCONTEXT ctx, uintptr_t host_addr,
     uint64_t written;
     int size;
 
-    if (!mmio_decode_write_value(ctx, &written, &size))
+    const uint8_t *ip = (const uint8_t *)ctx->Rip;
+    if (ip[0] == 0x83 && ((ip[1] >> 3) & 7) == 1 && (ip[1] >> 6) != 3) {
+        int modrm_len = decode_modrm_len(ip + 1, 0);
+        uint32_t imm = (uint32_t)(int32_t)(int8_t)ip[1 + modrm_len];
+        uint32_t result = *(const volatile uint32_t *)host_addr | imm;
+        uint8_t parity = (uint8_t)result;
+        parity ^= parity >> 4;
+        parity ^= parity >> 2;
+        parity ^= parity >> 1;
+        ctx->EFlags = (ctx->EFlags & ~0x8C5u) |
+                      ((result & 0x80000000u) ? 0x80u : 0) |
+                      (result == 0 ? 0x40u : 0) |
+                      ((parity & 1) == 0 ? 0x4u : 0);
+        ctx->Rip += 2 + modrm_len;
+        written = result;
+        size = 4;
+    } else if (!mmio_decode_write_value(ctx, &written, &size)) {
         return 0;
+    }
 
     if (nv2a_offset == NV2A_PCRTC_INTR_0_OFF) {
         uint32_t remaining = *pcrtc & ~(uint32_t)written;

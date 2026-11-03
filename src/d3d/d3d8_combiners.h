@@ -277,7 +277,10 @@ typedef struct NV2ACombinerState {
      * at most twice the shaders, not eight times. Set per draw from the
      * render states, like `shadow`, not from the token. */
     BYTE alpha_test;
-    BYTE key_pad[3];   /* zero: part of the key bytes, so never left unset */
+    /* Bit N: stage N's PROJECT2D volume samples at r (proj2d_volume_r in
+     * d3d8_combiners.c). Set per draw from the bound volume's depth. */
+    BYTE vol_r;
+    BYTE key_pad[2];   /* zero: part of the key bytes, so never left unset */
 
     /* Everything above decides the generated shader and is its cache key
      * (NV2A_COMBINER_KEY_BYTES). Everything below is uploaded to the

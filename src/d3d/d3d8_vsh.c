@@ -68,6 +68,7 @@ static uint16_t       g_vsh_vdata_fed;     /* the mask g_vsh_vdata.fed holds */
 /* Constant registers (192 float4) */
 static NV2AVSConstants g_vsh_constants;
 static BOOL g_vsh_constants_dirty = TRUE;
+static unsigned long g_vsh_const_uploads, g_vsh_const_same;
 
 /* Constant buffer for VS constants */
 static RhiBuffer *g_vsh_cb = NULL;
@@ -771,6 +772,24 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "};\n"
         "\n", NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_INPUTS);
 
+    /* RECOMP_D3D8_CLIP_W=0: no clip distance at w <= 0 (see VS_OUT). */
+    {
+        static int clip_w = -1;
+        if (clip_w < 0) {
+            const char *e = getenv("RECOMP_D3D8_CLIP_W");
+            clip_w = !(e && e[0] == '0');
+        }
+        sb_append(&sb, "static const int xboxClipW = %d;\n", clip_w);
+    }
+    {
+        static int abs_w = -1;
+        if (abs_w < 0) {
+            const char *e = getenv("RECOMP_D3D8_ABS_W");
+            abs_w = e && e[0] == '1';
+        }
+        sb_append(&sb, "static const int xboxAbsW = %d;\n\n", abs_w);
+    }
+
     /* Input structure - only declare used inputs */
     sb_append(&sb, "struct VS_IN {\n");
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
@@ -804,9 +823,28 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float4 oT3  : TEXCOORD3;\n"
         "    float  oFog : TEXCOORD4;\n"
         "    float4 oViewPos : TEXCOORD5;\n"
+        /* The W-buffer depth (see the screen-space transform below): x is
+         * w over the depth scale, y the viewport's depth span when the
+         * pixel stage is to write it, else 0. Twice, since the pixel
+         * stages read one copy perspective-correct and one not. Straight
+         * after the view position, so a pixel stage that does not read
+         * them still matches by register. */
+        "    float4 oWDep : XBOXWDEPTH0;\n"
+        "    float4 oWLin : XBOXWLINEAR0;\n"
         "    float  oPts : PSIZE;\n"
         "    float4 oB0  : TEXCOORD6;\n"
         "    float4 oB1  : TEXCOORD7;\n"
+        /* D3D11 only: the near plane, as a clip distance. Depth clipping is
+         * off (d3d8_states.c, depth_clamp: BF2:MC's menus sit a tenth of a
+         * depth unit in front of it), and with it went the near plane: a
+         * wall that runs past the camera kept the sliver between the eye
+         * and the near plane, drawn at depth 0 over everything. In Forza
+         * Motorsport those slivers were black slabs with straight edges
+         * across the road. 1e-4 of the range in front of the plane is kept.
+         * The Vulkan device does not enable shaderClipDistance. */
+        "#ifndef __spirv__\n"
+        "    float  oClipW : SV_ClipDistance0;\n"
+        "#endif\n"
         /* Vulkan: a vertex stage feeding a point list must write the point
          * size; D3D11 has none (oPts above goes nowhere, every point is one
          * pixel). __spirv__ is DXC's macro for a SPIR-V compile, so
@@ -983,19 +1021,40 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
      * them has no area. */
     sb_append(&sb,
         "    /* Undo the Xbox screen-space transform */\n"
+        /* xboxClipZ: the program's own depth in clip space, kept for the
+         * near-plane clip distance (VS_OUT oClipW) before a W-buffered draw
+         * replaces z with w. */
+        "    float xboxClipZ;\n"
+        "    float4 xboxWDep = float4(0, 0, 0, 0);\n"
         "    if (xboxScreenspaceEnable.x != 0) {\n"
         "        float xboxW = oPos.w;\n"
         "        oPos -= xboxScreenspaceOffset;\n"
         "        oPos /= xboxScreenspaceScale;\n"
-        "        if (xboxScreenspaceEnable.y != 0 && xboxScreenspaceScale.z != 0)\n"
+        "        float xboxZ = oPos.z;\n"
+        "        if (xboxScreenspaceEnable.y != 0 && xboxScreenspaceScale.z != 0) {\n"
         "            oPos.z = xboxW / xboxScreenspaceScale.z;\n"
+        "            if (xboxScreenspaceEnable.y > 1.5)\n"
+        "                xboxWDep = float4(oPos.z, xboxScreenspaceEnable.w, 0, 0);\n"
+        "        }\n"
         "        if (oPos.w == 0) {\n"
         "            if (abs(oPos.x) > 1.0e4 || abs(oPos.y) > 1.0e4)\n"
         "                oPos = float4(0, 0, 0, 0);   /* through the eye: clipped */\n"
         "            else\n"
         "                oPos.w = 1;\n"
         "        }\n"
+        /* The NV2A rasterises the screen-space positions the program
+         * wrote, divided by w already, and uses w only to interpolate: a
+         * vertex behind the eye stays where the divide put it rather than
+         * being clipped against w = 0 as homogeneous clipping would. So |w|
+         * goes to the host under RECOMP_D3D8_ABS_W=1. OFF: tried for Forza
+         * Motorsport's horizon quads (corners far behind the camera), it
+         * wrecked every frame, since ordinary scenery crosses w = 0 all the
+         * time and the NV2A evidently clips it. Kept as an experiment. */
+        "        if (xboxAbsW != 0) oPos.w = abs(oPos.w);\n"
         "        oPos.xyz *= oPos.w;\n"
+        "        xboxClipZ = (xboxZ + 1.0e-4) * oPos.w;\n"
+        "    } else {\n"
+        "        xboxClipZ = oPos.z + 1.0e-4 * oPos.w;\n"
         "    }\n\n");
 
     /* Populate output structure */
@@ -1013,9 +1072,14 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         /* Table fog reads -viewpos.z (or its length, for range fog) as the
          * distance; on the Xbox that distance is the program's oFog. */
         "    o.oViewPos = float4(0, 0, -oFog.x, 1);\n"
+        "    o.oWDep = xboxWDep;\n"
+        "    o.oWLin = xboxWDep;\n"
         "    o.oPts = oPts.x;\n"
         "    o.oB0  = saturate(oB0);\n"
         "    o.oB1  = saturate(oB1);\n"
+        "#ifndef __spirv__\n"
+        "    o.oClipW = (xboxClipW != 0 && (xboxScreenspaceEnable.x == 0 || xboxScreenspaceEnable.z != 0)) ? xboxClipZ : 1.0;\n"
+        "#endif\n"
         "#ifdef __spirv__\n"
         "    o.vk_point_size = 1.0;\n"
         "#endif\n"
@@ -1798,43 +1862,50 @@ void d3d8_vsh_interp_registers(int *projection, int *affine_first, int *affine_c
 
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
 {
-    int end_reg;
-    float hp;
+    int end_reg, changed = 0;
+    float hp = 1.0f;
+    int reg_hp = -1;
 
-    if (!data || start_reg < 0)
+    if (!data || start_reg < 0 || count <= 0)
         return;
 
     end_reg = start_reg + count;
     if (end_reg > NV2A_VS_MAX_CONSTANTS)
         end_reg = NV2A_VS_MAX_CONSTANTS;
 
+    /* Hor+ at upload (RECOMP_HOR_PLUS_TARGETS=all) folds into the stored
+     * register, once. The compare is against that stored result, so a draw
+     * that sets the same matrix again does not upload the whole bank. */
+    if (hor_plus_all_targets()) {
+        hp = hor_plus_factor();
+        if (hp != 1.0f && !g_hor_plus_claimed)
+            reg_hp = d3d8_vsh_hor_plus_reg();
+    }
+
     for (int i = start_reg; i < end_reg; i++) {
         int src_offset = (i - start_reg) * 4;
-        g_vsh_constants.c[i][0] = data[src_offset + 0];
-        g_vsh_constants.c[i][1] = data[src_offset + 1];
-        g_vsh_constants.c[i][2] = data[src_offset + 2];
-        g_vsh_constants.c[i][3] = data[src_offset + 3];
-    }
+        float v[4];
 
-    /* Hor+ (hor_plus_factor) is applied as the constants reach the host
-     * (d3d8_vsh_prepare_draw), so it can depend on where the draw goes. */
-    if (!hor_plus_all_targets()) {
-        g_vsh_constants_dirty = TRUE;
-        return;
-    }
-    hp = hor_plus_factor();
-    if (hp != 1.0f && !g_hor_plus_claimed) {
-        int reg = d3d8_vsh_hor_plus_reg();
-
-        if (reg >= start_reg && reg < end_reg) {
-            g_vsh_constants.c[reg][0] *= hp;
-            g_vsh_constants.c[reg][1] *= hp;
-            g_vsh_constants.c[reg][2] *= hp;
-            g_vsh_constants.c[reg][3] *= hp;
+        v[0] = data[src_offset + 0];
+        v[1] = data[src_offset + 1];
+        v[2] = data[src_offset + 2];
+        v[3] = data[src_offset + 3];
+        if (i == reg_hp) {
+            v[0] *= hp;
+            v[1] *= hp;
+            v[2] *= hp;
+            v[3] *= hp;
+        }
+        if (memcmp(g_vsh_constants.c[i], v, sizeof v) != 0) {
+            memcpy(g_vsh_constants.c[i], v, sizeof v);
+            changed = 1;
         }
     }
 
-    g_vsh_constants_dirty = TRUE;
+    if (changed)
+        g_vsh_constants_dirty = TRUE;
+    else
+        g_vsh_const_same++;
 }
 
 HRESULT d3d8_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int count)
@@ -1887,6 +1958,33 @@ int d3d8_vsh_wbuffer_on(void)
 
     if (on < 0) {
         const char *e = getenv("RECOMP_D3D8_WBUFFER");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* Whether a W-buffered draw's depth is written per pixel
+ * (RECOMP_D3D8_WDEPTH, on unless 0).
+ *
+ * The W the NV2A keeps is exact at every pixel; the host rasterises the
+ * depth the vertex stage gives it linearly in screen space, where w is not
+ * linear but 1/w is. Across a triangle that overstates w -- the more, the
+ * bigger the triangle on screen -- so two surfaces in one plane cut into
+ * different triangles get different depths and cut through each other.
+ * Forza Motorsport's billboards are a board and its advert in one plane:
+ * the white board came through the advert in wedges along the triangles'
+ * edges, changing with every move of the camera. The pixel stage now
+ * writes the exact w (an attribute interpolated perspective-correct),
+ * minus the overstatement, from the rasterised depth, so a depth bias the
+ * draw has is kept. Plain SV_Depth: SV_DepthLessEqual (never more than the
+ * rasterised depth, which holds) wants the position read centroid, and gains
+ * nothing under the LESS tests the titles draw with. */
+int d3d8_vsh_wdepth_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_D3D8_WDEPTH");
         on = !(e && e[0] == '0');
     }
     return on;
@@ -1994,9 +2092,26 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
         const DWORD *rs = d3d8_GetRenderStates();
         float w = (rs && rs[D3DRS_ZENABLE] == 2u /* D3DZB_USEW */ &&
                    d3d8_vsh_wbuffer_on()) ? 1.0f : 0.0f;
-        if (g_vsh_screen.enable[1] != w) {
+        /* enable.y = 2: the pixel stage writes the W depth per pixel, and
+         * enable.w is the viewport's depth span it is written in. */
+        float span = d3d8_GetViewportDepthSpan();
+        if (w != 0.0f && d3d8_vsh_wdepth_on())
+            w = 2.0f;
+        if (g_vsh_screen.enable[1] != w || g_vsh_screen.enable[3] != span) {
             g_vsh_screen.enable[1] = w;
+            g_vsh_screen.enable[3] = span;
             g_vsh_screen_dirty = TRUE;
+        }
+        /* enable.z: the draw tests depth. The near-plane clip distance
+         * applies only then: with Z off the NV2A ignores the depth a program
+         * writes, and Forza's minimap track line comes out at z = -8e6 in
+         * some frames, which the clip removed. */
+        {
+            float zt = (rs && rs[D3DRS_ZENABLE] != 0u) ? 1.0f : 0.0f;
+            if (g_vsh_screen.enable[2] != zt) {
+                g_vsh_screen.enable[2] = zt;
+                g_vsh_screen_dirty = TRUE;
+            }
         }
     }
 
@@ -2078,10 +2193,24 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
                         }
                 }
                 rhi_buffer_unmap(g_vsh_cb);
+                g_vsh_const_uploads++;
             }
             g_vsh_constants_dirty = FALSE;
             zoomed = want;
             widened = widen;
+        }
+        {
+            static DWORD report_at;
+            DWORD now = GetTickCount();
+
+            if (!report_at)
+                report_at = now;
+            else if (now - report_at >= 5000) {
+                fprintf(stderr, "[VS-CB] %lu uploads, %lu sets already stored\n",
+                        g_vsh_const_uploads, g_vsh_const_same);
+                g_vsh_const_uploads = g_vsh_const_same = 0;
+                report_at = now;
+            }
         }
     }
 

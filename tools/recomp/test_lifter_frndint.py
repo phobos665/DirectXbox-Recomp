@@ -35,7 +35,10 @@ class FrndintLiftTest(unittest.TestCase):
 
 class FrndintRuntimeTest(unittest.TestCase):
     def test_each_rounding_control_rounds_its_own_way(self):
-        cc = next(filter(None, map(shutil.which, ("cc", "gcc", "clang"))), None)
+        # Match the Windows project's Clang/MSVC toolchain before a MinGW
+        # compiler installed elsewhere on PATH. Keep the Unix preference.
+        names = ("clang", "cc", "gcc") if os.name == "nt" else ("cc", "gcc", "clang")
+        cc = next(filter(None, map(shutil.which, names)), None)
         if not cc:
             self.skipTest("no C compiler available")
         source = r'''

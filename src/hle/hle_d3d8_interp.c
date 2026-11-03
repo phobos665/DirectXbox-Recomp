@@ -129,6 +129,15 @@ static int        g_prep_cap;
 
 /* This frame, in the gate. */
 static int        g_prepared, g_frame_ok, g_slot;
+/* What the frame still drew after its in-between was drawn from it (the
+ * title's Swap body runs after the gate's wait): missing from the
+ * in-between, so it shows on every other picture only. */
+static size_t        g_redrawn_ops;
+static int           g_redrawn_draws;
+static unsigned long g_late_draws, g_late_frames;
+#define INTERP_LATE_RUN 15
+static int           g_late_run, g_pause_left, g_pause_len;
+static unsigned long g_pause_ended, g_paused_frames;
 static LONGLONG   g_last_present, g_qpf, g_redraw_est, g_presented_at;
 
 /* RECOMP_INTERP_DUMP=<prefix>: in-between frames from swap
@@ -138,7 +147,7 @@ static LONGLONG   g_last_present, g_qpf, g_redraw_est, g_presented_at;
  * side. */
 static const char   *g_dump_prefix;
 static unsigned long g_dump_from, g_swaps;
-static int           g_dumped;
+static int           g_dumped, g_dump_max = 24;
 
 /* For the report. */
 static unsigned long g_frames, g_shown, g_late, g_held_2d, g_held_match, g_held_cut,
@@ -146,6 +155,29 @@ static unsigned long g_frames, g_shown, g_late, g_held_2d, g_held_match, g_held_
 static double        g_matched_sum, g_redraw_ms_sum, g_redraw_ms_max;
 static double        g_alpha_sum, g_off_ms_sum, g_off_ms_max;
 static unsigned long g_redraws, g_matched_frames;
+
+static volatile int g_hold_req;     /* hle_d3d8_interp_hold, this frame */
+/* Frames left of an F11 series (hle_d3d8_interp_dump_now): every one gets
+ * its in-between, however late -- writing the pictures makes each frame
+ * late, and the pause that would follow would leave the series none. */
+static int          g_force_left;
+
+void hle_d3d8_interp_hold(void)
+{
+    g_hold_req = 1;
+}
+
+void hle_d3d8_interp_dump_now(int n)
+{
+    if (!g_dump_prefix || n <= 0)
+        return;
+    g_dump_from = g_swaps + 1;
+    g_dumped = 0;
+    g_dump_max = n;
+    g_force_left = n + 2;
+    g_pause_left = 0;
+    g_late_run = 0;
+}
 
 unsigned long hle_d3d8_interp_presents(void)
 {
@@ -171,8 +203,10 @@ static int grow(uint8_t **buf, size_t *cap, size_t need)
     return 1;
 }
 
-static void push(uint8_t **buf, size_t *len, size_t *cap, void (*fn)(const void *),
-                 const void *arg, size_t size, int draw, int *whole)
+/* arg NULL: room only, which the caller fills through the pointer returned
+ * (hle_d3d8_interp_draw_reserve) -- one copy of a draw's vertices, not two. */
+static void *push(uint8_t **buf, size_t *len, size_t *cap, void (*fn)(const void *),
+                  const void *arg, size_t size, int draw, int *whole)
 {
     size_t need = sizeof(op_header) + INTERP_ALIGN(size);
     op_header *h;
@@ -180,30 +214,53 @@ static void push(uint8_t **buf, size_t *len, size_t *cap, void (*fn)(const void 
     if (*len + need > INTERP_LIST_LIMIT || !grow(buf, cap, *len + need)) {
         if (whole)
             *whole = 0;                          /* not the whole frame: not drawn again */
-        return;
+        return NULL;
     }
     h = (op_header *)(*buf + *len);
     h->size = (uint32_t)size;
     h->draw = draw;
     h->fn = fn;
-    if (size)
+    if (size && arg)
         memcpy(h + 1, arg, size);
     *len += need;
+    return h + 1;
 }
+
+static LONGLONG      g_op_ticks;
+static unsigned long g_op_count;
 
 void hle_d3d8_interp_op(void (*fn)(const void *arg), const void *arg, size_t size)
 {
     InterpList *l = &g_list[g_cur];
 
     push(&l->ops, &l->len, &l->cap, fn, arg, size, -1, &l->whole);
+    g_op_count++;
 }
 
 void hle_d3d8_interp_draw(void (*fn)(const void *arg), const void *arg, size_t size,
                           const HleInterpDrawKey *key)
 {
+    void *p = hle_d3d8_interp_draw_reserve(fn, size, key);
+    if (p && size)
+        memcpy(p, arg, size);
+}
+
+/* Time spent keeping draws (hle_d3d8_record.c), for the report. */
+static LONGLONG g_keep_ticks;
+static double   g_keep_bytes;
+void hle_d3d8_interp_keep_ticks(long long t)
+{
+    g_keep_ticks += t;
+}
+
+void *hle_d3d8_interp_draw_reserve(void (*fn)(const void *arg), size_t size,
+                                   const HleInterpDrawKey *key)
+{
     InterpList *l = &g_list[g_cur];
     const float *c = hle_d3d8_interp_constants();
     float *r;
+
+    g_keep_bytes += (double)size;
 
     if (l->ndraws >= l->cap_draws) {
         int n = l->cap_draws ? l->cap_draws * 2 : 1024;
@@ -212,14 +269,14 @@ void hle_d3d8_interp_draw(void (*fn)(const void *arg), const void *arg, size_t s
 
         if (!d) {
             l->whole = 0;
-            return;
+            return NULL;
         }
         l->draws = d;
         g = (float *)realloc(l->regs, (size_t)n * (size_t)(g_nregs ? g_nregs : 1) * 4 *
                              sizeof(float));
         if (!g) {
             l->whole = 0;
-            return;
+            return NULL;
         }
         l->regs = g;
         l->cap_draws = n;
@@ -242,8 +299,12 @@ void hle_d3d8_interp_draw(void (*fn)(const void *arg), const void *arg, size_t s
     }
     if (g_aff_count)
         memcpy(r, c + g_aff_first * 4, (size_t)g_aff_count * 4 * sizeof(float));
-    push(&l->ops, &l->len, &l->cap, fn, arg, size, l->ndraws, &l->whole);
-    l->ndraws++;
+    {
+        void *p = push(&l->ops, &l->len, &l->cap, fn, NULL, size, l->ndraws, &l->whole);
+        if (p)
+            l->ndraws++;
+        return p;
+    }
 }
 
 /* Run what the list put off, with nothing kept while it runs: these are the
@@ -741,6 +802,8 @@ static void redraw(double a)
         return;
     }
     hle_d3d8_interp_rec = 0;                     /* what is drawn now is not kept */
+    g_redrawn_ops = cur->len;
+    g_redrawn_draws = cur->ndraws;
     for (off = 0; off < cur->len; ) {
         op_header *h = (op_header *)(cur->ops + off);
         if (h->draw >= 0)
@@ -748,7 +811,7 @@ static void redraw(double a)
         h->fn(h->size ? (const void *)(h + 1) : NULL);
         off += sizeof(op_header) + INTERP_ALIGN(h->size);
     }
-    if (g_dump_prefix && g_swaps + 1 >= g_dump_from && g_dumped < 24) {
+    if (g_dump_prefix && g_swaps + 1 >= g_dump_from && g_dumped < g_dump_max) {
         char path[512];
         snprintf(path, sizeof path, "%s_i%05lu_%d.bmp", g_dump_prefix, g_swaps + 1, g_slot);
         if (hle_d3d8_dump_back_buffer(path) == 0) {
@@ -792,13 +855,36 @@ static long long gate_idle(long long now, long long release)
     if (!g_prepared) {
         g_prepared = 1;
         g_frame_ok = 0;
-        if (hle_d3d8_capture_active() || hle_d3d8_movie_layer_shown())
+        if (hle_d3d8_capture_active() || hle_d3d8_movie_layer_shown() || g_hold_req)
             g_held_other++;
         else
             g_frame_ok = prepare_frame();
     }
-    if (!g_frame_ok || span <= g_qpf / 1000 || span > g_qpf / 10)
+    if (!g_frame_ok || (!g_force_left && (span <= g_qpf / 1000 || span > g_qpf / 10)))
         return 0;
+    /* Paced presents (d3d8_device.c, RECOMP_PACED_PRESENT): the in-between
+     * is drawn at once and shown at this frame's vblank, the frame itself
+     * half a period after. Nothing has to be finished by the halfway point,
+     * which a title that takes most of its period never is. Two frames a
+     * period only: the device keeps one image for each. */
+    if (g_multiple == 2 && xbox_D3D8PacedOn()) {
+        if (g_slot < 2) {
+            LARGE_INTEGER a, b;
+            double ms;
+            xbox_D3D8PacedDue(release);
+            QueryPerformanceCounter(&a);
+            redraw(0.5);
+            QueryPerformanceCounter(&b);
+            ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpf;
+            g_redraw_ms_sum += ms;
+            g_redraws++;
+            if (ms > g_redraw_ms_max)
+                g_redraw_ms_max = ms;
+            g_alpha_sum += 0.5;
+            g_slot = 2;
+        }
+        return 0;
+    }
     while (g_slot < g_multiple) {
         LONGLONG due = g_last_present + span * g_slot / g_multiple;
         LONGLONG start = due - g_redraw_est;
@@ -916,7 +1002,10 @@ void hle_d3d8_interp_init(void)
         g_dump_prefix = NULL;
     {
         const char *from = getenv("RECOMP_INTERP_DUMP_FROM");
+        const char *max = getenv("RECOMP_INTERP_DUMP_MAX");   /* more than 24, for a run of them */
         g_dump_from = from ? (unsigned long)atol(from) : 0;
+        if (max && atoi(max) > 0)
+            g_dump_max = atoi(max);
     }
     xbox_Nv2aFlipGateSetIdle(gate_idle);
     fprintf(stderr, "[INTERP] frame interpolation: %d frames shown for each the title "
@@ -924,10 +1013,17 @@ void hle_d3d8_interp_init(void)
     fflush(stderr);
 }
 
+int hle_d3d8_interp_gate_after_swap(void)
+{
+    return g_multiple && g_on;
+}
+
 void hle_d3d8_interp_frame_end(void)
 {
     LARGE_INTEGER now;
+    int held_req = g_hold_req;
 
+    g_hold_req = 0;                     /* asked for the frame just shown */
     if (!g_multiple)
         return;
     QueryPerformanceCounter(&now);
@@ -943,6 +1039,54 @@ void hle_d3d8_interp_frame_end(void)
         return;
     }
     follow_registers();
+    /* A title that runs out of its period has no wait to lend, and then
+     * keeping its frames only makes it later still: Forza's pack of eight
+     * cars at a race start went from 33 to 39 ms a frame keeping draws no
+     * in-between was ever drawn from. After INTERP_LATE_RUN frames in a row
+     * that gave the gate no wait, nothing is kept for a while; a pause that
+     * runs straight into another is made longer, up to 20 seconds. */
+    if (g_redrawn_ops && g_list[g_cur].ndraws > g_redrawn_draws) {
+        g_late_draws += (unsigned long)(g_list[g_cur].ndraws - g_redrawn_draws);
+        g_late_frames++;
+    }
+    g_redrawn_ops = 0;
+    g_redrawn_draws = 0;
+    if (g_force_left > 0) {
+        /* Late, so the gate had no wait to lend and gate_idle never ran:
+         * draw the in-between now, after the frame. Its place on the screen
+         * is wrong for the moment, its picture is what is being looked at. */
+        if (!g_prepared && hle_d3d8_interp_rec) {
+            g_prepared = 1;
+            if (!hle_d3d8_capture_active() && !held_req && prepare_frame())
+                redraw(0.5);
+        }
+        g_force_left--;
+        g_late_run = 0;
+        g_prepared = 1;
+    }
+    if (!g_prepared)
+        g_late_run++;
+    else
+        g_late_run = 0;
+    if (g_pause_left > 0 || g_late_run >= INTERP_LATE_RUN) {
+        if (g_pause_left <= 0) {
+            g_pause_len = g_frames - g_pause_ended < 30 && g_pause_len
+                              ? (g_pause_len * 2 > 1200 ? 1200 : g_pause_len * 2)
+                              : 150;
+            g_pause_left = g_pause_len;
+            g_late_run = 0;
+        }
+        if (--g_pause_left == 0)
+            g_pause_ended = g_frames;
+        g_paused_frames++;
+        hle_d3d8_interp_rec = 0;
+        list_retire(&g_list[0]);
+        list_retire(&g_list[1]);
+        g_prepared = 0;
+        g_frame_ok = 0;
+        g_slot = 1;
+        return;
+    }
     /* The frame just shown becomes the one before; what the one before it
      * put off can happen now, since neither will be drawn again. */
     list_retire(&g_list[g_cur ^ 1]);
@@ -973,6 +1117,25 @@ void hle_d3d8_interp_report(void)
             g_redraws ? g_off_ms_sum / (double)g_redraws : 0.0, g_off_ms_max,
             g_redraws ? g_alpha_sum / (double)g_redraws : 0.0,
             g_on ? "" : " (off)");
+    if (g_frames || g_keep_ticks)
+        fprintf(stderr, "[INTERP] keeping the frame's draws: %.2f ms a frame (%.1f MB a frame)\n",
+                g_frames ? (double)g_keep_ticks * 1000.0 / (double)g_qpf / (double)g_frames : 0.0,
+                g_frames ? g_keep_bytes / 1048576.0 / (double)g_frames : 0.0);
+    if (g_frames)
+        fprintf(stderr, "[INTERP] keeping the frame's other calls: %lu a frame\n",
+                g_op_count / g_frames);
+    if (g_late_frames)
+        fprintf(stderr, "[INTERP] %lu frames drew %lu draws after their in-between "
+                "was made (in the title's Swap)\n", g_late_frames, g_late_draws);
+    g_late_frames = g_late_draws = 0;
+    if (g_paused_frames)
+        fprintf(stderr, "[INTERP] %lu frames kept nothing: the title had no time to spare "
+                "for an in-between\n", g_paused_frames);
+    g_paused_frames = 0;
+    g_op_ticks = 0;
+    g_op_count = 0;
+    g_keep_ticks = 0;
+    g_keep_bytes = 0.0;
     fflush(stderr);
     g_frames = g_shown = g_late = g_held_2d = g_held_match = g_held_cut = 0;
     g_held_other = 0;

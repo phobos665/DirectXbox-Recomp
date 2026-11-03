@@ -146,4 +146,10 @@ else()
     # -Wno-missing-field-initializers: Vulkan's `{ VK_STRUCTURE_TYPE_... }` idiom.
     target_compile_options(xbox_d3d8 PRIVATE -Wall -Wextra -Wno-unused-parameter
                            -Wno-missing-field-initializers -O2)
+    if(WIN32)
+        # The clang driver on Windows: CodeView debug info, so the PDB the
+        # title links (/DEBUG) names static functions in a sampled profile
+        # too, as /Zi does for MSVC. No effect on the generated code.
+        target_compile_options(xbox_d3d8 PRIVATE -g -gcodeview)
+    endif()
 endif()

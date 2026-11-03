@@ -14,6 +14,9 @@
 #include "launcher.h"
 #include "launcher_theme.h"
 
+/* launcher_iso_win32.c: the game from the player's own disc image. */
+int launcher_iso_ensure_game(void);
+
 static HWND g_hwnd;
 
 /* ------------------------------------------------------------ the host */
@@ -256,6 +259,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
      * scales the result up, which on a look made of soft edges and
      * glows shows as a blur over all of it. */
     SetProcessDPIAware();
+
+    /* No game beside us yet: from the player's disc image, or not at all. */
+    if (!launcher_iso_ensure_game())
+        return 0;
 
     launcher_init();
 

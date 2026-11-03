@@ -84,7 +84,8 @@ enum {
     TAG_ADPCM = 0x0069u,
     SLOTS     = 256u,
 
-    PRE_ROLL_MS       = 50u,     /* silence ahead of a buffer's sound; see prime() */
+    PRE_ROLL_MS       = 50u,     /* silence ahead of a buffer's first sound; see prime() */
+    LEAD_MS           = 80u,     /* real audio re-queued when a looping voice ran dry */
     SERVICE_PERIOD_US = 5000,    /* the service thread's cadence; see service_thread() */
 
     MAX_NOTIFY        = 64u,     /* positions per buffer */
@@ -333,6 +334,10 @@ static void prime(Buffer *b, uint32_t rate, uint32_t played_rate, uint32_t chann
         if (!recomp_audio_output_position(slot_of(b), &played, &queued) || queued != 0u)
             return;
         b->dry++;
+        /* The voice ran out. Another block of silence would be a hole in the
+         * sound every time it happens. pump() has already lengthened this
+         * slice with the loop itself, which is what gets submitted next. */
+        return;
     }
     if (bytes == 0u || bytes > sizeof silence)
         return;
@@ -574,6 +579,31 @@ static void notify_stop(Buffer *b, uint64_t now, int stop)
     }
 }
 
+/* XAUDIO2_MAX_FREQ_RATIO. A mixed voice is created at the buffer's original
+ * rate and will not play outside this multiple of it. */
+enum { VOICE_FREQ_RATIO_MAX = 1024u };
+
+/* The sample rate the host voice consumes when asked for `want` against a
+ * voice created at `original`. */
+static uint32_t voice_playable_hz(uint32_t original, uint32_t want)
+{
+    uint64_t lo, hi;
+
+    if (original == 0u || want == 0u)
+        return want;
+    lo = (uint64_t)original / (uint64_t)VOICE_FREQ_RATIO_MAX;
+    if (lo < 1u)
+        lo = 1u;
+    hi = (uint64_t)original * (uint64_t)VOICE_FREQ_RATIO_MAX;
+    if (hi > 200000u)
+        hi = 200000u;
+    if ((uint64_t)want < lo)
+        return (uint32_t)lo;
+    if ((uint64_t)want > hi)
+        return (uint32_t)hi;
+    return want;
+}
+
 /* Send the samples the output clock has consumed since the last pump. */
 static void pump(Buffer *b, uint64_t now)
 {
@@ -618,6 +648,40 @@ static void pump(Buffer *b, uint64_t now)
     bytes = recomp_dsound_buffer_consume(out, now, &offset);
     if (bytes == 0u || b->data == 0u || bytes > sizeof pcm)
         return;
+    /* A looping voice with nothing left queued plays a hole until the next
+     * pump. Silence in that hole is the stutter. Read further around the
+     * loop so this submit covers LEAD_MS, and let the copy below leave the
+     * cursor at the end of what it read. */
+    int refilled = 0;
+    if ((out->play_flags & RECOMP_DSOUND_PLAY_LOOPING) && b->primed) {
+        uint32_t queued = 0u;
+        uint32_t frame = adpcm ? channels * 2u : channels * (bits / 8u);
+
+        if (frame &&
+            recomp_audio_output_position(slot_of(b), NULL, &queued) &&
+            queued == 0u) {
+            uint32_t lead = (uint32_t)((uint64_t)out->sample_rate / 1000u * (uint64_t)LEAD_MS * frame);
+            uint32_t room = out->size_bytes / frame * frame;
+            static int said;
+
+            if (lead > (uint32_t)sizeof pcm)
+                lead = (uint32_t)sizeof pcm / frame * frame;
+            if (room && lead > room)
+                lead = room;
+            if (lead > bytes) {
+                if (said < 4) {
+                    uint32_t rate = out->sample_rate ? out->sample_rate : 1u;
+                    said++;
+                    fprintf(stderr, "[DSOUND] slot %u refilling a dry loop: %u bytes "
+                            "(%u ms) at %u Hz, queuing %u bytes (%u ms)\n",
+                            slot_of(b), bytes, bytes / frame * 1000u / rate,
+                            out->sample_rate, lead, LEAD_MS);
+                }
+                bytes = lead;
+                refilled = 1;
+            }
+        }
+    }
 
     if (adpcm) {
         uint32_t block_bytes = XBOX_ADPCM_BLOCK_BYTES * channels;
@@ -652,6 +716,8 @@ static void pump(Buffer *b, uint64_t now)
             if (offset == out->size_bytes) offset = out->loop_start_bytes;
         }
     }
+    if (refilled)
+        out->cursor_bytes = offset;
     {
         int32_t volume = (int32_t)setting(b->iface, SET_VOLUME);
         RecompAudioMix mix;
@@ -692,16 +758,32 @@ static void pump(Buffer *b, uint64_t now)
         recomp_audio_output_submit(slot_of(b), pcm, bytes, rate, channels, bits, volume);
         /* The Doppler shift changes how fast the buffer is consumed, as it
          * does on the console -- from now: after this slice was taken, or
-         * the output clock would step over it. */
+         * the output clock would step over it. The host voice was created at
+         * the buffer's original rate and only plays within
+         * VOICE_FREQ_RATIO_MAX of that (audio_output_xaudio2.cpp). The title's
+         * cursor follows the pitch that was asked for; the output clock
+         * follows the rate the voice will actually consume, so a loop is not
+         * submitted slower than it is played. */
         if (b->mixed) {
             uint32_t asked = b->asked_rate ? b->asked_rate : b->model.original_sample_rate;
+            uint32_t original = out->original_sample_rate;
             uint32_t want = (uint32_t)lrintf((float)asked * doppler);
+            uint32_t play;
+            static int said_pitch;
             if (want < 1000u) want = 1000u;
             if (want > 200000u) want = 200000u;
-            if (want != b->model.sample_rate) {
-                (void)recomp_dsound_buffer_set_frequency(&b->model, want, now);
-                (void)recomp_dsound_buffer_set_frequency(&b->output_model, want, now);
+            play = voice_playable_hz(original, want);
+            if (said_pitch < 6 && (play != want || want <= 1000u)) {
+                said_pitch++;
+                fprintf(stderr, "[DSOUND] slot %u pitch: asked %u Hz x doppler %.4f "
+                        "-> %u Hz, original %u Hz, voice plays %u Hz\n",
+                        slot_of(b), asked, (double)doppler, want, original, play);
+                fflush(stderr);
             }
+            if (want != b->model.sample_rate)
+                (void)recomp_dsound_buffer_set_frequency(&b->model, want, now);
+            if (play != out->sample_rate)
+                (void)recomp_dsound_buffer_set_frequency(out, play, now);
         }
         /* The release has run out: the buffer stops, as the hardware stops
          * the voice. */
@@ -1765,8 +1847,12 @@ static uint32_t set_rate(uint32_t iface, uint32_t frequency)
         pump(b, now);
         b->asked_rate = frequency;
         result = recomp_dsound_buffer_set_frequency(&b->model, frequency, now);
-        if (result == RECOMP_DSOUND_OK && b->model.sample_rate != before)
-            (void)recomp_dsound_buffer_set_frequency(&b->output_model, frequency, now);
+        if (result == RECOMP_DSOUND_OK && b->model.sample_rate != before) {
+            uint32_t original = b->output_model.original_sample_rate;
+            uint32_t play = voice_playable_hz(original ? original : frequency,
+                                              b->model.sample_rate);
+            (void)recomp_dsound_buffer_set_frequency(&b->output_model, play, now);
+        }
     }
     unlock();
     return result;

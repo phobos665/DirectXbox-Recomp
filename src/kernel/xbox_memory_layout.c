@@ -154,6 +154,26 @@ static void *g_contig_memory = NULL;
 #define XBOX_NV2A_SIZE (16u * 1024u * 1024u)
 static void *g_nv2a_memory = NULL;
 
+/* Acknowledgement at the title's known PFB flush polling point.
+ * This clears the same busy bit as NV2A_ACK, after its writer has set it;
+ * no interrupt, FIFO pointer, or other register bit is changed. On by
+ * default: without it every CDevice_KickOff spins until the ack thread's
+ * next pass, about 4 ms a frame in a Forza race (RECOMP_SAMPLE, 30 Oct
+ * 2026). RECOMP_PFB_INLINE_ACK=0 turns it off. */
+void xbox_Nv2aPfbAck(uint32_t guest_base)
+{
+    static int enabled=-1;
+    if(enabled<0){const char *v=getenv("RECOMP_PFB_INLINE_ACK");enabled=!(v&&v[0]=='0');}
+    if(!enabled || guest_base!=XBOX_NV2A_BASE || !g_nv2a_memory)return;
+    volatile LONG *reg=(volatile LONG *)((uint8_t *)g_nv2a_memory+0x100410);
+    LONG previous=InterlockedAnd(reg,~(LONG)0x00010000);
+    if(previous&0x00010000){
+        static unsigned long acknowledged;
+        if(!acknowledged++)fprintf(stderr,"[PFB-ACK] inline flush acknowledgement active\n");
+    }
+}
+
+
 /* MCPX southbridge register span: APU 0xFE800000 through NIC 0xFEF00000. */
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
@@ -2296,6 +2316,20 @@ static void fence_mirrors_tick(void)
                 *fence = put;
                 g_ack_activity++;
             }
+            /* The GPU's own copy of that time. D3D_BlockOnTime with a
+             * nonzero second argument (Forza's KickOffAndWaitForIdle) also
+             * spins until bits 2..6 of PGRAPH 0x400B10 equal the completed
+             * time << 2. Nothing set it, so the wait passed only when the
+             * time happened to be a multiple of 32: Forza hung at random
+             * loading a race, at "Updating scoreboards" and at simulated
+             * qualifying, spinning in sub_003BD220 (30 Oct 2026). */
+            if (g_nv2a_memory) {
+                volatile uint32_t *pg =
+                    (volatile uint32_t *)((uint8_t *)g_nv2a_memory + 0x400B10);
+                uint32_t want = (put << 2) & 0x7Cu;
+                if ((*pg & 0x7Cu) != want)
+                    *pg = (*pg & ~0x7Cu) | want;
+            }
         }
     }
 }
@@ -3077,19 +3111,37 @@ static uint32_t *s_watchdog_esp;
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
 
-static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
+/* RECOMP_WATCHDOG_STALL=<s>: the same picture, but of the thread that
+ * presents frames, once it has presented none for that many seconds -- and
+ * the title runs on. A frozen screen with music still playing (Forza
+ * Motorsport's white screen on the way into a race) is a render thread that
+ * stopped; when it stopped is not known in advance, so a fixed time is no
+ * use. Each present hands its thread's registers over
+ * (xbox_WatchdogNotePresent). */
+static volatile LONG s_watchdog_presents;
+static unsigned      s_watchdog_stall;
+
+void xbox_WatchdogNotePresent(void)
+{
+    if (!s_watchdog_stall)
+        return;
+    s_watchdog_esp = &g_esp;
+    s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
+    s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
+    s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
+    InterlockedIncrement(&s_watchdog_presents);
+}
+
+static void xbox_watchdog_dump(const char *why, unsigned secs)
 {
     const uint8_t *mem;
-    uint32_t esp, i;
-
-    (void)unused;
-    Sleep(s_watchdog_secs * 1000u);
+    uint32_t esp, i, top;
 
     mem = (const uint8_t *)g_memory_offset;
     esp = s_watchdog_esp ? *s_watchdog_esp : 0;
-    fprintf(stderr, "[WATCHDOG] no exit after %us; guest esp=0x%08X\n"
+    fprintf(stderr, "[WATCHDOG] %s after %us; guest esp=0x%08X\n"
             "  regs: eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X\n",
-            s_watchdog_secs, esp,
+            why, secs, esp,
             s_watchdog_regs[0] ? *s_watchdog_regs[0] : 0,
             s_watchdog_regs[1] ? *s_watchdog_regs[1] : 0,
             s_watchdog_regs[2] ? *s_watchdog_regs[2] : 0,
@@ -3143,22 +3195,70 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * is as much a hang question as a crash one (Max Payne's heap spin). */
     xbox_watch_scan_on_crash();
 
+    /* A thread the title created has its stack elsewhere
+     * (xbox_AllocThreadStack): read on to the end of guest memory there. */
+    top = (esp >= XBOX_STACK_BASE && esp < XBOX_STACK_TOP) ? XBOX_STACK_TOP
+                                                         : XBOX_TOTAL_RAM - 4u;
     for (i = 0; i < 400 && esp; i++) {
         uint32_t a = esp + i * 4;
-        if (a < XBOX_STACK_BASE || a >= XBOX_STACK_TOP) break;
+        if (a < XBOX_BASE_ADDRESS || a >= top) break;
         fprintf(stderr, "    GS %08X %08X\n", a,
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
+}
+
+static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
+{
+    (void)unused;
+    Sleep(s_watchdog_secs * 1000u);
+    xbox_watchdog_dump("no exit", s_watchdog_secs);
     _exit(3);
+    return 0;
+}
+
+/* Three pictures per stall (at 1x, 2x and 4x the limit), so a loop shows as
+ * the same frames and a slow load as different ones; a new stall after
+ * presents resume gets its own. */
+static DWORD WINAPI xbox_watchdog_stall_thread(LPVOID unused)
+{
+    LONG last = 0;
+    unsigned idle = 0;
+
+    (void)unused;
+    for (;;) {
+        LONG now;
+        Sleep(1000);
+        now = s_watchdog_presents;
+        if (now != last) {
+            last = now;
+            idle = 0;
+            continue;
+        }
+        if (!now)
+            continue;
+        idle++;
+        if (idle == s_watchdog_stall || idle == 2 * s_watchdog_stall ||
+            idle == 4 * s_watchdog_stall)
+            xbox_watchdog_dump("no present", idle);
+    }
     return 0;
 }
 
 void xbox_WatchdogStart(void)
 {
     const char *secs = getenv("RECOMP_WATCHDOG_SECS");
+    const char *stall = getenv("RECOMP_WATCHDOG_STALL");
     HANDLE h;
 
+    if (stall && atoi(stall) > 0) {
+        s_watchdog_stall = (unsigned)atoi(stall);
+        h = CreateThread(NULL, 0, xbox_watchdog_stall_thread, NULL, 0, NULL);
+        if (h)
+            CloseHandle(h);
+        fprintf(stderr, "[WATCHDOG] guest stack of the presenting thread after %us without a present\n",
+                s_watchdog_stall);
+    }
     if (!secs || !*secs)
         return;
     s_watchdog_secs = (unsigned)atoi(secs);

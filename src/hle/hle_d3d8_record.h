@@ -108,6 +108,15 @@ typedef struct {
 } HleInterpDrawKey;
 
 void hle_d3d8_interp_op(void (*fn)(const void *arg), const void *arg, size_t size);
+void *hle_d3d8_interp_draw_reserve(void (*fn)(const void *arg), size_t size,
+                                   const HleInterpDrawKey *key);
+void hle_d3d8_interp_keep_ticks(long long t);
+/* hle_d3d8.c: TRUE for converted vertices that stay unchanged until the
+ * next frame, which a kept draw may point at instead of copying. */
+int hle_d3d8_vertices_stable(const void *p);
+/* hle_d3d8_interp.c: TRUE while in-betweens are drawn, so Swap runs the
+ * title's own Swap body before the gate's wait, not after. */
+int hle_d3d8_interp_gate_after_swap(void);
 void hle_d3d8_interp_draw(void (*fn)(const void *arg), const void *arg, size_t size,
                           const HleInterpDrawKey *key);
 /* Run fn(arg) once the frame being kept is no longer needed: a release or a
@@ -128,6 +137,13 @@ int  hle_d3d8_dump_back_buffer(const char *path);
  * presented. */
 void hle_d3d8_interp_init(void);
 void hle_d3d8_interp_frame_end(void);
+/* The frame being drawn is not to have an in-between drawn from it: the
+ * title knows it is one whose draws cannot be redrawn faithfully (a menu
+ * fading in or out). Forza's front end asks it at every frame. */
+void hle_d3d8_interp_hold(void);
+/* RECOMP_INTERP_DUMP: write the next n in-between frames, from now (F11
+ * under RECOMP_F11_SERIES). */
+void hle_d3d8_interp_dump_now(int n);
 /* The five-second report's line, and in-between frames shown so far. */
 void hle_d3d8_interp_report(void);
 unsigned long hle_d3d8_interp_presents(void);
@@ -233,4 +249,7 @@ void    host_vsh_set_vertex_data(int reg, const float value[4]);
 void    host_combiners_set_pixel_shader(DWORD token);
 
 
+void host_NoteDepthAlias(IDirect3DSurface8 *surface,IDirect3DTexture8 *texture);
+
 #endif /* XBOXRECOMP_HLE_D3D8_RECORD_H */
+

@@ -116,11 +116,57 @@ static DWORD hash_blend_states(const DWORD *rs)
            (rs[D3DRS_COLORWRITEENABLE] << 16);
 }
 
-static DWORD hash_raster_states(const DWORD *rs, BOOL scissor)
+/* NV2A polygon-offset bias is an OpenGL-style unit count (one unit is one
+ * minimum depth step). D3D11's DepthBias is that same count on a UNORM
+ * depth buffer. A non-finite or absurd value is no offset. */
+static float poly_float(DWORD bits)
 {
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+static int poly_bias_units(float f)
+{
+    if (!(f > -1.0e6f && f < 1.0e6f))
+        return 0;
+    if (f >= 0.0f)
+        return (int)(f + 0.5f);
+    return (int)(f - 0.5f);
+}
+
+/* The offset applies only while the enable for this fill mode is set.
+ * NV2A leaves all three off, so a draw that never asked for offset stays
+ * unbiased. */
+static void poly_offset(const DWORD *rs, float *slope, int *bias)
+{
+    DWORD enable;
+    float s, b;
+
+    switch (rs[D3DRS_FILLMODE]) {
+    case D3DFILL_POINT:     enable = rs[D3DRS_POLY_POINT]; break;
+    case D3DFILL_WIREFRAME: enable = rs[D3DRS_POLY_LINE]; break;
+    default:                enable = rs[D3DRS_POLY_FILL]; break;
+    }
+    s = poly_float(rs[D3DRS_POLY_SLOPE]);
+    b = poly_float(rs[D3DRS_POLY_BIAS]);
+    if (!enable || !(s > -1.0e6f && s < 1.0e6f))
+        s = 0.0f;
+    if (!enable)
+        b = 0.0f;
+    *slope = s;
+    *bias = enable ? poly_bias_units(b) : 0;
+}
+
+static DWORD hash_raster_states(const DWORD *rs, BOOL scissor, float slope, int bias)
+{
+    DWORD sb;
+    memcpy(&sb, &slope, sizeof sb);
     return rs[D3DRS_CULLMODE] ^
            (rs[D3DRS_FILLMODE] << 4) ^
-           (scissor ? 0x100u : 0u);
+           (scissor ? 0x100u : 0u) ^
+           (sb * 0x9E3779B1u) ^
+           ((DWORD)bias * 0x85EBCA77u);
 }
 
 /* ================================================================
@@ -208,10 +254,67 @@ static int depth_clamp(void)
     return on;
 }
 
+/* The values Forza actually writes, a few distinct ones, so a bias that
+ * rounds away to nothing (a tiny fraction) is visible in the log. */
+static void note_poly_offset(const DWORD *rs, float slope, int bias)
+{
+    static DWORD seen_s[16], seen_b[16], seen_e[16];
+    static int n;
+    static DWORD tick;
+    static unsigned long draws, enabled;
+    DWORD e, now;
+    int i;
+    float raw_s, raw_b;
+
+    draws++;
+    if (slope != 0.0f || bias != 0)
+        enabled++;
+    raw_s = poly_float(rs[D3DRS_POLY_SLOPE]);
+    raw_b = poly_float(rs[D3DRS_POLY_BIAS]);
+    e = rs[D3DRS_POLY_POINT] | (rs[D3DRS_POLY_LINE] << 1) |
+        (rs[D3DRS_POLY_FILL] << 2) | (rs[D3DRS_FILLMODE] << 8);
+    if ((rs[D3DRS_POLY_SLOPE] || rs[D3DRS_POLY_BIAS] || e) && n < 16) {
+        for (i = 0; i < n; i++)
+            if (seen_s[i] == rs[D3DRS_POLY_SLOPE] &&
+                seen_b[i] == rs[D3DRS_POLY_BIAS] && seen_e[i] == e)
+                break;
+        if (i == n) {
+            seen_s[n] = rs[D3DRS_POLY_SLOPE];
+            seen_b[n] = rs[D3DRS_POLY_BIAS];
+            seen_e[n] = e;
+            n++;
+            fprintf(stderr, "[HLE-D3D8] polygon offset: slope %g (0x%08lX) "
+                    "bias %g (0x%08lX) -> depth %d slope %g, fill %lu, "
+                    "enable point/line/solid %lu/%lu/%lu\n",
+                    raw_s, (unsigned long)rs[D3DRS_POLY_SLOPE],
+                    raw_b, (unsigned long)rs[D3DRS_POLY_BIAS],
+                    bias, slope, (unsigned long)rs[D3DRS_FILLMODE],
+                    (unsigned long)rs[D3DRS_POLY_POINT],
+                    (unsigned long)rs[D3DRS_POLY_LINE],
+                    (unsigned long)rs[D3DRS_POLY_FILL]);
+        }
+    }
+    now = GetTickCount();
+    if (!tick)
+        tick = now;
+    if (now - tick < 5000u)
+        return;
+    fprintf(stderr, "[POLY] %lu draws, offset on for %lu\n", draws, enabled);
+    tick = now;
+    draws = 0;
+    enabled = 0;
+}
+
 static void update_rasterizer_state(const DWORD *rs, BOOL scissor)
 {
-    DWORD hash = hash_raster_states(rs, scissor);
+    float slope;
+    int bias;
+    DWORD hash;
     RhiRasterDesc rd;
+
+    poly_offset(rs, &slope, &bias);
+    note_poly_offset(rs, slope, bias);
+    hash = hash_raster_states(rs, scissor, slope, bias);
 
     if (hash == g_last_raster_hash && g_raster_state) return;
     g_last_raster_hash = hash;
@@ -243,6 +346,12 @@ static void update_rasterizer_state(const DWORD *rs, BOOL scissor)
     rd.scissor = scissor ? 1 : 0;
     rd.multisample = 0;
     rd.antialiased_lines = 0;
+    /* Pulls a coplanar decal toward the camera when the title's bias is
+     * negative, which is the usual "draw this on top of the road" offset.
+     * The sign matches OpenGL and D3D11: positive bias increases depth. */
+    rd.depth_bias = bias;
+    rd.slope_scaled_depth_bias = slope;
+    rd.depth_bias_clamp = 0.0f;
 
     g_raster_state = rhi_raster_state_create(&rd);
     if (!g_raster_state)
@@ -366,7 +475,7 @@ void d3d8_states_apply_sampler(DWORD stage)
         tss[D3DTSS_MIPFILTER]);
     sd.address_u = d3d8_to_rhi_address(tss[D3DTSS_ADDRESSU] ? tss[D3DTSS_ADDRESSU] : D3DTADDRESS_WRAP);
     sd.address_v = d3d8_to_rhi_address(tss[D3DTSS_ADDRESSV] ? tss[D3DTSS_ADDRESSV] : D3DTADDRESS_WRAP);
-    sd.address_w = RHI_ADDRESS_WRAP;
+    sd.address_w = d3d8_to_rhi_address(tss[D3DTSS_ADDRESSW] ? tss[D3DTSS_ADDRESSW] : D3DTADDRESS_WRAP);
     sd.max_anisotropy = tss[D3DTSS_MAXANISOTROPY] ? tss[D3DTSS_MAXANISOTROPY] : 1;
 
     /* What a BORDER stage reads outside 0..1: the title's D3DTSS_BORDERCOLOR

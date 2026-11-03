@@ -311,6 +311,12 @@ def main():
                         help="JSON list of addresses to emit an entry trace "
                              "for (RECOMP_TRACE_ENTER). For bring-up: shows "
                              "which call in an init chain is not returning")
+    parser.add_argument("--regpromote", metavar="FILE",
+                        help="JSON list of function addresses (or \"all\") "
+                             "whose guest registers are kept in C locals "
+                             "(tools/recomp/regpromote.py). A title lists its "
+                             "profile's hottest functions; scripts/recompile.py "
+                             "passes config/regpromote/<TITLEID>.json")
     parser.add_argument("--trace-all-entries", action="store_true",
                         help="Emit an entry hook in every function. With "
                              "RECOMP_TRACE_PROFILE set at run time this reports "
@@ -381,6 +387,8 @@ def main():
     print(f"Loading data files...", file=sys.stderr)
     t0 = time.time()
 
+    from . import regpromote as _regpromote
+    _promote = _regpromote.load(args.regpromote)
     translator = BatchTranslator(
         xbe_path=args.xbe_path,
         func_json_path=data_files["functions"],
@@ -401,6 +409,11 @@ def main():
                 os.path.dirname(os.path.abspath(__file__)), "output"),
             "icall_sites.json"),
     )
+    translator.translator.regpromote = _promote
+    if _promote:
+        print(f"Register promotion: "
+              f"{'every function' if _promote == 'all' else f'{len(_promote)} function(s)'} "
+              f"({args.regpromote})", file=sys.stderr)
 
     t_load = time.time() - t0
     print(f"Loaded {len(translator.func_db)} functions, "

@@ -98,6 +98,9 @@ static const char g_vs_source[] =
     "    float4 tex3     : TEXCOORD3;\n"
     "    float  fog      : TEXCOORD4;\n"
     "    float4 viewpos  : TEXCOORD5;\n"   /* view-space position (per-pixel fog) */
+    /* d3d8_vsh.c, oWDep: zero here, nothing to write */
+    "    float4 wdep     : XBOXWDEPTH0;\n"
+    "    float4 wlin     : XBOXWLINEAR0;\n"
     /* Vulkan: a vertex stage feeding a point list must write the point
      * size, where D3D11 has none (every point is one pixel). __spirv__ is
      * DXC's own macro for a SPIR-V compile, so D3DCompile never sees this,
@@ -172,6 +175,8 @@ static const char g_vs_source[] =
     "    o.fog = 1.0;\n"
     "    o.specular = float4(0, 0, 0, 0);\n"
     "    o.viewpos = float4(0, 0, 0, 1);\n"
+    "    o.wdep = float4(0, 0, 0, 0);\n"
+    "    o.wlin = float4(0, 0, 0, 0);\n"
     "\n"
     "    if (Flags & FLAG_PRETRANSFORMED) {\n"
     "        o.pos.x = (input.pos.x / ScreenSize.x) * 2.0 - 1.0;\n"
@@ -322,6 +327,8 @@ static const char g_ps_body[] =
     "    float4 tex3     : TEXCOORD3;\n"
     "    float  fog      : TEXCOORD4;\n"
     "    float4 viewpos  : TEXCOORD5;\n"
+    "    float4 wdep     : XBOXWDEPTH0;\n"
+    "    noperspective float4 wlin : XBOXWLINEAR0;\n"
     "};\n"
     "\n"
     "// D3DFOGMODE: 0=NONE, 1=EXP, 2=EXP2, 3=LINEAR\n"
@@ -394,7 +401,10 @@ static const char g_ps_body[] =
     "    return a1 * a2;\n"  /* fallback = MODULATE */
     "}\n"
     "\n"
-    "float4 main(PS_IN input) : SV_TARGET {\n"
+    "float4 main(PS_IN input, out float o_depth : SV_Depth) : SV_TARGET {\n"
+    /* d3d8_vsh.c, d3d8_vsh_wdepth_on: under a program, a W-buffered
+     * draw's exact w; zero correction from the fixed-function stage. */
+    "    o_depth = input.pos.z - input.wdep.y * max(input.wlin.x - input.wdep.x, 0.0);\n"
     "    float4 current = input.diffuse;\n"
     "    float4 texels[4];\n"
     "\n"

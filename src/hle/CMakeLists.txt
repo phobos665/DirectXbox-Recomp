@@ -11,6 +11,11 @@ if(MSVC)
     # /Zi so the PDB names this library's static functions in a sampled
     # profile (RECOMP_SAMPLE); see src/kernel/CMakeLists.txt.
     add_compile_options(/Zi)
+elseif(WIN32)
+    # The same for the clang driver, which is not MSVC: without CodeView
+    # info a profile credits shadow_expand_vertices, shadow_wndproc and every
+    # other static in hle_d3d8.c to hle_d3d8_shadow_swaps.
+    add_compile_options(-g -gcodeview)
 endif()
 
 add_library(xbox_hle STATIC

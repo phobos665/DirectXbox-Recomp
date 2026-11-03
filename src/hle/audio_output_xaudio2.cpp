@@ -73,8 +73,14 @@ struct Submix {
 };
 constexpr uint32_t kSubmixCount = 32;
 
-/* Voices may play up to this much faster than they are submitted. */
-constexpr float kMaxFrequencyRatio = 8.0f;
+/* The source voice is created at the buffer's original rate. Pitch and
+ * Doppler are a frequency ratio from that, and the output clock
+ * (hle_dsound.c) submits at the pitched rate. XAudio2 accepts
+ * 1/XAUDIO2_MAX_FREQ_RATIO .. XAUDIO2_MAX_FREQ_RATIO. A cap of 8 played a
+ * 22050 Hz buffer no slower than 2756 Hz, while Forza's idle loop is clocked
+ * at 1000 Hz, so the voice consumed the loop about three times as fast as
+ * the clock submitted it and the slot ran dry every few pumps. */
+constexpr float kMaxFrequencyRatio = XAUDIO2_MAX_FREQ_RATIO;
 
 std::atomic<HRESULT> critical_error{S_OK};
 
@@ -804,6 +810,10 @@ extern "C" int recomp_audio_output_submit(
     if (voice.fed && state.BuffersQueued == 0) {
         ++voice.starved;
         ++starved_total;
+        /* A source voice that runs out of buffers stops, and the next
+         * SubmitSourceBuffer stays queued until Start. Without this the
+         * looping voice is silent from the first underrun on. */
+        voice.source->Start();
     }
     {
         const unsigned long long now = GetTickCount64();

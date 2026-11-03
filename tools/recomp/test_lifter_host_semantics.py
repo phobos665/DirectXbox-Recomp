@@ -18,6 +18,7 @@ The emitted text is checked, and then compiled and run on this host against
 Intel SDM results. On an x86 host the run exercises the SSE instructions; on
 AArch64 it exercises the portable fallbacks -- the half that matters there.
 """
+import os
 import shutil
 import subprocess
 import tempfile
@@ -263,7 +264,8 @@ def test_helpers_and_lowerings_match_x86_on_this_host():
         built = subprocess.run(
             [cc, "-std=gnu11", "-O2", "-Wall", "-Wno-unused-function",
              "-Wno-unused-variable", "-Wno-unused-but-set-variable",
-             "-I", str(_ROOT / "templates" / "runtime"), str(src), "-o", str(exe), "-lm"],
+             "-I", str(_ROOT / "templates" / "runtime"), str(src), "-o", str(exe)]
+            + ([] if os.name == "nt" else ["-lm"]),
             capture_output=True, text=True)
         assert built.returncode == 0, built.stderr[-4000:]
         ran = subprocess.run([str(exe)], capture_output=True, text=True)
