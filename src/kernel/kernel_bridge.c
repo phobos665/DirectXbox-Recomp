@@ -5461,6 +5461,65 @@ static int bridge_scsi_mode_sense_security(uint32_t sptd_va)
     return 1;
 }
 
+/* The disc's security sector, as a later XAPI's start-up check reads it.
+ *
+ * From XDK 5xxx a certificate can ask for more than the security page: when
+ * bit 0 of the dword at certificate +0x1D8 is set (the certificate is long
+ * enough to have one), XAPI follows the MODE SENSE above with READ DVD
+ * STRUCTURE (0xAD) for address 0xFF02FDFF, layer 0xFE, 0x664 bytes -- the
+ * security sector -- and accepts the disc only if, in the buffer it read:
+ *   - the dword at +0x4AB is the certificate's timestamp (+4),
+ *   - SHA-1 of the length 0x4CB (as a dword) and then 0x4CB bytes from +4
+ *     is the 20 bytes at +0x4CF, and
+ *   - XcVerifyPKCS1Signature accepts the signature at +0x4E3 for it, which
+ *     this kernel always does (bridge_XcVerifyPKCS1Signature).
+ * Otherwise it is XLaunchNewImage(NULL), five tries later. Tony Hawk's
+ * Underground's certificate sets the bit; it rebooted into itself three
+ * times and gave up. Measured in its XAPI (sub_00178F81, sub_00178ECA).
+ *
+ * A disc image has no security sector to give, so this one is made for the
+ * title that is running, as the page above says "authenticated": the
+ * timestamp and the digest, everything else zero. */
+#define SCSI_READ_DVD_STRUCTURE 0xADu
+#define DVD_SECURITY_ADDRESS    0xFF02FDFFu
+#define SS_TIMESTAMP            0x4ABu
+#define SS_HASHED_LEN           0x4CBu
+#define SS_DIGEST               0x4CFu
+#define SS_BYTES                0x664u
+
+static int bridge_scsi_read_security_sector(uint32_t sptd_va)
+{
+    uint32_t buf_va = BRIDGE_MEM32(sptd_va + SPTD_DATA_BUFFER);
+    uint32_t len    = BRIDGE_MEM32(sptd_va + SPTD_DATA_LENGTH);
+    uint32_t cdb    = sptd_va + SPTD_CDB;
+    uint32_t addr   = ((uint32_t)BRIDGE_MEM8(cdb + 2) << 24) |
+                      ((uint32_t)BRIDGE_MEM8(cdb + 3) << 16) |
+                      ((uint32_t)BRIDGE_MEM8(cdb + 4) << 8) | BRIDGE_MEM8(cdb + 5);
+    uint32_t cert_va = BRIDGE_MEM32(0x00010118u);   /* XBE header: certificate */
+    static uint8_t ss[SS_BYTES];
+    XBOX_SHA_CONTEXT sha;
+    uint32_t hashed = SS_HASHED_LEN, i;
+
+    if (addr != DVD_SECURITY_ADDRESS || !buf_va || !cert_va ||
+        len < SS_DIGEST + 20)
+        return 0;
+    memset(ss, 0, sizeof ss);
+    ss[0] = (uint8_t)((SS_BYTES - 2) >> 8);    /* structure header: length */
+    ss[1] = (uint8_t)(SS_BYTES - 2);
+    i = BRIDGE_MEM32(cert_va + 4);             /* TimeDate */
+    memcpy(ss + SS_TIMESTAMP, &i, 4);
+    xbox_XcSHAInit(&sha);
+    xbox_XcSHAUpdate(&sha, (const UCHAR *)&hashed, 4);
+    xbox_XcSHAUpdate(&sha, ss + 4, SS_HASHED_LEN);
+    xbox_XcSHAFinal(&sha, ss + SS_DIGEST);
+    if (len > SS_BYTES)
+        len = SS_BYTES;
+    for (i = 0; i < len; i++)
+        BRIDGE_MEM8(buf_va + i) = ss[i];
+    BRIDGE_MEM8(sptd_va + SPTD_SCSI_STATUS) = 0;   /* SCSISTAT_GOOD */
+    return 1;
+}
+
 /* The retail hard disk, in the units DISK_GEOMETRY reports. Deliberately the
  * same geometry kernel_path.c writes into the partition table it synthesises,
  * so a title that reads both sees one disk rather than two. */
@@ -5494,6 +5553,15 @@ static void bridge_NtDeviceIoControlFile(void)
             if (!said++)
                 fprintf(stderr, "  [FILE] DVD security page read: "
                                 "reporting an authenticated Xbox disc\n");
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+        if (opcode == SCSI_READ_DVD_STRUCTURE && bridge_scsi_read_security_sector(in_va)) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [FILE] DVD security sector read: answered with one "
+                                "made for this title's certificate\n");
             bridge_write_iostatus(ios_va, 0, in_len);
             g_eax = 0;
             return;
