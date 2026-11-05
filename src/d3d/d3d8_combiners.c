@@ -888,8 +888,18 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
 
     /* The fog unit, which runs before the combiners: the factor their fog
      * register's alpha holds. d3d8_shaders.c's compute_pfog and program_fog
-     * do the same for the fixed-function pixel path. */
+     * do the same for the fixed-function pixel path.
+     *
+     * With fog disabled the fog unit gives a factor of 1, no fog, whatever
+     * the vertex stage wrote (xemu, pgraph/glsl/vsh.c: oFog = 1.0 when fog
+     * is off). A final combiner reads the fog register either way, and some
+     * do more with it than the XDK's standard fog: Tony Hawk's
+     * Underground's skater shaders compute (1 - fog.a) * FC0 as a
+     * per-channel fog weight, with FC0 = 0x80008000, and draw with fog off.
+     * Taken from the vertex fog of 0, that pulled the green channel halfway
+     * to the fog colour on every skater: magenta skin, purple clothes. */
     EMIT("float fog_factor(PS_IN input) {\n");
+    EMIT("    if (fog_enable == 0u) return 1.0;\n");
     EMIT("    if (fog_src.x == 0u) return saturate(input.fog);\n");
     EMIT("    float d = input.fog;\n");
     EMIT("    if (fog_src.x == 2u) d = fog_src.y ? length(input.viewpos.xyz) : -input.viewpos.z;\n");
