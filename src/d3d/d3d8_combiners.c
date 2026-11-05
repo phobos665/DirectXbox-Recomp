@@ -675,8 +675,14 @@ static int emit_shadow_compare(char *buf, int bufsize, int *poff, int i)
     EMIT("        float4 q = input.tc%d;\n", i);
     EMIT("        float qw = abs(q.w) > 1e-20 ? q.w : 1.0;\n");
     EMIT("        float2 uv = q.xy / qw * tex_scale[%d].xy;\n", i);
-    EMIT("        float ref = q.z / qw;\n");
+    /* The reference is clamped to the depth format's range, as a
+     * fixed-point depth compare is (xemu's, through GL's shadow samplers,
+     * clamps it the same way): a receiver past the light's far plane
+     * compares as the far plane and is lit by a cleared map. Unclamped,
+     * every ground polygon THUG projects its skater's shadow onto that
+     * reaches beyond the shadow camera's range came out solid dark. */
     EMIT("        float m = shadow_max[%d];\n", i);
+    EMIT("        float ref = clamp(q.z / qw, 0.0, m);\n");
     EMIT("        float2 sz; tex%d.GetDimensions(sz.x, sz.y);\n", i);
     EMIT("        float2 p = uv * sz - 0.5;\n");
     EMIT("        float2 f = frac(p);\n");
