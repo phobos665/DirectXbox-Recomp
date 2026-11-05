@@ -2698,6 +2698,17 @@ HLE_EXPORT(Direct3D_CreateDevice)
         shadow_create(pp_va);
 }
 
+/* The device depth's latest whole clear (D3DDevice_Clear with no
+ * rectangles while it was bound): its number and its values. A scratch
+ * depth that stands in for the device depth behind an offscreen target
+ * the host cannot pair it with is given the same clear before it is used
+ * (devz_stand_in), as the console's target would find that memory. */
+static IDirect3DSurface8 *g_bound_depth_host;
+static unsigned long      g_devz_clears;
+static DWORD              g_devz_flags;
+static float              g_devz_z;
+static DWORD              g_devz_stencil;
+
 /* HRESULT D3DDevice_Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags,
  *     D3DCOLOR Color, float Z, DWORD Stencil)                               */
 HLE_EXPORT(D3DDevice_Clear)
@@ -2728,6 +2739,12 @@ HLE_EXPORT(D3DDevice_Clear)
          * so more go in batches of 64 -- clearing is order-independent. */
         if (!count || !rects) {
             host_Clear(g_shadow, 0, NULL, xbox_clear_flags_to_host(flags), color, z, stencil);
+            if ((flags & 0x3u) && g_bound_depth_host && g_bound_depth_host == g_device_depth) {
+                g_devz_clears++;
+                g_devz_flags = xbox_clear_flags_to_host(flags & 0x3u);
+                g_devz_z = z;
+                g_devz_stencil = stencil;
+            }
         } else {
             D3DRECT rect[64];
             uint32_t done = 0;
@@ -5191,7 +5208,7 @@ int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va,
  * into, are defined with the viewport constants above. */
 
 static struct { UINT width, height; IDirect3DTexture8 *texture; } g_scratch[SHADOW_SCRATCH];
-static struct { UINT width, height; IDirect3DSurface8 *surface; } g_depths[SHADOW_SCRATCH];
+static struct { UINT width, height; IDirect3DSurface8 *surface; unsigned long devz; } g_depths[SHADOW_SCRATCH];
 
 static void surface_measure(uint32_t va, UINT *w, UINT *h, uint32_t *fmt)
 {
@@ -5266,6 +5283,43 @@ static IDirect3DSurface8 *depth_surface(UINT w, UINT h)
         return g_depths[i].surface;
     }
     return NULL;
+}
+
+/* A scratch depth bound where the title named the device's own depth:
+ * an offscreen target the host cannot pair with the device depth because
+ * their host sizes differ: the device depth is supersampled with the scene
+ * (RECOMP_RES_SCALE) and a title's own render target texture is not. On
+ * the console that target tests against
+ * the device depth's memory, which the title cleared at the start of its
+ * frame; the scratch never saw that clear, so give it the latest one,
+ * once per clear. Tony Hawk's Underground draws its menus into a 640x480
+ * texture with the device depth during a transition, and with the scratch
+ * left as it was, every 3D draw failed its depth test: the skater and the
+ * city behind the menu were missing and that half of the screen faded to
+ * black. RECOMP_HLE_D3D8_DEVZ_STAND_IN=0 for the old behaviour. */
+static void devz_stand_in(IDirect3DSurface8 *depth)
+{
+    static int on = -1;
+    int i;
+
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_DEVZ_STAND_IN", 1);
+    if (!on || !g_devz_clears)
+        return;
+    for (i = 0; i < SHADOW_SCRATCH; i++) {
+        if (g_depths[i].surface != depth)
+            continue;
+        if (g_depths[i].devz != g_devz_clears) {
+            static int said;
+            g_depths[i].devz = g_devz_clears;
+            host_Clear(g_shadow, 0, NULL, g_devz_flags, 0, g_devz_z, g_devz_stencil);
+            if (!said++)
+                fprintf(stderr, "[HLE-D3D8] an offscreen target named the device depth and "
+                        "the host cannot pair them: its stand-in depth is given the device "
+                        "depth's clear (z %g)\n", (double)g_devz_z);
+        }
+        return;
+    }
 }
 
 static int shadow_maps_on(void)
@@ -5375,6 +5429,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     UINT w, h, zw = 0, zh = 0, face = 0, level = 0;
     uint32_t fmt, zfmt = 0, parent;
     int kind, i;                         /* 0 back buffer, 1 texture, 2 scratch, 3 cube */
+    int stand_in = 0;                    /* a scratch depth in the device depth's place */
 
     /* A NULL target keeps the current one; only the depth surface changes. */
     if (!rt)
@@ -5604,8 +5659,10 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         if (!depth && kind != 0 && kind != 3 && own && g_device_depth && texture &&
             share_device_depth_on() && device_depth_fits(texture, level))
             depth = g_device_depth;
-        if (!depth)
+        if (!depth) {
             depth = depth_surface(w, h);
+            stand_in = own && kind != 0 && depth != NULL;
+        }
         g_target_shadow_map = depth && depth_texture_of(zs) && zw == w && zh == h &&
                               shadow_maps_on() && kind != 0;
     } else {
@@ -5653,6 +5710,9 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             host_SetRenderTarget(g_shadow, NULL, 0, 0, depth);
         }
     }
+    g_bound_depth_host = depth;
+    if (stand_in && depth)
+        devz_stand_in(depth);
     g_target_width = w;
     g_target_height = h;
     g_bound_kind = kind;
