@@ -167,6 +167,7 @@ static unsigned long g_held_refreshes;
 /* Stage 0 currently holds the title's own frame; see SetTexture below and
  * hle_d3d8_stage0_is_framebuffer(). */
 static int g_stage0_framebuffer;
+static uint32_t g_stage0_fb_size;   /* its Size word, when it is the frame buffer */
 
 static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev);
 
@@ -2193,9 +2194,11 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
              * so it identifies them without matching a shader or a size. */
             int i;
             g_stage0_framebuffer = 0;
+            g_stage0_fb_size = 0;
             for (i = 0; host && i < g_texture_count; i++)
                 if (g_textures[i].host == host && g_textures[i].framebuffer == FB_SCREEN) {
                     g_stage0_framebuffer = 1;
+                    g_stage0_fb_size = texture ? obj_field(texture, 16) : 0;
                     break;
                 }
         }
@@ -2239,6 +2242,17 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
 int hle_d3d8_stage0_is_framebuffer(void)
 {
     return g_stage0_framebuffer;
+}
+
+/* The title's size of the frame buffer bound at stage 0, from its Size
+ * word; 0 when stage 0 is not the frame buffer or says no size. */
+int hle_d3d8_stage0_framebuffer_size(unsigned *w, unsigned *h)
+{
+    if (!g_stage0_framebuffer || !g_stage0_fb_size)
+        return 0;
+    *w = (g_stage0_fb_size & 0xFFFu) + 1u;
+    *h = ((g_stage0_fb_size >> 12) & 0xFFFu) + 1u;
+    return 1;
 }
 
 HLE_ORIGINAL(D3DDevice_SetPalette);

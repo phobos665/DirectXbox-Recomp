@@ -120,6 +120,10 @@ typedef struct D3D8TextureInfo {
 } D3D8TextureInfo;
 BOOL d3d8_texture_info(IDirect3DBaseTexture8 *texture, D3D8TextureInfo *info);
 
+/* d3d8_device.c: the host size of a screen-sized colour render target, drawn
+ * at the scene's supersampling; FALSE for any other size. */
+BOOL d3d8_scene_target_size(UINT w, UINT h, UINT *host_w, UINT *host_h);
+
 /* A cube texture's shape, for frame capture. TRUE only for a cube, so this
  * doubles as the type test against d3d8_texture_info. */
 typedef struct D3D8CubeInfo {

@@ -1457,6 +1457,21 @@ static void d3d8_upload_mip_level(RhiImage *image, D3DFORMAT fmt,
 
     if (!rhi_device_ready() || !image) return;
 
+    /* A render target supersampled with the scene holds what the GPU drew,
+     * at more pixels than the title's copy: nothing of the title's size goes
+     * into it. */
+    {
+        RhiImageDesc d;
+        UINT mips, mip, lw;
+
+        rhi_image_get_desc(image, &d);
+        mips = d.mip_levels ? d.mip_levels : 1;
+        mip = subresource % mips;
+        lw = d.width >> mip ? d.width >> mip : 1;
+        if (d.width && lw != w && (d.bind & RHI_BIND_RENDER_TARGET))
+            return;
+    }
+
     /* Step 1: unswizzle swizzled formats into linear storage. */
     if (!d3d8_format_is_compressed(fmt) && d3d8_format_is_swizzled(fmt)) {
         linear = (BYTE *)malloc((size_t)w * h * bpp);
@@ -1619,6 +1634,19 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
         }
     }
 
+    /* A colour target the size of the title's screen is drawn at the
+     * scene's supersampling (d3d8_scene_target_size): the title renders a
+     * whole frame into it and puts that on the screen. The texture keeps the
+     * title's size everywhere else; only its host image is larger. */
+    if (want_srv && (Usage & D3DUSAGE_RENDERTARGET) && tex->levels == 1) {
+        UINT hw, hh;
+
+        if (d3d8_scene_target_size(Width, Height, &hw, &hh)) {
+            td.width = hw;
+            td.height = hh;
+        }
+    }
+
     tex->image = rhi_image_create(&td, NULL);
     if (!tex->image) {
         fprintf(stderr, "D3D8: CreateTexture2D failed (fmt=%d %ux%u, %u level(s), usage 0x%X)\n",
@@ -1736,6 +1764,21 @@ BOOL d3d8_format_is_linear(D3DFORMAT fmt)
 
 /* Level-0 size of a 2D texture; FALSE for a cube or volume texture, whose
  * coordinates are never in texels. */
+BOOL xbox_D3D8TextureHostSize(IDirect3DTexture8 *texture, UINT level, UINT *width,
+                              UINT *height)
+{
+    D3D8Texture *t = (D3D8Texture *)texture;
+    RhiImageDesc d;
+
+    if (!texture || IDirect3DBaseTexture8_GetType((IDirect3DBaseTexture8 *)texture) !=
+            D3DRTYPE_TEXTURE || !t->image || level >= t->levels)
+        return FALSE;
+    rhi_image_get_desc(t->image, &d);
+    if (width)  *width = d.width >> level ? d.width >> level : 1;
+    if (height) *height = d.height >> level ? d.height >> level : 1;
+    return TRUE;
+}
+
 BOOL d3d8_base_size(IDirect3DBaseTexture8 *texture, UINT *width, UINT *height)
 {
     D3D8Texture *t;
