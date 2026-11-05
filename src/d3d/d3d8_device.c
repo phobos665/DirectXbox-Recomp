@@ -2373,8 +2373,15 @@ static BOOL draw_is_screen_pass(void)
         return TRUE;
     /* Up to 4x4: Gladius keeps a 4x4 white texture bound for its
      * untextured quads, its fades and cutscene letterbox bars among them,
-     * and at 1x1 they stayed in the centred 4:3 box. */
-    return d3d8_base_size(tex, &w, &h) && w <= 4 && h <= 4;
+     * and at 1x1 they stayed in the centred 4:3 box.
+     *
+     * Or a ramp, at most 8 texels across one way: a colour gradient, not a
+     * picture, which stretching distorts nothing of. Tony Hawk's
+     * Underground tints the paused game through a 256x4 texture on a
+     * full-screen quad, and kept in the box it left the sides of the
+     * picture untinted. A real 4:3 picture over the whole screen (a loading
+     * screen) has two real dimensions and still stays in the box. */
+    return d3d8_base_size(tex, &w, &h) && (w <= 8 || h <= 8);
 }
 
 /* Does this draw cover the guest's full width, and so escape the 2D
