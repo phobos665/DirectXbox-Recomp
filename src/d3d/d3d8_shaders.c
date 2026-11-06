@@ -523,10 +523,13 @@ static const char g_ps_end[] =
  * Texture object declarations must match the dimension of the SRV bound
  * at each stage, otherwise D3D11 fails to sample it correctly.
  * Above them, FF_PS_SIG_ALPHA_TEST: the alpha test can reject
- * (d3d8_alpha_test_can_reject), and only then is it in the shader.
+ * (d3d8_alpha_test_can_reject), and only then is it in the shader. Above
+ * that, FF_PS_SIG_ALPHA_KILL(i): stage i's D3DTSS_ALPHAKILL, a texel with
+ * alpha 0 discarding the fragment (xemu psh.c), for a stage with a texture.
  */
 #define FF_PS_SRC_SIZE 16384
 #define FF_PS_SIG_ALPHA_TEST 0x100u
+#define FF_PS_SIG_ALPHA_KILL(i) (0x200u << (i))
 
 static void build_ps_source(UINT sig, char *buf, int bufsize)
 {
@@ -553,6 +556,9 @@ static void build_ps_source(UINT sig, char *buf, int bufsize)
         /* Xbox A8 samples white RGB; DXGI A8 supplies zero RGB. */
         off += snprintf(buf + off, bufsize - off,
                         "    if (AlphaOnly[%d]) texels[%d].rgb = 1.0;\n", i, i);
+        if (sig & FF_PS_SIG_ALPHA_KILL(i))
+            off += snprintf(buf + off, bufsize - off,
+                            "    if (texels[%d].a == 0.0) discard;\n", i);
     }
     off += snprintf(buf + off, bufsize - off, "%s", g_ps_tail);
     if (sig & FF_PS_SIG_ALPHA_TEST)
@@ -653,6 +659,11 @@ static UINT ff_ps_compute_signature(void)
             else if (type == D3DRTYPE_VOLUMETEXTURE) dim = 2;
         }
         sig |= dim << (i * 2);
+        if (tex) {
+            const DWORD *tss = d3d8_GetTSS((DWORD)i);
+            if (tss && tss[D3DTSS_ALPHAKILL])
+                sig |= FF_PS_SIG_ALPHA_KILL(i);
+        }
     }
     return sig;
 }

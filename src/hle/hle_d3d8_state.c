@@ -47,8 +47,8 @@
  * EDGEANTIALIAS, BLENDCOLOR, the back-face material and two-sided lighting
  * states, point sprite and multisample states, and the
  * texture stage states ADDRESSW, BUMPENVLSCALE/LOFFSET,
- * COLORKEYOP, COLORSIGN, ALPHAKILL, COLORKEYCOLOR, COLORARG0 (its host number
- * is ALPHAKILL's) and ALPHAARG0.
+ * COLORKEYOP, COLORSIGN, COLORKEYCOLOR, COLORARG0 (its host number is
+ * ALPHAKILL's, which is forwarded) and ALPHAARG0.
  */
 #include "platform/xbox_winnt.h"
 #include <stdio.h>
@@ -480,6 +480,7 @@ static const struct {
     {  6, D3DTSS_MIPMAPLODBIAS, TS_AS_IS },
     {  7, D3DTSS_MAXMIPLEVEL,   TS_AS_IS },
     {  8, D3DTSS_MAXANISOTROPY, TS_AS_IS },
+    { 11, D3DTSS_ALPHAKILL,     TS_AS_IS },  /* D3DTALPHAKILL_ENABLE is 4 */
     { 12, D3DTSS_COLOROP,       TS_OP },
     { 14, D3DTSS_COLORARG1,     TS_AS_IS },  /* D3DTA_* match the PC's */
     { 15, D3DTSS_COLORARG2,     TS_AS_IS },
