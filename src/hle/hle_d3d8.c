@@ -3623,6 +3623,31 @@ static int xbox_vsdt_expanded(uint32_t format, UINT *size)
     }
 }
 
+/* An X_D3DVSDT format the host can fetch as integers for the program to
+ * convert (d3d8_vsh.c, g_emit_input_kind): the unnormalised shorts whose
+ * widths DXGI has, and NORMPACKED3 as one 32-bit word. A register in one of
+ * these on the draw's own stream, at an aligned offset, is read in place
+ * instead of being unpacked on the CPU for every vertex of every draw
+ * (shadow_expand_vertices). SHORT3, NORMSHORT3 and PBYTE3 have no format of
+ * their width and are still unpacked. RECOMP_D3D8_VS_INT_INPUTS=0 unpacks
+ * these too, as before. */
+static int xbox_vsdt_integer(uint32_t format, RhiFormat *f, UINT *size)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_D3D8_VS_INT_INPUTS", 1);
+    if (!on)
+        return 0;
+    switch (format) {
+    case 0x15: *f = RHI_FORMAT_R16_SINT;           *size = 2; return 1; /* SHORT1 */
+    case 0x25: *f = RHI_FORMAT_R16G16_SINT;        *size = 4; return 1; /* SHORT2 */
+    case 0x45: *f = RHI_FORMAT_R16G16B16A16_SINT;  *size = 8; return 1; /* SHORT4 */
+    case 0x16: *f = RHI_FORMAT_R32_UINT;           *size = 4; return 1; /* NORMPACKED3 */
+    default:   return 0;
+    }
+}
+
 static const RhiFormat FLOATN_FORMAT[5] = {
     RHI_FORMAT_UNKNOWN, RHI_FORMAT_R32_FLOAT, RHI_FORMAT_R32G32_FLOAT,
     RHI_FORMAT_R32G32B32_FLOAT, RHI_FORMAT_R32G32B32A32_FLOAT,
@@ -3790,7 +3815,9 @@ static void shadow_read_declaration(int slot, uint32_t handle)
         decl_attr(p, object, i, &stream, &offset, &format);
         if (format <= 0x02u)
             continue;
-        if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
+        if (stream == base && !(offset & 3u) && xbox_vsdt_integer(format, &dxgi, &size)) {
+            continue;                    /* read in place, as integers */
+        } else if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             packed++;
             shift += (UINT)floats * 4u;
         } else if ((stream != base || (offset & 3u)) &&
@@ -3819,6 +3846,9 @@ static void shadow_read_declaration(int slot, uint32_t handle)
             continue;
         if (stream > 15u || offset > 0xFFFFu) {
             refused = 1;
+        } else if (stream == base && !(offset & 3u) && xbox_vsdt_integer(format, &dxgi, &size)) {
+            in[n].format = dxgi;
+            in[n].offset = offset + shift;
         } else if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             p->packed_offset[packed] = offset;
             p->packed_out[packed] = out;

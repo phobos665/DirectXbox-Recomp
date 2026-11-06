@@ -215,6 +215,17 @@ static int g_bound_pos_input = -1;
 static int g_emit_pos_scale = -1, g_emit_pos_offset = -1;
 static int g_bound_pos_scale = -1, g_bound_pos_offset = -1;
 static int g_emit_temp_const[NV2A_VS_MAX_TEMPS];
+
+/* How each input register arrives, set before a compile from the program's
+ * declaration (decl_input_kinds). The NV2A converts every vertex format to
+ * floats as it fetches; the host has no fetch-time conversion for
+ * unnormalised shorts (DXGI has no SSCALED formats) or for NORMPACKED3, so
+ * those come in as integers and the program converts them itself, instead of
+ * shadow_expand_vertices unpacking every vertex on the CPU (hakuX does the
+ * same, vk/draw.c vat_format). The kind is part of the shader cache key: both
+ * backends require an input's type to match its format. */
+enum { VSH_IN_FLOAT = 0, VSH_IN_SINT = 1, VSH_IN_NORMPACKED3 = 2 };
+static uint8_t g_emit_input_kind[NV2A_VS_MAX_INPUTS];
 static const D3D8VshInput *g_bound_decl;
 static int                 g_bound_decl_count;
 
@@ -789,10 +800,25 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     sb_append(&sb, "struct VS_IN {\n");
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
         if (inputs & (1u << i)) {
-            sb_append(&sb, "    float4 v%d : ATTR%d;\n", i, i);
+            sb_append(&sb, "    %s v%d : ATTR%d;\n",
+                      g_emit_input_kind[i] == VSH_IN_SINT ? "int4"
+                      : g_emit_input_kind[i] == VSH_IN_NORMPACKED3 ? "uint" : "float4",
+                      i, i);
         }
     }
     sb_append(&sb, "};\n\n");
+    /* NORMPACKED3: x and y signed 11 bits over 1023, z signed 10 over 511,
+     * as shadow_expand_vertices unpacks it on the CPU. */
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+        if ((inputs & (1u << i)) && g_emit_input_kind[i] == VSH_IN_NORMPACKED3) {
+            sb_append(&sb,
+                "float4 x_normpacked3(uint p) {\n"
+                "    return float4((float)(asint(p << 21) >> 21) / 1023.0,\n"
+                "                  (float)(asint(p << 10) >> 21) / 1023.0,\n"
+                "                  (float)(asint(p) >> 22) / 511.0, 1.0);\n"
+                "}\n\n");
+            break;
+        }
 
     /* Output structure. The names are the ones the pixel shaders ask for
      * (d3d8_shaders.c and d3d8_combiners.c, PS_IN): fog at TEXCOORD4 and a
@@ -869,8 +895,10 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     sb_append(&sb, "    /* Input registers */\n");
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
         if (inputs & (1u << i)) {
-            sb_append(&sb, "    float4 v%d = xboxVertexFed[%d][%d] != 0 ? input.v%d : "
-                      "xboxVertexData[%d];\n", i, i / 4, i % 4, i, i);
+            const char *pre = g_emit_input_kind[i] == VSH_IN_SINT ? "float4("
+                            : g_emit_input_kind[i] == VSH_IN_NORMPACKED3 ? "x_normpacked3(" : "";
+            sb_append(&sb, "    float4 v%d = xboxVertexFed[%d][%d] != 0 ? %sinput.v%d%s : "
+                      "xboxVertexData[%d];\n", i, i / 4, i % 4, pre, i, *pre ? ")" : "", i);
         }
     }
     sb_append(&sb, "\n");
@@ -1219,7 +1247,7 @@ static VshCacheEntry *cache_insert(uint32_t hash)
  * Returns the cache entry (with compiled VS and blob).
  */
 static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
-                                      uint32_t hash)
+                                      uint32_t hash, const uint8_t *kinds)
 {
     NV2AVshProgram program;
     /* A 136-instruction program runs to about 30 KB of source. Heap, not
@@ -1245,7 +1273,9 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
         g_emit_temp_const[t] = -1;
     memset(g_emit_const_read, 0, sizeof g_emit_const_read);
     g_emit_const_indexed = 0;
+    memcpy(g_emit_input_kind, kinds, sizeof g_emit_input_kind);
     hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, HLSL_BUF);
+    memset(g_emit_input_kind, 0, sizeof g_emit_input_kind);
     if (hlsl_len <= 0 || hlsl_len >= HLSL_BUF - 1) {
         fprintf(stderr, "D3D8 VSH: HLSL generation failed (%d bytes)\n", hlsl_len);
         free(hlsl_buf);
@@ -2006,6 +2036,36 @@ uint16_t d3d8_vsh_inputs_read(DWORD handle)
     return program.inputs_read;
 }
 
+/* Which input registers a declaration feeds as integers (g_emit_input_kind),
+ * and a value to mix into the cache key: 0 when every input is a float, so a
+ * program drawn only through float declarations keeps its microcode hash. */
+static uint32_t decl_input_kinds(const NV2AVshSlot *vsh, uint8_t kind[NV2A_VS_MAX_INPUTS])
+{
+    uint32_t bits = 0;
+    int j;
+
+    memset(kind, 0, NV2A_VS_MAX_INPUTS);
+    for (j = 0; j < vsh->decl_count; j++) {
+        int r = vsh->decl[j].reg;
+        uint8_t k;
+
+        if (r < 0 || r >= NV2A_VS_MAX_INPUTS)
+            continue;
+        switch (vsh->decl[j].format) {
+        case RHI_FORMAT_R16_SINT: case RHI_FORMAT_R16G16_SINT:
+        case RHI_FORMAT_R16G16B16A16_SINT:
+            k = VSH_IN_SINT; break;
+        case RHI_FORMAT_R32_UINT:
+            k = VSH_IN_NORMPACKED3; break;
+        default:
+            k = VSH_IN_FLOAT; break;
+        }
+        kind[r] = k;
+        bits |= (uint32_t)k << (2 * r);
+    }
+    return bits;
+}
+
 BOOL d3d8_vsh_prepare_draw(DWORD handle)
 {
     int slot;
@@ -2015,6 +2075,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     RhiVertexLayout *layout;
     void *mapped;
     uint16_t fed;
+    uint8_t kinds[NV2A_VS_MAX_INPUTS];
 
     if (!d3d8_vsh_is_programmable(handle) || !g_vsh_cb || !g_vsh_vdata_cb)
         return FALSE;
@@ -2040,14 +2101,18 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
         }
     }
 
-    /* The microcode's hash, taken when the program was loaded */
-    hash = vsh->hash;
+    /* The microcode's hash, taken when the program was loaded, and the
+     * declaration's integer inputs when it has any. */
+    {
+        uint32_t kbits = decl_input_kinds(vsh, kinds);
+        hash = kbits ? (vsh->hash ^ (kbits * 0x9E3779B1u)) + 0x7F4A7C15u : vsh->hash;
+    }
 
     /* Look up in cache */
     entry = cache_lookup(hash);
     if (!entry) {
         /* Cache miss: parse, generate HLSL, compile */
-        entry = compile_shader(vsh->microcode, vsh->length, hash);
+        entry = compile_shader(vsh->microcode, vsh->length, hash, kinds);
         if (!entry)
             return FALSE;
     }

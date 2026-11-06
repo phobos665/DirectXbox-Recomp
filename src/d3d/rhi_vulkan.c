@@ -366,6 +366,7 @@ static VkFormat vk_format(RhiFormat f)
     case RHI_FORMAT_R16G16B16A16_FLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
     case RHI_FORMAT_R16G16B16A16_UNORM: return VK_FORMAT_R16G16B16A16_UNORM;
     case RHI_FORMAT_R16G16B16A16_SNORM: return VK_FORMAT_R16G16B16A16_SNORM;
+    case RHI_FORMAT_R16G16B16A16_SINT:  return VK_FORMAT_R16G16B16A16_SINT;
     case RHI_FORMAT_R32G32_FLOAT:       return VK_FORMAT_R32G32_SFLOAT;
     /* DXGI names packed formats from the low bits up and Vulkan from the
      * high bits down: the layouts agree where the names disagree. */
@@ -376,6 +377,7 @@ static VkFormat vk_format(RhiFormat f)
     case RHI_FORMAT_R16G16_FLOAT:       return VK_FORMAT_R16G16_SFLOAT;
     case RHI_FORMAT_R16G16_UNORM:       return VK_FORMAT_R16G16_UNORM;
     case RHI_FORMAT_R16G16_SNORM:       return VK_FORMAT_R16G16_SNORM;
+    case RHI_FORMAT_R16G16_SINT:        return VK_FORMAT_R16G16_SINT;
     case RHI_FORMAT_D32_FLOAT:          return VK_FORMAT_D32_SFLOAT;
     case RHI_FORMAT_R32_FLOAT:          return VK_FORMAT_R32_SFLOAT;
     case RHI_FORMAT_R32_UINT:           return VK_FORMAT_R32_UINT;
@@ -387,6 +389,7 @@ static VkFormat vk_format(RhiFormat f)
     case RHI_FORMAT_R16_UNORM:          return VK_FORMAT_R16_UNORM;
     case RHI_FORMAT_R16_UINT:           return VK_FORMAT_R16_UINT;
     case RHI_FORMAT_R16_SNORM:          return VK_FORMAT_R16_SNORM;
+    case RHI_FORMAT_R16_SINT:           return VK_FORMAT_R16_SINT;
     case RHI_FORMAT_R8_UNORM:           return VK_FORMAT_R8_UNORM;
     case RHI_FORMAT_A8_UNORM:           return VK_FORMAT_R8_UNORM;         /* swizzled in views */
     case RHI_FORMAT_BC1_UNORM:          return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
@@ -438,7 +441,9 @@ static int env_on(const char *name);
 
 static void audit_formats(void)
 {
-    static const RhiFormat vertex_only[] = { RHI_FORMAT_R32G32B32_FLOAT, RHI_FORMAT_R32G32B32A32_SINT };
+    static const RhiFormat vertex_only[] = { RHI_FORMAT_R32G32B32_FLOAT, RHI_FORMAT_R32G32B32A32_SINT,
+                                             RHI_FORMAT_R16G16B16A16_SINT, RHI_FORMAT_R16G16_SINT,
+                                             RHI_FORMAT_R16_SINT };
     char missing[512] = "", no_target[512] = "";
     int all = env_on("RECOMP_VK_FORMATS");
     int f;
