@@ -1346,6 +1346,12 @@ int  xbox_D3D8GetTwoDPlacement(uint32_t *tag);
 BOOL          xbox_D3D8TextureHostSize(IDirect3DTexture8 *texture, UINT level,
                                        UINT *width, UINT *height);
 HRESULT       xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst);
+/* Keep the frame last presented, for a title that reads its front buffer,
+ * and copy it into a texture: the whole of it, as CopyBackBufferToTexture
+ * copies the screen. The copy fails (and the caller copies the screen)
+ * while nothing is kept. */
+void          xbox_D3D8KeepFront(BOOL on);
+HRESULT       xbox_D3D8CopyFrontToTexture(IDirect3DTexture8 *dst);
 /* The same for one of CopyRects' rectangles: `src` in the title's own
    pixels, copied to the same size at `at` in the texture (NULL: its
    corner), as CopyRects does -- it does not scale. A title draws a small
