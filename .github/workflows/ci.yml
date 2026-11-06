@@ -113,7 +113,9 @@ jobs:
 
   macos:
     name: Build and test (macOS, Apple Silicon, clang)
-    runs-on: macos-15
+    # macos-26, as the release job below: GitHub's macos-15 queue has been
+    # longer than the 15 minutes a job may wait for a machine.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
@@ -227,7 +229,15 @@ jobs:
   # Xcode here. The Vulkan loader, MoltenVK and DXC come from LunarG's SDK.
   release-macos:
     name: Self-building release (macOS)
-    runs-on: macos-15
+    # The macOS 26 image, not 15: GitHub's macos-15 Apple Silicon queue has
+    # been longer than the 15 minutes a job may wait for a machine, so with
+    # the build-and-test job ahead of it this one was routinely never given
+    # one ("The job was not acquired by Runner of type hosted even after
+    # multiple attempts") and main stayed red. macos-26 is Apple Silicon too,
+    # from a pool of its own (macos-14 is retired), and the release sets its
+    # own minimum macOS (make_release.py MACOS_MIN, 13.0), so what it builds
+    # does not change.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
