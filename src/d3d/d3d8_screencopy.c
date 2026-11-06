@@ -191,9 +191,25 @@ static void probe_source(const RhiOutputState *saved, const D3D8Texture *tex,
  * scale. */
 static HRESULT copy_to_texture(IDirect3DTexture8 *dst, const RECT *src, const POINT *at);
 
+/* The source the next copy samples: the scene, or the kept front buffer. */
+static RhiView *g_source_override;
+
 HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
 {
     return copy_to_texture(dst, NULL, NULL);
+}
+
+HRESULT xbox_D3D8CopyFrontToTexture(IDirect3DTexture8 *dst)
+{
+    HRESULT hr;
+    RhiView *front = d3d8_GetFrontView();
+
+    if (!front)
+        return E_FAIL;
+    g_source_override = front;
+    hr = copy_to_texture(dst, NULL, NULL);
+    g_source_override = NULL;
+    return hr;
 }
 
 HRESULT xbox_D3D8CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src,
@@ -301,7 +317,7 @@ static HRESULT copy_to_texture(IDirect3DTexture8 *dst, const RECT *src, const PO
     rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 7, 1, &g.cb);
     /* Asked for every time: while frame interpolation draws an in-between
      * frame, the scene is a second image (xbox_D3D8InterpBegin). */
-    g.back_srv = d3d8_GetSceneView();
+    g.back_srv = g_source_override ? g_source_override : d3d8_GetSceneView();
     rhi_set_textures(9, 1, &g.back_srv);
     rhi_set_blend_state(g.blend, blend_factor, 0xFFFFFFFF);
     rhi_set_depth_state(g.depth, 0);

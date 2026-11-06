@@ -134,6 +134,7 @@ unsigned long hle_d3d8_interp_presents(void);
 
 /* Screen copies, wrapped so frame interpolation draws them again. */
 HRESULT host_CopyBackBufferToTexture(IDirect3DTexture8 *dst);
+HRESULT host_CopyFrontToTexture(IDirect3DTexture8 *dst);
 HRESULT host_CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src,
                                          const POINT *at);
 /* The device's depth, as Z24S8 bytes, into a render-target texture. */

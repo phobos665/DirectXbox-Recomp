@@ -1927,6 +1927,19 @@ HRESULT host_CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     return xbox_D3D8CopyBackBufferToTexture(dst);
 }
 
+/* The front buffer into a texture: the frame last presented, kept by the
+ * device once the title has asked for its front buffer; else the screen as
+ * it stands. Recorded as a screen copy, which replay serves from its own
+ * scene. */
+HRESULT host_CopyFrontToTexture(IDirect3DTexture8 *dst)
+{
+    if (g_cap && dst)
+        rec_screen_copy(dst, NULL, NULL);
+    if (SUCCEEDED(xbox_D3D8CopyFrontToTexture(dst)))
+        return S_OK;
+    return xbox_D3D8CopyBackBufferToTexture(dst);
+}
+
 HRESULT host_CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src,
                                          const POINT *at)
 {
