@@ -675,8 +675,14 @@ static int emit_shadow_compare(char *buf, int bufsize, int *poff, int i)
     EMIT("        float4 q = input.tc%d;\n", i);
     EMIT("        float qw = abs(q.w) > 1e-20 ? q.w : 1.0;\n");
     EMIT("        float2 uv = q.xy / qw * tex_scale[%d].xy;\n", i);
-    EMIT("        float ref = q.z / qw;\n");
+    /* The reference is clamped to the depth format's range, as a
+     * fixed-point depth compare is (xemu's, through GL's shadow samplers,
+     * clamps it the same way): a receiver past the light's far plane
+     * compares as the far plane and is lit by a cleared map. Unclamped,
+     * every ground polygon THUG projects its skater's shadow onto that
+     * reaches beyond the shadow camera's range came out solid dark. */
     EMIT("        float m = shadow_max[%d];\n", i);
+    EMIT("        float ref = clamp(q.z / qw, 0.0, m);\n");
     EMIT("        float2 sz; tex%d.GetDimensions(sz.x, sz.y);\n", i);
     EMIT("        float2 p = uv * sz - 0.5;\n");
     EMIT("        float2 f = frac(p);\n");
@@ -888,8 +894,18 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
 
     /* The fog unit, which runs before the combiners: the factor their fog
      * register's alpha holds. d3d8_shaders.c's compute_pfog and program_fog
-     * do the same for the fixed-function pixel path. */
+     * do the same for the fixed-function pixel path.
+     *
+     * With fog disabled the fog unit gives a factor of 1, no fog, whatever
+     * the vertex stage wrote (xemu, pgraph/glsl/vsh.c: oFog = 1.0 when fog
+     * is off). A final combiner reads the fog register either way, and some
+     * do more with it than the XDK's standard fog: Tony Hawk's
+     * Underground's skater shaders compute (1 - fog.a) * FC0 as a
+     * per-channel fog weight, with FC0 = 0x80008000, and draw with fog off.
+     * Taken from the vertex fog of 0, that pulled the green channel halfway
+     * to the fog colour on every skater: magenta skin, purple clothes. */
     EMIT("float fog_factor(PS_IN input) {\n");
+    EMIT("    if (fog_enable == 0u) return 1.0;\n");
     EMIT("    if (fog_src.x == 0u) return saturate(input.fog);\n");
     EMIT("    float d = input.fog;\n");
     EMIT("    if (fog_src.x == 2u) d = fog_src.y ? length(input.viewpos.xyz) : -input.viewpos.z;\n");

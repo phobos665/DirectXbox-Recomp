@@ -315,18 +315,60 @@ int d3d8_GetWBufferProjection(float out[4])
  * still created at the size it asked for, so anything bound there keeps a
  * factor of one; that is what lets render-target scaling be a later step
  * rather than a precondition. */
+/* The bound offscreen target's host size: its image's, which is larger
+ * than the title's for a screen-sized target (d3d8_scene_target_size). */
+static UINT g_rt_host_w, g_rt_host_h;
+
 static float rt_scale_x(void)
 {
-    if (g_cur_rt || !g_device_state.present_width)
+    if (g_cur_rt)
+        return (g_cur_rt->width && g_rt_host_w) ? (float)g_rt_host_w / (float)g_cur_rt->width
+                                                : 1.0f;
+    if (!g_device_state.present_width)
         return 1.0f;
     return (float)g_device_state.width / (float)g_device_state.present_width;
 }
 
 static float rt_scale_y(void)
 {
-    if (g_cur_rt || !g_device_state.present_height)
+    if (g_cur_rt)
+        return (g_cur_rt->height && g_rt_host_h) ? (float)g_rt_host_h / (float)g_cur_rt->height
+                                                 : 1.0f;
+    if (!g_device_state.present_height)
         return 1.0f;
     return (float)g_device_state.height / (float)g_device_state.present_height;
+}
+
+/* Whether a colour render-target texture of w x h is drawn at the scene's
+ * supersampling, and the host size it gets: one exactly the title's screen,
+ * while the scene is rendered larger than that (RECOMP_RES_SCALE). A title
+ * that renders a whole frame into a texture and then puts that on the
+ * screen otherwise drops to the console's resolution for as long as it
+ * does: Tony Hawk's Underground draws every menu transition that way, and
+ * at 3x the menus went soft for the length of each fade. A smaller target
+ * (a reflection, a glow) keeps its own size, as before.
+ * RECOMP_D3D8_SCALE_SCENE_TARGETS=0 keeps every texture at the title's size. */
+BOOL d3d8_scene_target_size(UINT w, UINT h, UINT *host_w, UINT *host_h)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_D3D8_SCALE_SCENE_TARGETS");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || !g_device_state.width || !g_device_state.height ||
+        w != d3d8_GetGuestWidth() || h != d3d8_GetGuestHeight() ||
+        (g_device_state.width == w && g_device_state.height == h))
+        return FALSE;
+    *host_w = g_device_state.width;
+    *host_h = g_device_state.height;
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "D3D8: a %ux%u render target texture is drawn at the scene's "
+                    "%ux%u, as the screen is\n", w, h, *host_w, *host_h);
+    }
+    return TRUE;
 }
 
 /* xbox_D3D8KeepPresented: the frame as it reaches the swap chain. */
@@ -1077,8 +1119,8 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
      * and whatever the viewport and the scissor say (d3d8_clear.c). A
      * rectangle that is the whole target, or none at all, is the native
      * clear below. */
-    target_w = g_cur_rt ? g_cur_rt->width : g_device_state.width;
-    target_h = g_cur_rt ? g_cur_rt->height : g_device_state.height;
+    target_w = g_cur_rt ? (g_rt_host_w ? g_rt_host_w : g_cur_rt->width) : g_device_state.width;
+    target_h = g_cur_rt ? (g_rt_host_h ? g_rt_host_h : g_cur_rt->height) : g_device_state.height;
     if (!clear_rects_to_host(Count, pRects, target_w, target_h, host_rects, &n_rects)) {
         /* A depth-only rectangle belongs to the 3D viewport it was worked
          * out for (Max Payne clears a portal's rectangle before drawing
@@ -2009,6 +2051,7 @@ static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSu
     RhiView *dsv = NULL;
     D3D8Surface *rt = (D3D8Surface *)pRenderTarget;
     D3D8Surface *ds = (D3D8Surface *)pZStencilSurface;
+    UINT rt_w, rt_h;
 
     /* Refused before anything changes, so a bad call leaves the old targets
      * bound on both sides. NULL is the back buffer (not D3D8, which refuses
@@ -2031,14 +2074,28 @@ static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSu
         fprintf(stderr, "D3D8: SetRenderTarget with non-depth stencil surface\n");
         return E_INVALIDARG;
     }
+    /* The target's host size: its image's level (larger than the title's for
+     * a target supersampled with the scene). */
+    if (rt) {
+        RhiImageDesc d;
+        UINT mips, mip;
+
+        memset(&d, 0, sizeof d);
+        if (rt->image)
+            rhi_image_get_desc(rt->image, &d);
+        mips = d.mip_levels ? d.mip_levels : 1;
+        mip = rt->subresource % mips;
+        rt_w = d.width ? (d.width >> mip ? d.width >> mip : 1) : rt->width;
+        rt_h = d.height ? (d.height >> mip ? d.height >> mip : 1) : rt->height;
+    } else {
+        rt_w = g_device_state.width;
+        rt_h = g_device_state.height;
+    }
     /* D3D11 ignores a binding whose depth is not the target's size, which
      * would leave draws going to the previous target. */
-    if (ds && (ds->width  != (rt ? rt->width  : g_device_state.width) ||
-               ds->height != (rt ? rt->height : g_device_state.height))) {
+    if (ds && (ds->width != rt_w || ds->height != rt_h)) {
         fprintf(stderr, "D3D8: SetRenderTarget with depth %ux%u for a %ux%u target\n",
-                ds->width, ds->height,
-                rt ? rt->width : g_device_state.width,
-                rt ? rt->height : g_device_state.height);
+                ds->width, ds->height, rt_w, rt_h);
         return E_INVALIDARG;
     }
     if (rt) IDirect3DSurface8_AddRef(pRenderTarget);
@@ -2047,6 +2104,8 @@ static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSu
     if (g_cur_ds) IDirect3DSurface8_Release(&g_cur_ds->iface);
     g_cur_rt = rt;
     g_cur_ds = ds;
+    g_rt_host_w = rt ? rt_w : 0;
+    g_rt_host_h = rt ? rt_h : 0;
 
     rtv = rt ? rt->rtv : g_device_state.rhi_default_rtv;
     dsv = ds ? ds->dsv : NULL;
@@ -2373,8 +2432,15 @@ static BOOL draw_is_screen_pass(void)
         return TRUE;
     /* Up to 4x4: Gladius keeps a 4x4 white texture bound for its
      * untextured quads, its fades and cutscene letterbox bars among them,
-     * and at 1x1 they stayed in the centred 4:3 box. */
-    return d3d8_base_size(tex, &w, &h) && w <= 4 && h <= 4;
+     * and at 1x1 they stayed in the centred 4:3 box.
+     *
+     * Or a ramp, at most 8 texels across one way: a colour gradient, not a
+     * picture, which stretching distorts nothing of. Tony Hawk's
+     * Underground tints the paused game through a 256x4 texture on a
+     * full-screen quad, and kept in the box it left the sides of the
+     * picture untinted. A real 4:3 picture over the whole screen (a loading
+     * screen) has two real dimensions and still stays in the box. */
+    return d3d8_base_size(tex, &w, &h) && (w <= 8 || h <= 8);
 }
 
 /* Does this draw cover the guest's full width, and so escape the 2D

@@ -68,7 +68,8 @@ int hle_d3d8_trace_on(void);
 #define COMMON_TYPE_SURFACE  0x00050000u
 #define FORMAT_CUBEMAP       0x00000004u
 #define XFMT_P8              0x0B
-#define TEXTURE_CACHE        512
+#define TEXTURE_CACHE        512     /* kept, evicting; see cache_slot */
+#define TEXTURE_CACHE_MAX    4096    /* grown to only by a frame that binds more */
 #define FB_SCREEN            1
 #define FB_DEPTH             2
 #define MAX_STAGES           4
@@ -103,7 +104,7 @@ typedef struct {
     uint32_t           bytes;
 } texture_entry;
 
-static texture_entry g_textures[TEXTURE_CACHE];
+static texture_entry g_textures[TEXTURE_CACHE_MAX];
 static int           g_texture_count;
 
 /* A memo in front of the lookup by identity (va, data, format, size): with
@@ -166,6 +167,7 @@ static unsigned long g_held_refreshes;
 /* Stage 0 currently holds the title's own frame; see SetTexture below and
  * hle_d3d8_stage0_is_framebuffer(). */
 static int g_stage0_framebuffer;
+static uint32_t g_stage0_fb_size;   /* its Size word, when it is the frame buffer */
 
 static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev);
 
@@ -360,6 +362,24 @@ static int read_layout(uint32_t va, texture_layout *t)
     /* Data is physical; tolerate it arriving with the window's high bits. */
     t->phys = data & 0x0FFFFFFF;
     if (!data || (uint64_t)t->phys + bytes > CONTIG_SIZE) {
+        /* Once per format word, as for the refusals above: the count alone
+         * does not say whether that is a null Data or a bad layout. A null
+         * Data is not always a mistake: Tony Hawk's Underground's shadow
+         * pass renders depth only, into a colour target with no memory at
+         * all (0x00F7FD98), and that target is what is counted here. */
+        static uint32_t seen[16];
+        static int nseen;
+        int k;
+        for (k = 0; k < nseen && seen[k] != format; k++)
+            ;
+        if (k == nseen && nseen < 16) {
+            seen[nseen++] = format;
+            fprintf(stderr, "[HLE-D3D8] texture 0x%08X not mirrored: data 0x%08X, "
+                    "%llu bytes (format word 0x%08X, Size 0x%08X) %s; bound, it samples "
+                    "white, and as a render target it is a scratch target\n",
+                    va, data, (unsigned long long)bytes, format, size,
+                    data ? "runs past contiguous memory" : "has no data");
+        }
         g_skip_range++;
         return 0;
     }
@@ -654,7 +674,17 @@ static void age_out(unsigned long now)
 }
 
 /* A free entry: one the budget or the age-out emptied, else a new one, else
- * the least recently bound entry that no stage holds, freed. */
+ * the least recently bound entry that no stage holds, freed, else -- when
+ * every entry was bound in this frame -- a new one past the usual count.
+ *
+ * TEXTURE_CACHE entries are kept as before, so a title whose frames fit in
+ * them evicts exactly as it did and its per-bind scans stay that long. The
+ * cache grows only for a frame that binds more distinct textures than that,
+ * where there is no victim at all: Tony Hawk's Underground's in-engine
+ * cutscenes bind over 500, and with nothing to evict, every texture after
+ * the 512th got the white placeholder. The loading screen's sprites are
+ * drawn last, so the whole screen came out white between scenes. The byte
+ * budget still bounds what all of them hold. */
 static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
 {
     texture_entry *victim = NULL;
@@ -671,7 +701,7 @@ static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
     }
     if (g_texture_count < TEXTURE_CACHE)
         return &g_textures[g_texture_count++];
-    for (i = 0; i < TEXTURE_CACHE; i++) {
+    for (i = 0; i < g_texture_count; i++) {
         texture_entry *e = &g_textures[i];
         int held = 0;
         if (!e->host) {          /* empty already (a failed create) */
@@ -683,8 +713,17 @@ static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
         if (!held && e->used_swap != now && (!victim || e->used_swap < victim->used_swap))
             victim = e;
     }
-    if (!victim)
+    if (!victim) {
+        if (g_texture_count < TEXTURE_CACHE_MAX) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "[HLE-D3D8] a frame bound more than %d distinct textures: "
+                        "the texture cache grows past that (at most %d)\n",
+                        TEXTURE_CACHE, TEXTURE_CACHE_MAX);
+            return &g_textures[g_texture_count++];
+        }
         return NULL;
+    }
     (void)dev;
     if (victim->host)
         g_evict_full++;
@@ -2155,9 +2194,11 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
              * so it identifies them without matching a shader or a size. */
             int i;
             g_stage0_framebuffer = 0;
+            g_stage0_fb_size = 0;
             for (i = 0; host && i < g_texture_count; i++)
                 if (g_textures[i].host == host && g_textures[i].framebuffer == FB_SCREEN) {
                     g_stage0_framebuffer = 1;
+                    g_stage0_fb_size = texture ? obj_field(texture, 16) : 0;
                     break;
                 }
         }
@@ -2201,6 +2242,17 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
 int hle_d3d8_stage0_is_framebuffer(void)
 {
     return g_stage0_framebuffer;
+}
+
+/* The title's size of the frame buffer bound at stage 0, from its Size
+ * word; 0 when stage 0 is not the frame buffer or says no size. */
+int hle_d3d8_stage0_framebuffer_size(unsigned *w, unsigned *h)
+{
+    if (!g_stage0_framebuffer || !g_stage0_fb_size)
+        return 0;
+    *w = (g_stage0_fb_size & 0xFFFu) + 1u;
+    *h = ((g_stage0_fb_size >> 12) & 0xFFFu) + 1u;
+    return 1;
 }
 
 HLE_ORIGINAL(D3DDevice_SetPalette);
