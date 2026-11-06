@@ -354,11 +354,15 @@ static DWORD textureop_to_host(uint32_t v)
     case 15: return D3DTOP_BLENDFACTORALPHA;
     case 16: unmapped("D3DTOP BLENDTEXTUREALPHAPM", v); return D3DTOP_BLENDTEXTUREALPHA;
     case 17: return D3DTOP_PREMODULATE;
+    case 18: return D3DTOP_MODULATEALPHA_ADDCOLOR;
+    case 19: return D3DTOP_MODULATECOLOR_ADDALPHA;
+    case 20: return D3DTOP_MODULATEINVALPHA_ADDCOLOR;
+    case 21: return D3DTOP_MODULATEINVCOLOR_ADDALPHA;
     case 22: return D3DTOP_DOTPRODUCT3;
     case 23: return D3DTOP_MULTIPLYADD;
     case 24: return D3DTOP_LERP;
     }
-    unmapped("D3DTOP", v);                   /* 18-21 and the bump-map ops */
+    unmapped("D3DTOP", v);                   /* the bump-map ops */
     return D3DTOP_MODULATE;
 }
 
