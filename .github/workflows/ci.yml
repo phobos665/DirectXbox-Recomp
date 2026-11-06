@@ -227,6 +227,12 @@ jobs:
   # Xcode here. The Vulkan loader, MoltenVK and DXC come from LunarG's SDK.
   release-macos:
     name: Self-building release (macOS)
+    # After the macOS build rather than beside it. GitHub's hosted Apple
+    # Silicon runners are short: with both macOS jobs asking at once, one
+    # was routinely never given a machine and failed after 15 minutes
+    # ("not acquired by Runner ... after multiple attempts") on main and on
+    # pull requests alike, while the other ran. One at a time, each gets one.
+    needs: macos
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
