@@ -310,10 +310,11 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
         }
         /* The states that discard fragments without leaving a mark. */
         fprintf(stderr, "[draw %4ld] zfunc %lu afunc %lu colorwrite 0x%lX stencil %lu "
-                "fill %lu shade %lu\n", n,
+                "fill %lu shade %lu tfactor 0x%08lX\n", n,
                 (unsigned long)rs[D3DRS_ZFUNC], (unsigned long)rs[D3DRS_ALPHAFUNC],
                 (unsigned long)rs[D3DRS_COLORWRITEENABLE], (unsigned long)rs[D3DRS_STENCILENABLE],
-                (unsigned long)rs[D3DRS_FILLMODE], (unsigned long)rs[D3DRS_SHADEMODE]);
+                (unsigned long)rs[D3DRS_FILLMODE], (unsigned long)rs[D3DRS_SHADEMODE],
+                (unsigned long)rs[D3DRS_TEXTUREFACTOR]);
         /* The fixed-function stage ops, up to the first disabled stage --
          * what a draw with no pixel shader does with its textures. BLiNX's
          * title movie came out white because stage 1 was still active over
@@ -322,12 +323,15 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
             const DWORD *t = d3d8_GetTSS(st);
             if (!t || (st > 0 && t[D3DTSS_COLOROP] <= 1))
                 break;
+            /* result: D3DTSS_RESULTARG, where the stage writes (1 CURRENT,
+             * 5 TEMP); a stage feeding TEMP leaves CURRENT alone. */
             fprintf(stderr, "[draw %4ld] stage%lu color op %lu (%lu, %lu) alpha op %lu "
-                        "(%lu, %lu) texcoord %lu address %lu/%lu filter %lu/%lu/%lu\n",
+                        "(%lu, %lu) result %lu texcoord %lu address %lu/%lu filter %lu/%lu/%lu\n",
                         n, (unsigned long)st,
                         (unsigned long)t[D3DTSS_COLOROP], (unsigned long)t[D3DTSS_COLORARG1],
                         (unsigned long)t[D3DTSS_COLORARG2], (unsigned long)t[D3DTSS_ALPHAOP],
                         (unsigned long)t[D3DTSS_ALPHAARG1], (unsigned long)t[D3DTSS_ALPHAARG2],
+                        (unsigned long)t[D3DTSS_RESULTARG],
                         (unsigned long)t[D3DTSS_TEXCOORDINDEX],
                         (unsigned long)t[D3DTSS_ADDRESSU], (unsigned long)t[D3DTSS_ADDRESSV],
                         (unsigned long)t[D3DTSS_MAGFILTER], (unsigned long)t[D3DTSS_MINFILTER],
