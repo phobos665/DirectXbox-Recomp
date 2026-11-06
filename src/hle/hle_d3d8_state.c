@@ -99,8 +99,17 @@ static int      g_state_ready = -1;  /* -1 not checked, 0 unusable, 1 ready */
  * only for D3D8 3948 and older, and Hunter's stage arrays read as valid
  * values in that order (see the note with this change).
  *
+ * LAYOUT_4432: XDK 4432 to 4626 (Silent Hill 2 is 4531). The 4034 layout
+ * plus DEPTHCLIPCONTROL (4432); the table marks STIPPLEENABLE, the unused
+ * slots, PRESENTATIONINTERVAL and SAMPLEALPHA "verified absent in 4531".
+ * That puts the deferred block at 83 and the complex block at 118, where
+ * Silent Hill 2's XDK symbols put them. Without it no state reached the host
+ * at all: every draw ran with blending, alpha test and stencil off, and a
+ * full-screen quad that the stencil limits to the shadowed pixels painted
+ * the whole picture white under the title's film grain.
+ *
  * LAYOUT_4627: the final layout, deferred at 92 and complex at 136. */
-enum rs_layout { LAYOUT_4627, LAYOUT_PRE4034, LAYOUT_4034 };
+enum rs_layout { LAYOUT_4627, LAYOUT_PRE4034, LAYOUT_4034, LAYOUT_4432 };
 static enum rs_layout g_layout = LAYOUT_4627;
 static uint32_t g_prev_rs[XRS_COUNT];
 static uint32_t g_prev_tss[STAGES][STAGE_SIZE];
@@ -149,11 +158,15 @@ static int state_ready(void)
     } else if (hle_var_D3D_g_DeferredRenderState - rs == 4 * 82 &&
                hle_var_D3D_g_ComplexRenderState - rs == 4 * 117) {
         g_layout = LAYOUT_4034;
+    } else if (hle_var_D3D_g_DeferredRenderState - rs == 4 * 83 &&
+               hle_var_D3D_g_ComplexRenderState - rs == 4 * 118) {
+        g_layout = LAYOUT_4432;
     } else if (hle_var_D3D_g_DeferredRenderState - rs != 4 * XRS_FOGENABLE ||
         hle_var_D3D_g_ComplexRenderState - rs != 4 * XRS_COMPLEX) {
         fprintf(stderr, "[HLE-D3D8] shadow states off: deferred states at slot %d and "
                 "complex at %d, where the XDK 4627+ layout has %d and %d, the "
-                "4034-4431 one 82 and 117 and the pre-4034 one 82 and 116\n",
+                "4432-4626 one 83 and 118, the 4034-4431 one 82 and 117 and the "
+                "pre-4034 one 82 and 116\n",
                 (int)(hle_var_D3D_g_DeferredRenderState - rs) / 4,
                 (int)(hle_var_D3D_g_ComplexRenderState - rs) / 4,
                 XRS_FOGENABLE, XRS_COMPLEX);
@@ -163,7 +176,8 @@ static int state_ready(void)
             "stage states at 0x%08X (%s layout)\n",
             rs, hle_var_D3D_g_DeferredTextureState,
             g_layout == LAYOUT_PRE4034 ? "pre-4034 XDK" :
-            g_layout == LAYOUT_4034 ? "XDK 4034-4431" : "XDK 4627+");
+            g_layout == LAYOUT_4034 ? "XDK 4034-4431" :
+            g_layout == LAYOUT_4432 ? "XDK 4432-4626" : "XDK 4627+");
     g_state_ready = 1;
     return 1;
 }
@@ -175,6 +189,18 @@ static int rs_slot(uint32_t state)
 {
     if (g_layout == LAYOUT_4627)
         return state > XRS_REMOVED ? (int)state - 1 : (int)state;
+    if (g_layout == LAYOUT_4432) {
+        if (state <= 82)  return (int)state;      /* pixel shader, simple, DEPTHCLIPCONTROL */
+        if (state <= 91)  return -1;              /* STIPPLEENABLE..unused */
+        if (state <= 126) return (int)state - 9;  /* FOGENABLE..SWAPFILTER */
+        if (state <= 135) return -1;              /* PRESENTATIONINTERVAL..unused */
+        if (state <= 153) return (int)state - 18; /* PSTEXTUREMODES..MULTISAMPLEMASK */
+        if (state == 154) return -1;              /* MULTISAMPLETYPE */
+        if (state <= 158) return (int)state - 19; /* MULTISAMPLEMODE..LINEWIDTH */
+        if (state == 159) return -1;              /* SAMPLEALPHA */
+        if (state <  XRS_COUNT) return (int)state - 20; /* DXT1NOISEENABLE.. */
+        return -1;
+    }
     if (g_layout == LAYOUT_4034) {
         if (state <= 81)  return (int)state;      /* pixel shader and simple */
         if (state <= 91)  return -1;              /* DEPTHCLIPCONTROL..unused */
