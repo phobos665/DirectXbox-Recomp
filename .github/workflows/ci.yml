@@ -113,7 +113,9 @@ jobs:
 
   macos:
     name: Build and test (macOS, Apple Silicon, clang)
-    runs-on: macos-15
+    # macos-26, as the release job below: GitHub's macos-15 queue has been
+    # longer than the 15 minutes a job may wait for a machine.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
