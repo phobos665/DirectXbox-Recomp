@@ -108,8 +108,9 @@ or later (LICENSE). This release also carries, each under its own licence:
   CMake 4.4 (BSD-3-Clause) and Ninja 1.13 (Apache-2.0)
   CPython 3.13 (Python Software Foundation License), from
     python-build-standalone, with Capstone 5.0.7 (BSD-3-Clause)
-  SDL 3.4 (zlib), miniupnpc 2.3 (BSD-3-Clause) and libsamplerate
-    (BSD-2-Clause), linked into the game's runtime
+  SDL 3.4 (zlib), miniupnpc 2.3 (BSD-3-Clause), libsamplerate
+    (BSD-2-Clause) and xxHash 0.8 (BSD-2-Clause), linked into the game's
+    runtime
   XbSymbolDatabase (MIT), from the Cxbx-Reloaded project
   The DirectX Shader Compiler ({dxc_licenses})
 {extra}"""

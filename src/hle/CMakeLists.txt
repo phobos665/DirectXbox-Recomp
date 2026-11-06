@@ -49,6 +49,8 @@ else()
     target_link_libraries(xbox_hle PRIVATE SDL3::SDL3)
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# xxhash.h, header-only, for the texture checksum (hle_d3d8_texture.c).
+target_include_directories(xbox_hle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/xxhash)
 target_link_libraries(xbox_hle PUBLIC xbox_config)
 target_link_libraries(xbox_hle PUBLIC xbox_kernel)
 # Host device choice and per-control bindings (src/input/input_bindings.c),

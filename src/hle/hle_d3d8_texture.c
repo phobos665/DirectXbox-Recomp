@@ -45,6 +45,8 @@
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
 #include "hle_d3d8_record.h"
+#define XXH_INLINE_ALL
+#include "xxhash.h"                      /* third_party/xxhash: level0_checksum */
 
 /* Reads a RECOMP_* switch; see xbox_memory_layout.h. Declared here rather than
  * including the kernel header, which this file otherwise has no need of. */
@@ -398,9 +400,11 @@ static int read_layout(uint32_t va, texture_layout *t)
  * screen's portraits) showed blocks of stale frames that stayed there, even
  * with the game paused.
  *
- * Word at a time, so hashing the few megabytes a frame binds costs about a
- * millisecond. RECOMP_HLE_D3D8_TEX_SAMPLED=1 restores the old sample, for
- * comparison. */
+ * XXH3 (third_party/xxhash), which hashes several words per cycle with the
+ * host's vector unit. Until Nov 2026 this was a word-at-a-time chain in which
+ * every multiply waited on the last, a couple of bytes a cycle; hakuX measured
+ * the same chain at about a fifth of its push-buffer decoder.
+ * RECOMP_HLE_D3D8_TEX_SAMPLED=1 restores the old sample, for comparison. */
 static uint32_t level0_checksum(const texture_layout *t)
 {
     static int sampled = -1;
@@ -421,16 +425,7 @@ static uint32_t level0_checksum(const texture_layout *t)
         return h;
     }
     {
-        uint64_t h = 0x9E3779B97F4A7C15ull, w;
-        uint32_t n = t->bytes, i;
-
-        for (i = 0; i + 8 <= n; i += 8) {
-            memcpy(&w, p + i, 8);
-            h = (h ^ w) * 0x100000001B3ull;
-            h ^= h >> 29;
-        }
-        for (; i < n; i++)
-            h = (h ^ p[i]) * 0x100000001B3ull;
+        uint64_t h = XXH3_64bits(p, t->bytes);
         return (uint32_t)(h ^ (h >> 32));
     }
 }
