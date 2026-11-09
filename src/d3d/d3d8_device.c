@@ -411,8 +411,61 @@ static void follow_vrr(void);
 
 static void two_d_tag_frame(void);
 
+/* The frame last presented, kept for a title that reads its front buffer
+ * (xbox_D3D8KeepFront): the host has one screen, which the next frame
+ * clears and draws over, while on the console the front buffer still holds
+ * what was shown. Silent Hill 2 copies it into a texture as its item and
+ * pause screens open, to show the game's picture frozen behind them. One
+ * scene-sized copy a frame, and only once a title has asked. */
+static struct { RhiImage *img; RhiView *srv; BOOL on; UINT w, h; } g_front;
+
+void xbox_D3D8KeepFront(BOOL on)
+{
+    if (on && !g_front.on)
+        fprintf(stderr, "D3D8: the title reads its front buffer; the presented frame "
+                "is kept for it\n");
+    g_front.on = on;
+}
+
+RhiView *d3d8_GetFrontView(void)
+{
+    return g_front.on ? g_front.srv : NULL;
+}
+
+static void keep_front(void)
+{
+    D3D8DeviceState *s = &g_device_state;
+    RhiImageDesc d;
+
+    if (!g_front.on || !s->rhi_scene_image)
+        return;
+    rhi_image_get_desc(s->rhi_scene_image, &d);
+    if (!g_front.img || g_front.w != d.width || g_front.h != d.height) {
+        RhiViewDesc vd;
+
+        if (g_front.srv) rhi_view_destroy(g_front.srv);
+        if (g_front.img) rhi_image_destroy(g_front.img);
+        g_front.srv = NULL;
+        d.mip_levels = 1;
+        d.samples = 1;
+        d.bind = RHI_BIND_SAMPLED;
+        if (!(g_front.img = rhi_image_create(&d, NULL)))
+            return;
+        memset(&vd, 0, sizeof vd);
+        vd.dim = RHI_VIEW_DIM_2D;
+        vd.mip_count = 1;
+        vd.layer_count = 1;
+        g_front.srv = rhi_view_create(g_front.img, RHI_VIEW_SAMPLED, &vd);
+        g_front.w = d.width;
+        g_front.h = d.height;
+    }
+    if (g_front.srv)
+        (void)rhi_image_copy(g_front.img, s->rhi_scene_image);
+}
+
 static void present_resolve(void)
 {
+    keep_front();
     follow_vrr();
     two_d_tag_frame();
     present_scene();

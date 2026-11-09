@@ -41,6 +41,8 @@ void                 d3d8_GetTargetGuestSize(UINT *w, UINT *h);
  * sample it, and the render-target view "the back buffer" means. */
 RhiImage *d3d8_GetSceneImage(void);
 RhiView  *d3d8_GetSceneView(void);
+/* The frame last presented, when a title reads its front buffer; else NULL. */
+RhiView  *d3d8_GetFrontView(void);
 RhiView  *d3d8_GetDefaultTargetView(void);
 /* Tell the device whether the next draw is positioned in screen
  * coordinates of the title's own making rather than through its

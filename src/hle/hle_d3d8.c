@@ -2387,6 +2387,25 @@ HLE_ORIGINAL(D3DDevice_LightEnable);
 HLE_ORIGINAL(D3DDevice_SetViewport);
 HLE_ORIGINAL(D3DDevice_SetScissors);
 HLE_ORIGINAL(D3DDevice_CopyRects);
+HLE_ORIGINAL(D3DDevice_GetBackBuffer);
+/* HRESULT D3DDevice_GetBackBuffer(INT BackBuffer, D3DBACKBUFFER_TYPE Type,
+ *                                 D3DSurface **ppBackBuffer)
+ * Replaced only to hear a title ask for its front buffer (-1): it will read
+ * what it last presented, which the host keeps from then on
+ * (xbox_D3D8KeepFront). Silent Hill 2 does, for the frozen picture behind
+ * its item and pause screens. */
+HLE_EXPORT(D3DDevice_GetBackBuffer)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_GetBackBuffer", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_GetBackBuffer, "D3DDevice_GetBackBuffer"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_GetBackBuffer);
+    if (g_shadow && (int32_t)HLE_ARG(0) == -1)
+        xbox_D3D8KeepFront(TRUE);
+}
+
 HLE_ORIGINAL(D3DDevice_GetBackBuffer2);
 HLE_ORIGINAL(D3DSurface_LockRect);
 /* The dispatch table, for calling a title's callback. */
@@ -6156,9 +6175,20 @@ HLE_EXPORT(D3DDevice_CopyRects)
         surface_measure(dst, &dw, &dh, &dfmt);
         /* The source is the screen when it is the surface GetBackBuffer2
          * returned, or -- before that is known -- any parentless surface of
-         * the back buffer's size, the same test SetRenderTarget uses. */
+         * the back buffer's size, the same test SetRenderTarget uses. Or the
+         * other frame buffer: a parentless screen-sized surface over a
+         * frame buffer's memory. Silent Hill 2 freezes the game's picture
+         * for its item menu's Status panel by copying the front buffer
+         * (GetBackBuffer(-1)) into a texture as the menu opens; refused, the
+         * panel stayed black. The host has one screen, so this copies what
+         * it holds: the last frame, until the title draws the next. */
+        int src_frame = !src_parent && sw == g_shadow_width && sh == g_shadow_height &&
+                        hle_d3d8_is_framebuffer(HLE_MEM32(src + 4) & 0x0FFFFFFFu);
+        /* From now on the device keeps each presented frame for it. */
+        if (src_frame && g_backbuffer_va && src != g_backbuffer_va)
+            xbox_D3D8KeepFront(TRUE);
         if (dst != g_backbuffer_va &&
-            (g_backbuffer_va ? src == g_backbuffer_va
+            (g_backbuffer_va ? (src == g_backbuffer_va || src_frame)
                              : (!src_parent && sw == g_shadow_width && sh == g_shadow_height)) &&
             dst_parent && HLE_MEM32(dst_parent + 4) == HLE_MEM32(dst + 4)) {
             IDirect3DTexture8 *tex = hle_d3d8_render_texture(g_shadow, dst_parent);
@@ -6211,7 +6241,9 @@ HLE_EXPORT(D3DDevice_CopyRects)
                 if (said_rect++ < 4)
                     fprintf(stderr, "[HLE-D3D8] the title copies the top left %ux%u of its "
                             "screen into texture 0x%08X\n", dw, dh, dst_parent);
-            } else if (tex && SUCCEEDED(host_CopyBackBufferToTexture(tex))) {
+            } else if (tex && SUCCEEDED(src != g_backbuffer_va && src_frame
+                                        ? host_CopyFrontToTexture(tex)
+                                        : host_CopyBackBufferToTexture(tex))) {
                 from_screen++;
                 if (from_screen == 1)
                     fprintf(stderr, "[HLE-D3D8] the title reads its own screen back: "

@@ -277,7 +277,11 @@ typedef struct NV2ACombinerState {
      * at most twice the shaders, not eight times. Set per draw from the
      * render states, like `shadow`, not from the token. */
     BYTE alpha_test;
-    BYTE key_pad[3];   /* zero: part of the key bytes, so never left unset */
+    /* D3DTSS_ALPHAKILL per stage (bit i), for the stages that fetch a
+     * texture: a texel with alpha 0 discards the fragment (xemu psh.c,
+     * NV_PGRAPH_TEXCTL0_0_ALPHAKILLEN). Set per draw, like `shadow`. */
+    BYTE alpha_kill;
+    BYTE key_pad[2];   /* zero: part of the key bytes, so never left unset */
 
     /* Everything above decides the generated shader and is its cache key
      * (NV2A_COMBINER_KEY_BYTES). Everything below is uploaded to the

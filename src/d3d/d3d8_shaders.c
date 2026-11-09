@@ -305,7 +305,7 @@ static const char g_ps_body[] =
     "    uint   _pad0;\n"
     "    // Per-stage: x=colorop, y=colorarg1, z=colorarg2, w=alphaop\n"
     "    uint4  StageColor[4];\n"
-    "    // Per-stage: x=alphaarg1, y=alphaarg2, z=0, w=0\n"
+    "    // Per-stage: x=alphaarg1, y=alphaarg2, z=1 when RESULTARG is TEMP, w=0\n"
     "    uint4  StageAlpha[4];\n"
     "    uint4  AlphaOnly;\n"
     "    // Per-stage texel -> normalised scale; 1 unless the texture is linear\n"
@@ -356,7 +356,7 @@ static const char g_ps_body[] =
     "\n"
     /* Resolve a texture argument value */
     "float4 resolve_arg(uint arg, float4 diffuse, float4 current,\n"
-    "                   float4 texel, float4 tfactor, float4 specular) {\n"
+    "                   float4 texel, float4 tfactor, float4 specular, float4 temp) {\n"
     "    float4 val;\n"
     "    uint base = arg & 0x0Fu;\n"
     "    if      (base == 0u) val = diffuse;\n"   /* D3DTA_DIFFUSE */
@@ -364,6 +364,7 @@ static const char g_ps_body[] =
     "    else if (base == 2u) val = texel;\n"     /* D3DTA_TEXTURE */
     "    else if (base == 3u) val = tfactor;\n"   /* D3DTA_TFACTOR */
     "    else if (base == 4u) val = specular;\n"  /* D3DTA_SPECULAR */
+    "    else if (base == 5u) val = temp;\n"      /* D3DTA_TEMP */
     "    else val = current;\n"
     "    if (arg & 0x10u) val = 1.0 - val;\n"     /* D3DTA_COMPLEMENT */
     "    if (arg & 0x20u) val = val.aaaa;\n"      /* D3DTA_ALPHAREPLICATE */
@@ -396,6 +397,8 @@ static const char g_ps_body[] =
     "\n"
     "float4 main(PS_IN input) : SV_TARGET {\n"
     "    float4 current = input.diffuse;\n"
+    "    float4 temp = float4(0.0, 0.0, 0.0, 0.0);\n"
+    "    bool wrote_current = false;\n"
     "    float4 texels[4];\n"
     "\n"
     "    // Pre-sample all textures\n";
@@ -416,8 +419,8 @@ static const char g_ps_tail[] =
     "        float4 texel = texels[i];\n"
     "\n"
     "        // Resolve color arguments\n"
-    "        float4 carg1 = resolve_arg(colorarg1, input.diffuse, current, texel, TexFactor, input.specular);\n"
-    "        float4 carg2 = resolve_arg(colorarg2, input.diffuse, current, texel, TexFactor, input.specular);\n"
+    "        float4 carg1 = resolve_arg(colorarg1, input.diffuse, current, texel, TexFactor, input.specular, temp);\n"
+    "        float4 carg2 = resolve_arg(colorarg2, input.diffuse, current, texel, TexFactor, input.specular, temp);\n"
     "\n"
     "        // Apply color operation per channel\n"
     "        float3 color;\n"
@@ -425,6 +428,19 @@ static const char g_ps_tail[] =
     "            // DOTPRODUCT3: dot of (arg1-0.5)*(arg2-0.5)*4, replicated\n"
     "            float d = saturate(4.0 * dot(carg1.rgb - 0.5, carg2.rgb - 0.5));\n"
     "            color = float3(d, d, d);\n"
+    /* The four that mix one argument's alpha into the colour (colour
+     * operations only). Silent Hill 2 draws its characters through
+     * MODULATEALPHA_ADDCOLOR: the lit texture held in TEMP plus a highlight
+     * stage 1 worked out, and as a plain modulate by a highlight of zero
+     * every character came out black. */
+    "        } else if (colorop == 18u) {\n"   /* MODULATEALPHA_ADDCOLOR */
+    "            color = saturate(carg1.rgb + carg1.a * carg2.rgb);\n"
+    "        } else if (colorop == 19u) {\n"   /* MODULATECOLOR_ADDALPHA */
+    "            color = saturate(carg1.rgb * carg2.rgb + carg1.a);\n"
+    "        } else if (colorop == 20u) {\n"   /* MODULATEINVALPHA_ADDCOLOR */
+    "            color = saturate((1.0 - carg1.a) * carg2.rgb + carg1.rgb);\n"
+    "        } else if (colorop == 21u) {\n"   /* MODULATEINVCOLOR_ADDALPHA */
+    "            color = saturate((1.0 - carg1.rgb) * carg2.rgb + carg1.a);\n"
     "        } else {\n"
     "            color.r = apply_op(colorop, carg1.r, carg2.r, input.diffuse.a, texel.a, current.a, TexFactor.a);\n"
     "            color.g = apply_op(colorop, carg1.g, carg2.g, input.diffuse.a, texel.a, current.a, TexFactor.a);\n"
@@ -432,8 +448,8 @@ static const char g_ps_tail[] =
     "        }\n"
     "\n"
     "        // Resolve alpha arguments\n"
-    "        float4 aarg1 = resolve_arg(alphaarg1, input.diffuse, current, texel, TexFactor, input.specular);\n"
-    "        float4 aarg2 = resolve_arg(alphaarg2, input.diffuse, current, texel, TexFactor, input.specular);\n"
+    "        float4 aarg1 = resolve_arg(alphaarg1, input.diffuse, current, texel, TexFactor, input.specular, temp);\n"
+    "        float4 aarg2 = resolve_arg(alphaarg2, input.diffuse, current, texel, TexFactor, input.specular, temp);\n"
     "\n"
     "        // Apply alpha operation\n"
     "        float alpha;\n"
@@ -442,7 +458,21 @@ static const char g_ps_tail[] =
     "        else\n"
     "            alpha = apply_op(alphaop, aarg1.a, aarg2.a, input.diffuse.a, texel.a, current.a, TexFactor.a);\n"
     "\n"
-    "        current = float4(color, alpha);\n"
+    /* D3DTSS_RESULTARG: a stage may write TEMP instead of CURRENT. On the
+     * NV2A these are combiner registers r1 and r0, and CURRENT is the
+     * diffuse colour only as stage 0 reads it: a later stage reads r0, which
+     * starts as (0, 0, 0, texture 0's alpha) -- 1 without a stage-0 texture
+     * (xemu, pgraph/glsl/psh.c). So while only TEMP has been written, that
+     * is what CURRENT holds. Silent Hill 2's characters keep their lit
+     * texture in TEMP and read CURRENT's alpha for the alpha test: as the
+     * diffuse alpha (0) they were discarded altogether. */
+    "        if (StageAlpha[i].z != 0u) {\n"
+    "            temp = float4(color, alpha);\n"
+    "            if (!wrote_current) current = float4(0.0, 0.0, 0.0, texels[0].a);\n"
+    "        } else {\n"
+    "            current = float4(color, alpha);\n"
+    "            wrote_current = true;\n"
+    "        }\n"
     "    }\n"
     "\n"
     "    // Add specular (D3DRS_SPECULARENABLE)\n"
@@ -493,10 +523,13 @@ static const char g_ps_end[] =
  * Texture object declarations must match the dimension of the SRV bound
  * at each stage, otherwise D3D11 fails to sample it correctly.
  * Above them, FF_PS_SIG_ALPHA_TEST: the alpha test can reject
- * (d3d8_alpha_test_can_reject), and only then is it in the shader.
+ * (d3d8_alpha_test_can_reject), and only then is it in the shader. Above
+ * that, FF_PS_SIG_ALPHA_KILL(i): stage i's D3DTSS_ALPHAKILL, a texel with
+ * alpha 0 discarding the fragment (xemu psh.c), for a stage with a texture.
  */
 #define FF_PS_SRC_SIZE 16384
 #define FF_PS_SIG_ALPHA_TEST 0x100u
+#define FF_PS_SIG_ALPHA_KILL(i) (0x200u << (i))
 
 static void build_ps_source(UINT sig, char *buf, int bufsize)
 {
@@ -523,6 +556,9 @@ static void build_ps_source(UINT sig, char *buf, int bufsize)
         /* Xbox A8 samples white RGB; DXGI A8 supplies zero RGB. */
         off += snprintf(buf + off, bufsize - off,
                         "    if (AlphaOnly[%d]) texels[%d].rgb = 1.0;\n", i, i);
+        if (sig & FF_PS_SIG_ALPHA_KILL(i))
+            off += snprintf(buf + off, bufsize - off,
+                            "    if (texels[%d].a == 0.0) discard;\n", i);
     }
     off += snprintf(buf + off, bufsize - off, "%s", g_ps_tail);
     if (sig & FF_PS_SIG_ALPHA_TEST)
@@ -623,6 +659,11 @@ static UINT ff_ps_compute_signature(void)
             else if (type == D3DRTYPE_VOLUMETEXTURE) dim = 2;
         }
         sig |= dim << (i * 2);
+        if (tex) {
+            const DWORD *tss = d3d8_GetTSS((DWORD)i);
+            if (tss && tss[D3DTSS_ALPHAKILL])
+                sig |= FF_PS_SIG_ALPHA_KILL(i);
+        }
     }
     return sig;
 }
@@ -1346,6 +1387,7 @@ void d3d8_shaders_prepare_draw(DWORD handle)
 
             pc->stage_alpha[stage][0] = tss[D3DTSS_ALPHAARG1];
             pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2];
+            pc->stage_alpha[stage][2] = tss[D3DTSS_RESULTARG] == D3DTA_TEMP ? 1u : 0u;
             /* A stage with no texture that reads D3DTA_TEXTURE does not take
              * part. The host device binds white there (so register combiners
              * read what they always did), and as a fixed-function argument

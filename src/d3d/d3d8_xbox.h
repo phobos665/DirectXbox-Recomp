@@ -469,6 +469,12 @@ typedef enum D3DTEXTUREOP {
     D3DTOP_BLENDFACTORALPHA     = 14,
     D3DTOP_BLENDCURRENTALPHA    = 15,
     D3DTOP_PREMODULATE          = 16,
+    /* The PC's numbers for the four "modulate and add" operations; the host's
+     * fixed-function pixel shader (d3d8_shaders.c) implements them. */
+    D3DTOP_MODULATEALPHA_ADDCOLOR    = 18,
+    D3DTOP_MODULATECOLOR_ADDALPHA    = 19,
+    D3DTOP_MODULATEINVALPHA_ADDCOLOR = 20,
+    D3DTOP_MODULATEINVCOLOR_ADDALPHA = 21,
     D3DTOP_DOTPRODUCT3          = 24,
     D3DTOP_MULTIPLYADD          = 25,
     D3DTOP_LERP                 = 26,
@@ -480,6 +486,7 @@ typedef enum D3DTEXTUREOP {
 #define D3DTA_TEXTURE           0x02
 #define D3DTA_TFACTOR           0x03
 #define D3DTA_SPECULAR          0x04
+#define D3DTA_TEMP              0x05
 #define D3DTA_COMPLEMENT        0x10
 #define D3DTA_ALPHAREPLICATE    0x20
 
@@ -1339,6 +1346,12 @@ int  xbox_D3D8GetTwoDPlacement(uint32_t *tag);
 BOOL          xbox_D3D8TextureHostSize(IDirect3DTexture8 *texture, UINT level,
                                        UINT *width, UINT *height);
 HRESULT       xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst);
+/* Keep the frame last presented, for a title that reads its front buffer,
+ * and copy it into a texture: the whole of it, as CopyBackBufferToTexture
+ * copies the screen. The copy fails (and the caller copies the screen)
+ * while nothing is kept. */
+void          xbox_D3D8KeepFront(BOOL on);
+HRESULT       xbox_D3D8CopyFrontToTexture(IDirect3DTexture8 *dst);
 /* The same for one of CopyRects' rectangles: `src` in the title's own
    pixels, copied to the same size at `at` in the texture (NULL: its
    corner), as CopyRects does -- it does not scale. A title draws a small
