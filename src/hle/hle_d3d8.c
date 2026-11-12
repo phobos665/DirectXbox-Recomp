@@ -1049,6 +1049,64 @@ static void shadow_viewport_constants(const D3DVIEWPORT8 *vp)
     host_vsh_set_screenspace(scale, offset);
 }
 
+/* The viewport clips. A program draw is given a host viewport over the whole
+ * target (its screen space already holds the title's), so nothing else would
+ * keep it inside the title's rectangle, and THUG's horizontal split screen
+ * draws each player's view under a 640x240 viewport with geometry well past
+ * it: player 1's view ran down over player 2's. While such a draw is up the
+ * host scissor is the title's scissor cut to the title's viewport, sent
+ * through the scissor call a capture already records; the rest of the time
+ * it is the title's scissor as given. The title's scissor is kept here
+ * (D3DDevice_SetScissors) so it can be put back. */
+static UINT    g_title_scissor_count;
+static BOOL    g_title_scissor_exclusive;
+static D3DRECT g_title_scissor[8];
+static int     g_scissor_sent = -1;      /* 0 the title's, 1 cut to the viewport */
+static D3DRECT g_scissor_sent_rect;
+
+static void shadow_apply_scissor(void)
+{
+    const D3DVIEWPORT8 *v = &g_title_viewport;
+    int clip = g_host_viewport_mode == 1 && g_title_viewport_set &&
+               !g_title_scissor_exclusive &&
+               (v->X > 0 || v->Y > 0 || v->X + v->Width < g_target_width ||
+                v->Y + v->Height < g_target_height);
+
+    if (clip) {
+        D3DRECT r;
+
+        r.x1 = (LONG)v->X;
+        r.y1 = (LONG)v->Y;
+        r.x2 = (LONG)(v->X + v->Width);
+        r.y2 = (LONG)(v->Y + v->Height);
+        if (g_title_scissor_count) {
+            const D3DRECT *t = &g_title_scissor[0];
+            if (t->x1 > r.x1) r.x1 = t->x1;
+            if (t->y1 > r.y1) r.y1 = t->y1;
+            if (t->x2 < r.x2) r.x2 = t->x2;
+            if (t->y2 < r.y2) r.y2 = t->y2;
+            if (r.x2 < r.x1) r.x2 = r.x1;
+            if (r.y2 < r.y1) r.y2 = r.y1;
+        }
+        if (g_scissor_sent == 1 && memcmp(&r, &g_scissor_sent_rect, sizeof r) == 0)
+            return;
+        {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "[HLE-D3D8] a program draw is clipped to the title's viewport "
+                        "%ld,%ld-%ld,%ld (a %ux%u target)\n", (long)r.x1, (long)r.y1,
+                        (long)r.x2, (long)r.y2, (unsigned)g_target_width,
+                        (unsigned)g_target_height);
+        }
+        g_scissor_sent = 1;
+        g_scissor_sent_rect = r;
+        host_SetScissors(1, FALSE, &r);
+    } else if (g_scissor_sent != 0) {
+        g_scissor_sent = 0;
+        host_SetScissors(g_title_scissor_count, g_title_scissor_exclusive, g_title_scissor);
+    }
+}
+
 static void shadow_use_viewport(int whole_target)
 {
     D3DVIEWPORT8 vp;
@@ -1056,6 +1114,7 @@ static void shadow_use_viewport(int whole_target)
     if (g_host_viewport_mode == whole_target)
         return;
     g_host_viewport_mode = whole_target;
+    shadow_apply_scissor();
     if (!whole_target && g_title_viewport_set) {
         vp = g_title_viewport;
     } else {
@@ -5212,7 +5271,11 @@ HLE_EXPORT(D3DDevice_SetScissors)
             memcpy(rect, HLE_PTR(rects), n * sizeof rect[0]);
         else
             n = 0;
-        host_SetScissors(n, exclusive != 0, rect);
+        g_title_scissor_count = n;
+        g_title_scissor_exclusive = exclusive != 0;
+        memcpy(g_title_scissor, rect, n * sizeof rect[0]);
+        g_scissor_sent = -1;
+        shadow_apply_scissor();
     }
 }
 
