@@ -126,13 +126,26 @@ static void fake_apply(RecompInputGamepad *g, int i)
  * MK Shaolin Monks play test stopped pressing at three minutes and looked like
  * the game had stopped answering the pad. A script cut short now says so. */
 #define SEQ_MAX 1024
-static struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; } s_seq[SEQ_MAX];
-static int s_seq_count = -1;
-static unsigned long long s_seq_t0;
+#define SEQ_PORTS 4
+struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; };
+static struct seq_step s_seq_steps[SEQ_PORTS][SEQ_MAX];
+static int s_seq_counts[SEQ_PORTS] = { -1, -1, -1, -1 };
+static unsigned long long s_seq_t0;   /* shared, so the ports' scripts keep time together */
 
-static void seq_parse(const char *env)
+/* The variable that scripts each port: RECOMP_INPUT_SEQ for controller 1,
+ * RECOMP_INPUT_SEQ_P2..P4 for the others. A script on 2-4 also plugs that
+ * controller in (recomp_input_host_scripted_mask), so a run can take a
+ * title's two-player modes with nothing connected: THUG greys out 2 PLAYER
+ * until a second pad is present. */
+static const char *const SEQ_ENV[SEQ_PORTS] = {
+    "RECOMP_INPUT_SEQ", "RECOMP_INPUT_SEQ_P2", "RECOMP_INPUT_SEQ_P3", "RECOMP_INPUT_SEQ_P4",
+};
+
+static void seq_parse(unsigned port, const char *env)
 {
     const char *p = env;
+    struct seq_step *s_seq = s_seq_steps[port];
+    int s_seq_count = 0;
 
     while (*p && s_seq_count < SEQ_MAX) {
         struct seq_step *s = &s_seq[s_seq_count];
@@ -145,8 +158,9 @@ static void seq_parse(const char *env)
         s->hold = 200;
         s->at = strtoul(p, &end, 10);
         if (end == p || *end != ':') {
-            fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: bad step at '%.*s' (want <ms>:<button>)\n",
-                    (int)len, p);
+            fprintf(stderr, "  [PAD] %s: bad step at '%.*s' (want <ms>:<button>)\n",
+                    SEQ_ENV[port], (int)len, p);
+            s_seq_counts[port] = s_seq_count;
             return;
         }
         q = end + 1;
@@ -157,7 +171,9 @@ static void seq_parse(const char *env)
                 n++;
             k = fake_lookup(q, n);
             if (k < 0) {
-                fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: unknown button '%.*s'\n", (int)n, q);
+                fprintf(stderr, "  [PAD] %s: unknown button '%.*s'\n", SEQ_ENV[port],
+                        (int)n, q);
+                s_seq_counts[port] = s_seq_count;
                 return;
             }
             if (s->nkeys < 4)
@@ -179,25 +195,42 @@ static void seq_parse(const char *env)
         }
         p = step_end + 1;
     }
+    s_seq_counts[port] = s_seq_count;
     if (*p && s_seq_count >= SEQ_MAX)
-        fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: more than %d steps; the rest are ignored"
-                " (from '%.24s')\n", SEQ_MAX, p);
+        fprintf(stderr, "  [PAD] %s: more than %d steps; the rest are ignored"
+                " (from '%.24s')\n", SEQ_ENV[port], SEQ_MAX, p);
 }
 
-/* Whether an input script is driving this run (RECOMP_INPUT_SEQ), parsing
- * it the first time. */
-static int seq_active(void)
+/* Whether an input script is driving this port (SEQ_ENV), parsing it the
+ * first time. */
+static int seq_port_active(unsigned port)
 {
-    if (s_seq_count < 0) {
-        const char *env = getenv("RECOMP_INPUT_SEQ");
-        s_seq_count = 0;
+    if (port >= SEQ_PORTS)
+        return 0;
+    if (s_seq_counts[port] < 0) {
+        const char *env = getenv(SEQ_ENV[port]);
+        s_seq_counts[port] = 0;
         if (env && *env) {
-            seq_parse(env);
-            fprintf(stderr, "  [PAD] input script: %d steps from %s\n", s_seq_count, env);
+            seq_parse(port, env);
+            fprintf(stderr, "  [PAD] input script for controller %u: %d steps from %s\n",
+                    port + 1u, s_seq_counts[port], env);
             fflush(stderr);
         }
     }
-    return s_seq_count > 0;
+    return s_seq_counts[port] > 0;
+}
+
+static int seq_active(void) { return seq_port_active(0u); }
+
+uint32_t recomp_input_host_scripted_mask(void)
+{
+    uint32_t mask = 0u;
+    unsigned port;
+
+    for (port = 1u; port < SEQ_PORTS; port++)
+        if (seq_port_active(port))
+            mask |= 1u << port;
+    return mask;
 }
 
 /* A script is for a run that goes the same way every time, and a pad left
@@ -223,17 +256,19 @@ static int seq_owns_pad(void)
     return !with_pad;
 }
 
-static void seq_input(RecompInputGamepad *g)
+static void seq_input(unsigned port, RecompInputGamepad *g)
 {
     unsigned long long t;
+    const struct seq_step *s_seq;
     int i, k;
 
-    if (!seq_active())
+    if (!seq_port_active(port))
         return;
+    s_seq = s_seq_steps[port];
     if (!s_seq_t0)
         s_seq_t0 = GetTickCount64();
     t = GetTickCount64() - s_seq_t0;
-    for (i = 0; i < s_seq_count; i++) {
+    for (i = 0; i < s_seq_counts[port]; i++) {
         if (t < s_seq[i].at || t >= (unsigned long long)s_seq[i].at + s_seq[i].hold)
             continue;
         for (k = 0; k < s_seq[i].nkeys; k++)
@@ -378,7 +413,8 @@ bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad)
     if (gamepad == NULL)
         return false;
     memset(gamepad, 0, sizeof *gamepad);
-    if (!(port == 0 && seq_owns_pad()) && recomp_bindings_sample(port, &pad)) {
+    if (!(port == 0 && seq_owns_pad()) && !(port > 0 && seq_port_active(port)) &&
+        recomp_bindings_sample(port, &pad)) {
         gamepad->buttons = (uint16_t)pad.wButtons;
         for (i = 0; i < RECOMP_INPUT_ANALOG_BUTTON_COUNT; i++)
             gamepad->analog_buttons[i] = pad.bAnalogButtons[i];
@@ -390,8 +426,8 @@ bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad)
     if (port == 0) {
         record_input(gamepad);      /* the person, before any script adds to it */
         fake_input(gamepad);
-        seq_input(gamepad);
     }
+    seq_input(port, gamepad);
     return true;
 }
 

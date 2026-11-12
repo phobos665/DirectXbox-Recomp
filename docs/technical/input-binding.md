@@ -269,6 +269,13 @@ a machine with no pad.
 controller 1 after its bindings. They stand in for a person at the keyboard,
 so what that person bound should not change them.
 
+`RECOMP_INPUT_SEQ_P2`, `_P3` and `_P4` are the same script for controllers 2
+to 4, on the same clock as controller 1's (from the title's first pad read).
+A scripted controller replaces whatever is bound to that port and counts as
+plugged in, so a run reaches a title's multi-player modes with one pad or
+none: Tony Hawk's Underground greys out 2 PLAYER until a second pad is
+present, and its split screen is only reachable this way in a scripted run.
+
 `src/usb/usb_gamepad.c` reports port 1 through the same bindings, so a title
 that finds its pad through the emulated USB stack rather than the XAPI
 replacement behaves the same.

@@ -8,6 +8,7 @@
 #define XBOXRECOMP_INPUT_HOST_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "input_model.h"
 
 /* Guest ordering of the analog button bytes. */
@@ -22,6 +23,10 @@ enum {
  * port 0 only. Ports are 0-based here and 1-based in the UI and the config
  * file, where they are what is written on the console. */
 bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad);
+
+/* The ports 1-3 (0-based) an input script drives (RECOMP_INPUT_SEQ_P2..P4),
+ * which count as connected whatever is plugged in. */
+uint32_t recomp_input_host_scripted_mask(void);
 
 /* Port 0, for callers that only ever had one pad. */
 bool recomp_input_host_sample(RecompInputGamepad *gamepad);
