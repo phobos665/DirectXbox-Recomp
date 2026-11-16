@@ -1232,10 +1232,19 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── xadd: exchange and add, flags from addition ──
     if flag_setter == "xadd":
+        # The lift snapshots the sum into _fa/_fas (see the atomic arm of
+        # _lift_misc, the only place an xadd is lifted). Reading the
+        # destination again here tests a different word once its address
+        # register has moved, and a different value once another thread has
+        # touched it.
         if jcc in ("je", "jz"):
-            return f"({lhs} == 0)", desc
+            return "(_fa == 0)", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != 0)", desc
+            return "(_fa != 0)", desc
+        if jcc == "js":
+            return "(_fas < 0)", desc
+        if jcc == "jns":
+            return "(_fas >= 0)", desc
         return None
 
     # ── repe cmpsb / repne scasb: string comparison ──
@@ -2323,9 +2332,23 @@ class Lifter:
                 src = _fmt_operand_read(ops[1])
                 if atomic_m == "xadd":
                     # dst = dst + src, and src receives dst's old value.
+                    #
+                    # The flags are the sum's, and the sum is snapshotted into
+                    # _fa here rather than re-read from the destination at the
+                    # jcc. Re-reading was wrong twice over. The address can
+                    # change between the two: Sid Meier's Pirates! releases a
+                    # reference with `lock xadd [edi], eax / pop edi / jne`, so
+                    # the branch tested whatever the caller's edi pointed at,
+                    # and every child added to a UI node was destroyed on the
+                    # spot. And the word itself can change: guest threads run
+                    # in parallel on Windows, so another thread's AddRef or
+                    # Release between the atomic and the re-read decides this
+                    # thread's branch -- two releases can both see zero.
                     return [
-                        "{ uint32_t _old = RECOMP_ATOMIC_ADD32("
-                        f"XBOX_PTR({addr}), {src});",
+                        f"{{ uint32_t _src = {src};",
+                        "  uint32_t _old = RECOMP_ATOMIC_ADD32("
+                        f"XBOX_PTR({addr}), _src);",
+                        "  _fa = _old + _src; _fas = (int32_t)_fa;",
                         "  " + _fmt_operand_write(ops[1], "_old") + " }"
                         f"  /* {m} */",
                     ]
