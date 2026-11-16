@@ -1788,8 +1788,11 @@ class FunctionTranslator:
         # sahf and the fcomi family leave an EFLAGS image in _fa, and sahf
         # reads the OF before it from _fb.
         # mul and imul leave "the product did not fit" (CF = OF) in _fa.
+        # xadd snapshots its sum into _fa/_fas for the jcc that follows it
+        # (lifter.py, the atomic arm), so it needs them declared too.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg", "inc", "dec", "sahf",
+                                 "lock cmpxchg", "xadd", "lock xadd",
+                                 "inc", "dec", "sahf",
                                  "mul", "imul",
                                  "fcomi", "fcomip", "fcompi", "fucomi",
                                  "fucomip", "fucompi")

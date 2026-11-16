@@ -106,9 +106,29 @@ class LockPrefixFlagsTest(unittest.TestCase):
                     f"{mnemonic} left its jcc on the _flags placeholder:\n{out}")
 
     def test_the_branch_reads_the_sum(self):
-        """xadd sets ZF from the sum, which is what its destination now holds."""
+        """xadd sets ZF from the sum, snapshotted when the xadd runs."""
         out = _lift(_release_sequence("lock xadd"))
-        self.assertIn("MEM32(eax)", out, out)
+        self.assertIn("_fa = _old + _src", out, out)
+        self.assertIn("(_fa != 0)", out, out)
+
+    def test_the_branch_survives_the_address_register_moving(self):
+        """`lock xadd [edi], eax / pop edi / jne` must not test the new edi.
+
+        Sid Meier's Pirates! releases a reference this way (0x0020AD80). The
+        condition used to be MEM32(edi) != 0 evaluated after the pop, so it
+        read whatever the caller's edi pointed at, found zero, and destroyed
+        an object that was still referenced.
+        """
+        insns = [
+            _insn(0x20AD80, 4, "lock xadd", "dword ptr [edi], eax",
+                  [_mem("edi"), Operand(type="reg", reg="eax")]),
+            _insn(0x20AD84, 1, "pop", "edi", [Operand(type="reg", reg="edi")]),
+            _insn(0x20AD85, 2, "jne", "0x20ad8f",
+                  [Operand(type="imm", imm=0x20AD8F)]),
+        ]
+        out = _lift(insns)
+        self.assertNotIn("MEM32(edi) != 0", out, out)
+        self.assertIn("(_fa != 0)", out, out)
 
     def test_lock_cmpxchg_does_not_inherit_stale_flags(self):
         """A `cmp` before a `lock cmpxchg` must not decide the cmpxchg's jcc.
