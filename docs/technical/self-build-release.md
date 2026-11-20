@@ -402,6 +402,51 @@ adaptive or round icon: a launcher that wants one masks the square.
   `/usr/bin/xcrun`, `git`, `cc` and `ld`. Do not quarantine a test copy and
   start it: Gatekeeper then waits on a dialog, and locks the bundle.
 
+## The online updater (29 Oct 2026)
+
+A release made from a recipe with `"updater": true` also carries the toolkit's
+`titles/xodash-update` as `recipe-updater/`, and its `release.json` names it:
+
+```json
+"updater": {"recipe": "recipe-updater", "exe": "xodash_update_recomp",
+            "sha1": ["28e1634969edfd307c241979aef5aef1bdc6a5d4"]}
+```
+
+`xboxrecomp-build updater --dashboard <folder>` builds the 5960 dashboard's
+online updater from the player's own dashboard: the C: drive the launcher's
+Dashboard row copied out of their xemu disk image (`src/hdd`) into the
+settings folder's `dashboard/`. It checks `xodash/update.xbe` against the
+SHA-1s, lays out `updater/game` in the player's folder (the dashboard
+mirrored with links, `default.xbe` its `xodash/update.xbe`), lifts and builds
+the recipe there, and installs `updater/xodash_update_recomp` beside the
+game's executable, which is where the runtime looks when a title asks for its
+update (`src/kernel/xbox_title_update.c`). Its own `build.log` and
+`build.json` are in `updater/`. The launcher's Xbox Live mode offers it as the
+**Updater** row once a 5960 dashboard is ready.
+
+A title whose update is a build of its own names it as `title_update`:
+
+```json
+"title_update": {"exe": "rs3_tu501_recomp", "sha1": ["30c6a2f5..."],
+                 "lift": ["scripts/release_lift.py", "--tu501", "{xbe_dir}"],
+                 "cmake": ["-DRS3_TU501=ON"]}
+```
+
+`xboxrecomp-build title-update` builds it once the updater has installed the
+update in the game folder (`TDATA/<TITLEID>/$u/default.xbe`, SHA-1 checked),
+with the title's own lift and CMake switches, in `update/`, and installs it
+beside the game's executable, where the game hands over to it. The launcher
+starts that build by itself, on the build screen, when it opens on a game
+whose update is installed and not built; a failure leaves the game playable.
+
+Checked on macOS on 29 Oct 2026 with a real release of Rainbow Six 3
+(645 MB): the game built from a copy of the disc, the updater from the 5960
+dashboard's update.xbe, and update 0x501 from the copy the updater installs;
+the game handed over to the update's build, which ran offline at 60 fps.
+Not yet run on Linux or Windows, and the launcher's Updater row and automatic
+update build were not clicked through (the release tested was made before the
+latter).
+
 ## Not done yet
 
 - Windows: a player-side build and a run on a real machine (above); the

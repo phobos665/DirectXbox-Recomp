@@ -30,6 +30,7 @@
 #include <dirent.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>         /* unlink, rmdir: a dashboard copy redone */
 #endif
 #if defined(__APPLE__)
 #include <ftw.h>
@@ -42,6 +43,9 @@
 #include "recomp_config.h"
 #include "recomp_pad.h"
 #include "net_upnp.h"
+#include "insignia_register.h"
+#include "xbox_console_id.h"
+#include "xbox_hdd.h"
 #include "platform/host_main.h"
 
 #ifndef LAUNCHER_GAME_EXE
@@ -80,7 +84,7 @@ static int g_cw = LAUNCHER_WINDOW_W, g_ch = LAUNCHER_WINDOW_H;
 
 /* ------------------------------------------------------------- settings */
 
-typedef enum { ROW_INT, ROW_BOOL, ROW_CHOICE, ROW_TEXT } RowKind;
+typedef enum { ROW_INT, ROW_BOOL, ROW_CHOICE, ROW_TEXT, ROW_ACTION } RowKind;
 
 typedef struct Row {
     const char *label;
@@ -93,6 +97,8 @@ typedef struct Row {
     size_t      text_len;
     const char *empty;                  /* ROW_TEXT: shown while there is no text */
     int         digits;                 /* ROW_TEXT: only 0-9 may be typed */
+    void      (*action)(void);          /* ROW_ACTION: A or a click does it; text
+                                         * is what the row says */
 } Row;
 
 static const char *const k_frame_caps_console[] = { "adaptive", "60", "30", "0", NULL };
@@ -114,11 +120,13 @@ static int  g_video_count;
 /* ---- System Link ---- */
 
 /* The rows depend on the mode: a host is not asked for an address, and a
- * joining copy is not asked about its router. */
-static const char *const k_link_modes[] = { "off", "host", "join", NULL };
+ * joining copy is not asked about its router. "nat" is Xbox Live: the card
+ * cabled to the internet through the runtime's router. */
+static const char *const k_link_modes[] = { "off", "host", "join", "nat", NULL };
 #define LINK_OFF   0
 #define LINK_HOST  1
 #define LINK_JOIN  2
+#define LINK_LIVE  3
 #define LINK_BY_HAND (-1)               /* "udp", set in the file; kept as it is */
 
 static int           g_link_mode;
@@ -129,6 +137,28 @@ static char          g_lan_addr[64];    /* this PC on its network */
 static NetUpnpResult g_probe;           /* what the router said */
 static volatile long g_probe_state;     /* 0 not asked, 1 asking, 2 answered */
 static uint64_t      g_copied_until;    /* "copied" shown until then */
+
+/* ---- Xbox Live ---- */
+
+static void live_register(void);
+static void live_refresh(void);
+static void dash_choose(void);
+static void dash_choose_folder(void);
+static void dash_refresh(void);
+static void upd_build(void);
+static void upd_refresh(void);
+static int  upd_offered(void);
+static char g_upd_value[64];            /* what the Updater row says */
+static char           g_dash_value[64];  /* what the Dashboard row says */
+static char           g_dash_note[300];  /* what the panel says about it */
+static volatile long  g_dash_state;      /* 0 idle, 1 copying, 2 finished */
+static volatile long  g_dash_files;      /* copied so far */
+static int            g_pick_dash;       /* the open dialog is the Dashboard row's */
+static char           g_live_value[64];  /* what the Register row says */
+static char           g_live_console[200]; /* which console this PC is */
+static int            g_live_stale = 1;  /* look at the console again */
+static volatile long  g_live_state;      /* 0 idle, 1 asking Insignia, 2 answered */
+static InsigniaResult g_live_result;
 
 /* ---- input ---- */
 
@@ -254,6 +284,7 @@ static const char *link_mode_label(int i)
     switch (i) {
     case LINK_HOST: return "Host a session";
     case LINK_JOIN: return "Join a session";
+    case LINK_LIVE: return "Xbox Live (Insignia)";
     case LINK_BY_HAND: return "udp (set in the settings file)";
     default: return "Off";
     }
@@ -295,6 +326,35 @@ static void build_link_rows(void)
         r->kind  = ROW_TEXT; r->text = g_settings.syslink_code;
         r->text_len = sizeof g_settings.syslink_code; r->empty = "none";
         r++;
+    }
+    if (g_link_mode == LINK_LIVE) {
+        r->label = "Insignia";
+        r->help  = "Tell Insignia this console's serial number and keys, as its"
+                   " setup assistant does on a real console. Once per console;"
+                   " the game can sign in after it.";
+        r->kind  = ROW_ACTION; r->text = g_live_value; r->action = live_register;
+        r++;
+
+        r->label = "Dashboard";
+        r->help  = "Your own copy of the Xbox dashboard (5960) makes your Xbox Live"
+                   " account and installs title updates. Choose the xemu hard disk"
+                   " image it is on: its C: drive is copied out and checked.";
+        r->kind  = ROW_ACTION; r->text = g_dash_value; r->action = dash_choose;
+        r++;
+
+        r->label = "";
+        r->help  = "A C: drive you copied off your Xbox over FTP: choose that folder.";
+        r->kind  = ROW_ACTION; r->text = (char *)"...or choose a folder"; r->action = dash_choose_folder;
+        r++;
+
+        if (upd_offered()) {
+            r->label = "Updater";
+            r->help  = "Builds the dashboard's online updater from your dashboard, as the"
+                       " game was built from your disc: the program that installs a title"
+                       " update when Xbox Live says the game needs one.";
+            r->kind  = ROW_ACTION; r->text = g_upd_value; r->action = upd_build;
+            r++;
+        }
     }
     if (g_link_mode == LINK_HOST) {
         r->label = "Open the router";
@@ -414,7 +474,8 @@ static int row_can(const Row *r, int delta)
     case ROW_INT:
         return delta < 0 ? *r->ival > r->lo : *r->ival < r->hi;
     case ROW_TEXT:
-        return 0;                       /* typed, not stepped: no arrows */
+    case ROW_ACTION:
+        return 0;                       /* typed, or done: no arrows */
     default:
         return 1;
     }
@@ -468,6 +529,11 @@ static char g_xbe_found[LAUNCHER_PATH]; /* empty: the game's files were not foun
 static int  g_release;
 static char g_release_dir[LAUNCHER_PATH];
 static char g_release_exe[128];
+/* release.json's title_update: the update's build, made once the updater has
+ * installed the update (xboxrecomp-build title-update). */
+static char g_release_update_exe[128];
+static int  g_rel_update_pending;       /* installed, not built */
+static int  g_rel_updating;             /* the build running is the update's */
 static char g_release_version[96];
 static char g_user_dir[LAUNCHER_PATH];   /* where the builder builds it */
 
@@ -679,6 +745,26 @@ static void release_status(void)
         g_rel = REL_SETUP;
         g_rel_stale = 1;
     }
+    /* An update the updater installed, with no build of it yet: the game
+     * would hand over to nothing. */
+    g_rel_update_pending = 0;
+    if (g_rel == REL_READY && g_release_update_exe[0]) {
+        char xbe[LAUNCHER_PATH + 64];
+        FILE *x;
+        snprintf(xbe, sizeof xbe, "%s/game/TDATA/%08X/$u/default.xbe", g_user_dir, g_title_id);
+        if (!(x = fopen(xbe, "rb"))) {
+            snprintf(xbe, sizeof xbe, "%s/game/TDATA/%08x/$u/default.xbe", g_user_dir, g_title_id);
+            x = fopen(xbe, "rb");
+        }
+        if (x) {
+            fclose(x);
+            snprintf(exe, sizeof exe, "%s/%s", g_user_dir, g_release_update_exe);
+            if (!(x = fopen(exe, "rb")))
+                g_rel_update_pending = 1;
+            else
+                fclose(x);
+        }
+    }
 }
 
 #if defined(__APPLE__)
@@ -761,6 +847,15 @@ static void release_init(void)
     if (strlen(g_release_exe) + 5 <= sizeof g_release_exe)
         strcat(g_release_exe, ".exe");
 #endif
+    {
+        const char *tu = strstr(text, "\"title_update\"");
+        if (tu && json_str(tu, "exe", g_release_update_exe, sizeof g_release_update_exe)) {
+#ifdef _WIN32
+            if (strlen(g_release_update_exe) + 5 <= sizeof g_release_update_exe)
+                strcat(g_release_update_exe, ".exe");
+#endif
+        }
+    }
     g_title_id = (uint32_t)strtoul(id, NULL, 16);
     json_str(text, "title_name", g_title_name, sizeof g_title_name);
     json_str(text, "version", g_release_version, sizeof g_release_version);
@@ -1274,6 +1369,22 @@ static void probe_thread(void)
  * to say so. Nothing is opened from here; the game does that while it hosts. */
 static void link_tab_tick(void)
 {
+    static long live_seen;
+    long live = lhost_read(&g_live_state);
+
+    if (g_link_mode == LINK_LIVE && (g_live_stale || live != live_seen))
+        live_refresh();
+    live_seen = live;
+    {
+        static long dash_seen = -1, files_seen = -1;
+        long dash = lhost_read(&g_dash_state), files = lhost_read(&g_dash_files);
+        if (g_link_mode == LINK_LIVE && (dash != dash_seen || (dash == 1 && files != files_seen))) {
+            dash_refresh();
+            upd_refresh();
+        }
+        dash_seen = dash;
+        files_seen = files;
+    }
     if (!g_lan_addr[0] && !net_local_address(g_lan_addr, sizeof g_lan_addr))
         snprintf(g_lan_addr, sizeof g_lan_addr, "?");
     /* Only this thread moves it off 0, so asking and starting are one. */
@@ -1302,9 +1413,584 @@ static void copy_text(const char *s)
         g_copied_until = lhost_ticks() + 1500;
 }
 
+/* ---- the Xbox Live tab's console and its registration ---- */
+
+/* The console identity code is the game's own (src/kernel/xbox_console_id.c,
+ * built in here), so the launcher finds the console the game will be: a
+ * backup beside the game folder, then the per-user one. It asks for the game
+ * folder through this, as the runtime answers it. */
+int xbox_path_game_dir_utf8(char *out, size_t n)
+{
+    char *slash;
+
+    if (!g_xbe_found[0])
+        return 0;
+    snprintf(out, n, "%s", g_xbe_found);
+    slash = strrchr(out, '/');
+#ifdef _WIN32
+    {
+        char *bs = strrchr(out, '\\');
+        if (bs && (!slash || bs > slash))
+            slash = bs;
+    }
+#endif
+    if (!slash)
+        return 0;
+    *slash = '\0';
+    return 1;
+}
+
+/* Whether the launcher may make a console when there is none: not when the
+ * settings name one (console_dir: that folder is the game's console, made or
+ * not) or say only a backup is wanted. */
+static int live_may_generate(void)
+{
+    const char *dir = recomp_config_lookup("RECOMP_CONSOLE_DIR", "console_dir");
+    const char *how = recomp_config_lookup("RECOMP_CONSOLE_IDENTITY", "console_identity");
+
+    return !(dir && *dir) && !(how && strcasecmp(how, "backup") == 0);
+}
+
+/* The console as the game will find it, looked at afresh. Looking never
+ * makes one; with make, one is generated for this install when there is
+ * none, where the game would make it. */
+static const XboxConsoleId *live_console(int make)
+{
+    xbox_console_id_generate(make ? 1 : 0);
+    xbox_console_id_reset();
+    return xbox_ConsoleId();
+}
+
+/* What the tab says about the console, after a change or an answer. Reads
+ * a few small files, so only then, not every frame. */
+static void live_refresh(void)
+{
+    const XboxConsoleId *id = live_console(0);
+    long state = lhost_read(&g_live_state);
+
+    if (!id)
+        snprintf(g_live_console, sizeof g_live_console, live_may_generate()
+                 ? "None yet. Registering makes one for this PC, kept for good;"
+                   " so does starting the game."
+                 : "None: the settings name a console folder (console_dir) with no"
+                   " eeprom.bin in it, or ask for a backup only.");
+    else if (id->generated)
+        snprintf(g_live_console, sizeof g_live_console,
+                 "Made for this PC, and kept: every game here signs in as it.");
+    else
+        snprintf(g_live_console, sizeof g_live_console,
+                 "Your own console's backup, in %s.", id->dir);
+
+    if (state == 1)
+        snprintf(g_live_value, sizeof g_live_value, "Registering...");
+    else if (id && id->generated && insignia_is_registered(id->dir))
+        snprintf(g_live_value, sizeof g_live_value, "Registered");
+    else
+        snprintf(g_live_value, sizeof g_live_value, "Register this console");
+    g_live_stale = 0;
+}
+
+static struct {
+    char    serial[12];
+    uint8_t hd_key[16], online_key[16];
+    char    dir[LAUNCHER_PATH];
+    int     generated;
+} g_live_ask;
+
+static void live_thread(void)
+{
+    InsigniaResult r;
+
+    insignia_register(g_live_ask.serial, g_live_ask.hd_key, g_live_ask.online_key, &r);
+    /* Remembered only for a console made here: a backup's folder is the
+     * player's, and is not written to. */
+    if (r.outcome == INSIGNIA_REGISTERED && g_live_ask.generated)
+        insignia_mark_registered(g_live_ask.dir);
+    memset(&g_live_ask, 0, sizeof g_live_ask);
+    g_live_result = r;
+    lhost_publish(&g_live_state, 2);
+}
+
+/* The Register row. Sent only when asked, once at a time, and never again
+ * for a console already registered from here: to Insignia a request is a
+ * console turning up. */
+static void live_register(void)
+{
+    const XboxConsoleId *id;
+
+    if (lhost_read(&g_live_state) == 1)
+        return;
+    id = live_console(1);
+    if (!id) {
+        memset(&g_live_result, 0, sizeof g_live_result);
+        g_live_result.outcome = INSIGNIA_BAD_CONSOLE;
+        snprintf(g_live_result.message, sizeof g_live_result.message,
+                 "There is no console to register, and none could be made.");
+        lhost_publish(&g_live_state, 2);
+        g_live_stale = 1;
+        return;
+    }
+    if (id->generated && insignia_is_registered(id->dir)) {
+        g_live_stale = 1;
+        return;
+    }
+    if (!id->have_hd_key) {
+        memset(&g_live_result, 0, sizeof g_live_result);
+        g_live_result.outcome = INSIGNIA_BAD_CONSOLE;
+        snprintf(g_live_result.message, sizeof g_live_result.message,
+                 "The backup has no HDD key (hddinfo.txt or hd_key.txt beside eeprom.bin).");
+        lhost_publish(&g_live_state, 2);
+        return;
+    }
+    memcpy(g_live_ask.serial, id->serial, 12);
+    memcpy(g_live_ask.hd_key, id->hd_key, 16);
+    memcpy(g_live_ask.online_key, id->online_key, 16);
+    snprintf(g_live_ask.dir, sizeof g_live_ask.dir, "%s", id->dir);
+    g_live_ask.generated = id->generated;
+    lhost_publish(&g_live_state, 1);
+    if (!lhost_thread(live_thread)) {
+        memset(&g_live_ask, 0, sizeof g_live_ask);
+        lhost_publish(&g_live_state, 0);
+    }
+    g_live_stale = 1;
+}
+
+/* ---- the player's own dashboard, copied off their xemu disk image ---- */
+
+/* The 5960 online dashboard (xodash\xonlinedash.xbe), by size and SHA-1: the
+ * build docs/technical/xbox-live-accounts.md describes. */
+static const uint8_t k_dash_sha1[20] = {
+    0x6b, 0x9d, 0x11, 0x91, 0x85, 0xdc, 0xab, 0x48, 0xb6, 0x2d,
+    0xb7, 0xf5, 0xaf, 0xdc, 0xfd, 0x74, 0x52, 0xfb, 0x4b, 0x39,
+};
+#define DASH_ONLINE_SIZE 2617344u
+
+static int dash_dir(char *out, size_t n, const char *leaf)
+{
+    char dir[LAUNCHER_PATH];
+
+    if (!recomp_config_user_dir(dir, sizeof dir))
+        return 0;
+#ifdef _WIN32
+    snprintf(out, n, "%s\\%s", dir, leaf);
+#else
+    snprintf(out, n, "%s/%s", dir, leaf);
+#endif
+    return 1;
+}
+
+/* 1 when folder holds the 5960 online dashboard; 0 with why in note. */
+static int dash_check(const char *folder, char *note, size_t n)
+{
+    char path[LAUNCHER_PATH + 64];
+    uint8_t sha[20];
+    uint64_t size = 0;
+
+#ifdef _WIN32
+    snprintf(path, sizeof path, "%s\\xodash\\xonlinedash.xbe", folder);
+#else
+    snprintf(path, sizeof path, "%s/xodash/xonlinedash.xbe", folder);
+#endif
+    if (!xbox_hdd_sha1_file(path, sha, &size)) {
+        snprintf(note, n, "No online dashboard (xodash\\xonlinedash.xbe) on that C: drive:"
+                 " install the 5960 dashboard in xemu first.");
+        return 0;
+    }
+    if (size != DASH_ONLINE_SIZE || memcmp(sha, k_dash_sha1, sizeof sha) != 0) {
+        snprintf(note, n, "That dashboard is not version 5960, the one Insignia needs"
+                 " (System Info should show D:1.00.5960.01).");
+        return 0;
+    }
+    return 1;
+}
+
+static void dash_refresh(void)
+{
+    char dir[LAUNCHER_PATH];
+    long state = lhost_read(&g_dash_state);
+
+    if (state == 1) {
+        snprintf(g_dash_value, sizeof g_dash_value, "Copying... %ld files",
+                 lhost_read(&g_dash_files));
+        return;
+    }
+    if (dash_dir(dir, sizeof dir, "dashboard") && dash_check(dir, g_dash_note, sizeof g_dash_note)) {
+        snprintf(g_dash_value, sizeof g_dash_value, "Dashboard 5960 ready");
+        if (state != 2)
+            snprintf(g_dash_note, sizeof g_dash_note,
+                     "Your dashboard is ready. Choose the row again to copy another.");
+    } else {
+        snprintf(g_dash_value, sizeof g_dash_value, "Choose your xemu disk image");
+        if (state != 2)
+            g_dash_note[0] = '\0';
+    }
+}
+
+static int dash_progress(const char *path, void *ctx)
+{
+    (void)path;
+    (void)ctx;
+    lhost_publish(&g_dash_files, lhost_read(&g_dash_files) + 1);
+    return 0;
+}
+
+static char g_dash_image[LAUNCHER_PATH];   /* the image, or the folder */
+static int  g_dash_from_folder;
+
+/* Whether path is one of the two folders this job makes and may delete. */
+static int dash_ours(const char *path)
+{
+    size_t n = strlen(path);
+    return (n > 13 && strcmp(path + n - 13, "dashboard.new") == 0) ||
+           (n > 13 && strcmp(path + n - 13, "dashboard.old") == 0);
+}
+
+static void remove_tree(const char *path, int depth)
+{
+#ifdef _WIN32
+    char pat[LAUNCHER_PATH + 8], sub[LAUNCHER_PATH + 300];
+    WIN32_FIND_DATAA fd;
+    HANDLE f;
+
+    if (depth > 40)
+        return;
+    snprintf(pat, sizeof pat, "%s\\*", path);
+    f = FindFirstFileA(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+                continue;
+            snprintf(sub, sizeof sub, "%s\\%s", path, fd.cFileName);
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                remove_tree(sub, depth + 1);
+            else
+                DeleteFileA(sub);
+        } while (FindNextFileA(f, &fd));
+        FindClose(f);
+    }
+    RemoveDirectoryA(path);
+#else
+    char sub[LAUNCHER_PATH + 300];
+    struct dirent *e;
+    struct stat st;
+    DIR *d;
+
+    if (depth > 40 || lstat(path, &st) != 0)
+        return;
+    if (!S_ISDIR(st.st_mode)) {
+        unlink(path);
+        return;
+    }
+    d = opendir(path);
+    while (d && (e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        snprintf(sub, sizeof sub, "%s/%s", path, e->d_name);
+        remove_tree(sub, depth + 1);      /* lstat: a link is unlinked, not followed */
+    }
+    if (d)
+        closedir(d);
+    rmdir(path);
+#endif
+}
+
+/* Remove a folder this job made, and nothing else. */
+static void dash_remove(const char *path)
+{
+    if (dash_ours(path))
+        remove_tree(path, 0);
+}
+
+static int copy_one(const char *from, const char *to)
+{
+    char buf[65536];
+    size_t got;
+    int ok = 1;
+    FILE *in = fopen(from, "rb"), *out = in ? fopen(to, "wb") : NULL;
+
+    if (!in || !out)
+        ok = 0;
+    while (ok && (got = fread(buf, 1, sizeof buf, in)) > 0)
+        ok = fwrite(buf, 1, got, out) == got;
+    if (in)
+        fclose(in);
+    if (out && fclose(out) != 0)
+        ok = 0;
+    return ok;
+}
+
+/* Copy a folder's tree (files and folders; links are followed, as a copy of
+ * a C: drive is plain files). -1 on a failure, else the files copied. */
+static long copy_tree(const char *from, const char *to, int depth)
+{
+    long files = 0;
+#ifdef _WIN32
+    char pat[LAUNCHER_PATH + 8], a[LAUNCHER_PATH + 300], b[LAUNCHER_PATH + 300];
+    WIN32_FIND_DATAA fd;
+    HANDLE f;
+
+    if (depth > 40)
+        return -1;
+    CreateDirectoryA(to, NULL);
+    snprintf(pat, sizeof pat, "%s\\*", from);
+    f = FindFirstFileA(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE)
+        return -1;
+    do {
+        long k;
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+            continue;
+        snprintf(a, sizeof a, "%s\\%s", from, fd.cFileName);
+        snprintf(b, sizeof b, "%s\\%s", to, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            k = copy_tree(a, b, depth + 1);
+        else
+            k = copy_one(a, b) ? 1 : -1;
+        if (k < 0) {
+            FindClose(f);
+            return -1;
+        }
+        files += k;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            lhost_publish(&g_dash_files, lhost_read(&g_dash_files) + 1);
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+#else
+    char a[LAUNCHER_PATH + 300], b[LAUNCHER_PATH + 300];
+    struct dirent *e;
+    struct stat st;
+    DIR *d;
+
+    if (depth > 40)
+        return -1;
+    mkdir(to, 0755);
+    d = opendir(from);
+    if (!d)
+        return -1;
+    while ((e = readdir(d)) != NULL) {
+        long k;
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        snprintf(a, sizeof a, "%s/%s", from, e->d_name);
+        snprintf(b, sizeof b, "%s/%s", to, e->d_name);
+        if (stat(a, &st) != 0)
+            continue;
+        k = S_ISDIR(st.st_mode) ? copy_tree(a, b, depth + 1) : (copy_one(a, b) ? 1 : -1);
+        if (k < 0) {
+            closedir(d);
+            return -1;
+        }
+        files += k;
+        if (!S_ISDIR(st.st_mode))
+            lhost_publish(&g_dash_files, lhost_read(&g_dash_files) + 1);
+    }
+    closedir(d);
+#endif
+    return files;
+}
+
+static void dash_thread(void)
+{
+    char err[300], fresh[LAUNCHER_PATH], dest[LAUNCHER_PATH], old[LAUNCHER_PATH];
+    XboxHdd *h = NULL;
+    XboxFatx *v = NULL;
+    long n = -1;
+
+    err[0] = '\0';
+    if (!dash_dir(fresh, sizeof fresh, "dashboard.new") || !dash_dir(dest, sizeof dest, "dashboard") ||
+        !dash_dir(old, sizeof old, "dashboard.old")) {
+        snprintf(err, sizeof err, "No settings folder to copy the dashboard into.");
+    } else if (g_dash_from_folder) {
+        recomp_make_dirs(fresh);
+        dash_remove(fresh);
+        n = copy_tree(g_dash_image, fresh, 0);
+        if (n < 0)
+            snprintf(err, sizeof err, "Could not copy %s.", g_dash_image);
+    } else if (!(h = xbox_hdd_open(g_dash_image, err, sizeof err))) {
+        /* err says why */
+    } else if (!(v = xbox_fatx_open(h, XBOX_HDD_C_OFFSET, XBOX_HDD_C_SIZE, err, sizeof err))) {
+        /* not an Xbox disk, or C: is not formatted */
+    } else {
+        recomp_make_dirs(fresh);
+        dash_remove(fresh);
+        n = xbox_fatx_extract(v, fresh, dash_progress, NULL, err, sizeof err);
+    }
+    xbox_fatx_close(v);
+    xbox_hdd_close(h);
+    if (n >= 0 && dash_check(fresh, err, sizeof err)) {
+        dash_remove(old);
+        rename(dest, old);                 /* the one before, if any */
+        if (rename(fresh, dest) == 0) {
+            dash_remove(old);
+            snprintf(g_dash_note, sizeof g_dash_note, "Copied %ld files from %s:"
+                     " dashboard 5960, ready.", n,
+                     g_dash_from_folder ? "the folder" : "the image's C: drive");
+        } else {
+            rename(old, dest);
+            snprintf(g_dash_note, sizeof g_dash_note, "Could not put the dashboard in place (%s).", dest);
+        }
+    } else {
+        if (n >= 0)
+            dash_remove(fresh);
+        snprintf(g_dash_note, sizeof g_dash_note, "%s", err[0] ? err : "The copy did not finish.");
+    }
+    lhost_publish(&g_dash_state, 2);
+}
+
+/* The Dashboard rows: ask for the image, or a folder. */
+static void dash_ask(int folder)
+{
+    if (lhost_read(&g_dash_state) == 1)
+        return;
+    g_pick_dash = folder ? 2 : 1;
+    if (!lhost_pick(folder)) {
+        g_pick_dash = 0;
+        snprintf(g_dash_note, sizeof g_dash_note, "No file dialog here. Copy your dashboard"
+                 " into the settings folder's dashboard/ by hand (docs/dashboard-files.md).");
+        lhost_publish(&g_dash_state, 2);
+    }
+}
+
+static void dash_choose(void) { dash_ask(0); }
+static void dash_choose_folder(void) { dash_ask(1); }
+
+/* What the dialog gave for a Dashboard row. */
+static void dash_picked(const char *path)
+{
+    g_dash_from_folder = g_pick_dash == 2;
+    g_pick_dash = 0;
+    if (!path) {
+        snprintf(g_dash_note, sizeof g_dash_note, "Nothing chosen.");
+        lhost_publish(&g_dash_state, 2);
+        return;
+    }
+    snprintf(g_dash_image, sizeof g_dash_image, "%s", path);
+    lhost_publish(&g_dash_files, 0);
+    lhost_publish(&g_dash_state, 1);
+    snprintf(g_dash_note, sizeof g_dash_note, g_dash_from_folder ? "Copying %s..."
+             : "Copying the C: drive off %s...", path);
+    if (!lhost_thread(dash_thread)) {
+        snprintf(g_dash_note, sizeof g_dash_note, "Could not start the copy.");
+        lhost_publish(&g_dash_state, 2);
+    }
+}
+
+/* ---- the online updater, built from the player's own dashboard ---- */
+
+static int    g_upd_building;           /* the job is the updater's */
+static double g_upd_progress;
+
+static int upd_file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f)
+        fclose(f);
+    return f != NULL;
+}
+
+/* A release that carries the updater's recipe (make_release.py, "updater"). */
+static int upd_offered(void)
+{
+    char path[LAUNCHER_PATH + 64];
+
+    if (!g_release)
+        return 0;
+#ifdef _WIN32
+    snprintf(path, sizeof path, "%s\\recipe-updater\\CMakeLists.txt", g_release_dir);
+#else
+    snprintf(path, sizeof path, "%s/recipe-updater/CMakeLists.txt", g_release_dir);
+#endif
+    return upd_file_exists(path);
+}
+
+/* Where the builder puts it: updater/ beside the game, where the game looks. */
+static int upd_built(void)
+{
+    char dir[LAUNCHER_PATH], path[LAUNCHER_PATH + 64];
+
+    if (!release_user_dir(g_title_id, dir, sizeof dir))
+        return 0;
+#ifdef _WIN32
+    snprintf(path, sizeof path, "%s\\updater\\xodash_update_recomp.exe", dir);
+#else
+    snprintf(path, sizeof path, "%s/updater/xodash_update_recomp", dir);
+#endif
+    return upd_file_exists(path);
+}
+
+static void upd_refresh(void)
+{
+    if (g_upd_building)
+        snprintf(g_upd_value, sizeof g_upd_value, "Building... %d%%", (int)(g_upd_progress * 100.0));
+    else if (upd_built())
+        snprintf(g_upd_value, sizeof g_upd_value, "Updater ready");
+    else
+        snprintf(g_upd_value, sizeof g_upd_value, "Build the updater");
+}
+
+/* The Updater row: build it, from the dashboard the Dashboard row copied. */
+static void upd_build(void)
+{
+    char exe[LAUNCHER_PATH + 64], dash[LAUNCHER_PATH], note[300];
+    const char *argv[5];
+
+    if (g_upd_building)
+        return;
+    if (!dash_dir(dash, sizeof dash, "dashboard") || !dash_check(dash, note, sizeof note)) {
+        snprintf(g_dash_note, sizeof g_dash_note,
+                 "The updater is built from your dashboard: copy it first (the Dashboard row).");
+        return;
+    }
+#ifdef _WIN32
+    snprintf(exe, sizeof exe, "%s\\bin\\xboxrecomp-build.exe", g_release_dir);
+#else
+    snprintf(exe, sizeof exe, "%s/bin/xboxrecomp-build", g_release_dir);
+#endif
+    argv[0] = exe; argv[1] = "updater"; argv[2] = "--dashboard"; argv[3] = dash; argv[4] = NULL;
+    if (!lhost_job_start(argv)) {
+        snprintf(g_dash_note, sizeof g_dash_note, "The builder could not be started (%s).", exe);
+        return;
+    }
+    g_upd_building = 1;
+    g_upd_progress = 0.0;
+    snprintf(g_dash_note, sizeof g_dash_note, "Building the online updater from your dashboard...");
+    upd_refresh();
+}
+
+/* While it builds: its progress, then how it went. */
+static void upd_tick(void)
+{
+    char line[4096], ev[24];
+    int n = 0, code;
+
+    while (n++ < 64 && lhost_job_line(line, sizeof line)) {
+        if (!json_str(line, "event", ev, sizeof ev))
+            continue;
+        if (strcmp(ev, "progress") == 0)
+            g_upd_progress = json_num(line, "overall");
+        else if (strcmp(ev, "error") == 0)
+            json_str(line, "message", g_dash_note, sizeof g_dash_note);
+    }
+    code = lhost_job_status();
+    if (code < 0) {
+        upd_refresh();
+        return;
+    }
+    g_upd_building = 0;
+    if (code == 0)
+        snprintf(g_dash_note, sizeof g_dash_note, "The online updater is built. When Xbox"
+                 " Live says the game needs an update, choosing OK installs it.");
+    else if (!g_dash_note[0] || strncmp(g_dash_note, "Building", 8) == 0)
+        snprintf(g_dash_note, sizeof g_dash_note, "The updater's build stopped (exit %d): see"
+                 " updater/build.log in the game's build folder.", code);
+    upd_refresh();
+}
+
 /* After the mode row moved: the list is a different length now. */
 static void link_rows_changed(void)
 {
+    g_live_stale = 1;
     build_link_rows();
     if (g_sel >= g_link_count)
         g_sel = g_link_count - 1;
@@ -1511,8 +2197,16 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
                 link_rows_changed();
         }
     }
-    if (accept)
-        do_play();
+    if (accept) {
+        int count;
+        Row *rows = tab_rows(&count);
+
+        /* A on an action row does it; anywhere else it plays. */
+        if (rows && g_sel < count && rows[g_sel].kind == ROW_ACTION)
+            rows[g_sel].action();
+        else
+            do_play();
+    }
     if (cancel)
         lhost_close();
 }
@@ -1622,6 +2316,47 @@ static void draw_link(void)
                  lhost_ticks() < g_copied_until ? "Copied."
                                                 : LAUNCHER_COPY_KEY " or a click here copies it.");
         theme_text_wrapped(line, text, 11, THEME_TEXT_DIM);
+    } else if (g_link_mode == LINK_LIVE) {
+        long state = lhost_read(&g_live_state);
+
+        theme_text(line, "XBOX LIVE", 10, 700, THEME_GREEN, THEME_LEFT);
+        line.y += 30; line.h = 60;
+        snprintf(text, sizeof text, "Console      %s", g_live_console);
+        theme_text_wrapped(line, text, 12, THEME_TEXT);
+        line.y += 64; line.h = 100;
+        if (g_dash_note[0]) {
+            theme_text_wrapped(line, g_dash_note, 12, THEME_TEXT);
+            line.y += 40;
+            line.h = 60;
+        }
+        if (g_sel < g_link_count && (g_link_rows[g_sel].action == dash_choose ||
+                                     g_link_rows[g_sel].action == dash_choose_folder) &&
+            lhost_read(&g_dash_state) != 1) {
+            /* The short guide; dashboard-files.md beside the launcher is the long one. */
+            theme_text_wrapped(line,
+                "Your dashboard comes from your own Xbox: its C: drive, running dashboard"
+                " 5960 (System Info shows D:1.00.5960.01). From an Xbox: softmod it, copy C:"
+                " over FTP (EvoX, UnleashX, XBMC), then choose that folder. In xemu: if"
+                " you installed your dashboard there, choose its disk image. Step by"
+                " step: dashboard-files.md, beside this launcher.",
+                12, THEME_TEXT_DIM);
+        } else if (state == 2 && g_live_result.message[0]) {
+            snprintf(text, sizeof text, "%s%s", g_live_result.message,
+                     g_live_result.outcome == INSIGNIA_REGISTERED
+                         ? " Start the game and sign in from its Xbox Live menu."
+                         : "");
+            theme_text_wrapped(line, text, 12,
+                               g_live_result.outcome == INSIGNIA_REGISTERED
+                                   ? THEME_GREEN : THEME_TEXT);
+        } else {
+            theme_text_wrapped(line,
+                "The game connects to the internet through this PC and signs in to"
+                " Insignia, the revived Xbox Live, as the console above. Register it"
+                " once first. To make an account you need a subscription code from"
+                " insignia.live and your own copy of the Xbox dashboard (5960): see"
+                " \"Getting your own Xbox dashboard files\" in the docs.",
+                12, THEME_TEXT_DIM);
+        }
     } else if (g_link_mode == LINK_JOIN) {
         theme_text(line, "JOINING", 10, 700, THEME_GREEN, THEME_LEFT);
         line.y += 30; line.h = 120;
@@ -1707,6 +2442,30 @@ static void release_start_build(void)
     g_rel = REL_BUILDING;
 }
 
+/* The title's update, installed by the updater: built as the game was. */
+static void release_start_update(void)
+{
+    char exe[LAUNCHER_PATH + 64];
+    const char *argv[3];
+
+#ifdef _WIN32
+    snprintf(exe, sizeof exe, "%s\\bin\\xboxrecomp-build.exe", g_release_dir);
+#else
+    snprintf(exe, sizeof exe, "%s/bin/xboxrecomp-build", g_release_dir);
+#endif
+    argv[0] = exe; argv[1] = "title-update"; argv[2] = NULL;
+    g_rel_error[0] = g_rel_note[0] = '\0';
+    g_rel_unsupported = g_build_cancelled = 0;
+    g_build_progress = 0.0;
+    snprintf(g_build_label, sizeof g_build_label, "Building the game's update");
+    g_build_detail[0] = '\0';
+    g_build_started = lhost_ticks();
+    if (!lhost_job_start(argv))
+        return;                          /* the game still plays, without its update */
+    g_rel_updating = 1;
+    g_rel = REL_BUILDING;
+}
+
 /* One line of the builder's progress (tools/builder: one JSON object a line). */
 static void release_line(const char *line)
 {
@@ -1739,6 +2498,7 @@ static void release_tick(void)
     if (code < 0)
         return;
     if (code == 0 && !g_rel_error[0]) {
+        g_rel_updating = 0;
         /* Built: the game's own files now name it, and the settings are
          * its; then the ordinary launcher, Play and all. */
         g_rel_stale = 0;
@@ -1757,6 +2517,16 @@ static void release_tick(void)
         /* Say so, rather than swapping screens under the player. */
         g_build_ms = lhost_ticks() - g_build_started;
         g_rel = REL_DONE;
+        return;
+    }
+    if (g_rel_updating) {
+        /* The game is still built and plays; only its update is not. */
+        g_rel_updating = 0;
+        g_rel = REL_READY;
+        snprintf(g_dash_note, sizeof g_dash_note, "The game's update did not build (%s)."
+                 " Its log is %s/update/build.log.", g_rel_error[0] ? g_rel_error : "stopped",
+                 g_user_dir);
+        g_rel_error[0] = '\0';
         return;
     }
     g_rel = REL_SETUP;
@@ -2006,6 +2776,10 @@ static void setup_char(unsigned ch)
 
 void launcher_picked(const char *path)
 {
+    if (g_pick_dash) {
+        dash_picked(path);
+        return;
+    }
     if (!path) {
         snprintf(g_rel_note, sizeof g_rel_note,
                  "Nothing chosen. If no dialog appeared, type or paste the path in the box.");
@@ -2255,12 +3029,21 @@ static void draw(void)
             11, THEME_TEXT_DIM);
     }
 
-    /* The footer says how to drive it, and changes with what is plugged in. */
+    /* The footer says how to drive it, and changes with what is plugged in,
+     * and with the row: on an action row A does the action, not Play. */
     r.x = 60; r.y = g_ch - 44; r.w = g_cw - 260; r.h = 24;
-    theme_text(r, g_pad_seen
-                  ? "A  Play      B  Quit      LB RB  Change tab      D-pad  Move"
-                  : "Enter  Play      Esc  Quit      Tab  Change tab      Arrows  Move",
-               11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    {
+        int count, action;
+        Row *rows = tab_rows(&count);
+
+        action = rows && g_sel < count && rows[g_sel].kind == ROW_ACTION;
+        theme_text(r, g_pad_seen
+                      ? (action ? "A  Do it      B  Quit      LB RB  Change tab      D-pad  Move"
+                                : "A  Play      B  Quit      LB RB  Change tab      D-pad  Move")
+                      : (action ? "Enter  Do it      Esc  Quit      Tab  Change tab      Arrows  Move"
+                                : "Enter  Play      Esc  Quit      Tab  Change tab      Arrows  Move"),
+                   11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    }
 
     {   /* Play, always on screen, always the obvious thing to press. */
         ThemeRect b;
@@ -2322,13 +3105,35 @@ void launcher_init(void)
 
     release_init();
     read_title();
+    /* Lookups by name (console_dir, console_identity) then read this game's
+     * settings file, as they do in the game. */
+    recomp_config_set_title(g_title_id);
     settings_load();
     bindings_load();
     build_rows();
+    /* RECOMP_LAUNCHER_TAB=video|input|link|about, and RECOMP_LAUNCHER_ROW=<n>
+     * on it: open there, so RECOMP_LAUNCHER_SHOT can show any tab. */
+    {
+        const char *tab = getenv("RECOMP_LAUNCHER_TAB"), *row = getenv("RECOMP_LAUNCHER_ROW");
+        static const char *const names[TAB_COUNT] = { "video", "input", "link", "about" };
+        int i;
+
+        for (i = 0; tab && i < TAB_COUNT; i++)
+            if (strcasecmp(tab, names[i]) == 0) {
+                set_tab((Tab)i);
+                g_tab_t = 1.0;
+            }
+        if (row && *row)
+            g_sel = atoi(row);
+    }
     rows_for_tab();
+    if (g_sel >= g_rows_on_tab)
+        g_sel = 0;
     /* RECOMP_LAUNCHER_BUILD=<image or folder>: build from it straight away,
      * for a front end that already knows where the disc is, and for a
      * script checking the whole path. */
+    if (g_release && g_rel == REL_READY && g_rel_update_pending)
+        release_start_update();
     build = getenv("RECOMP_LAUNCHER_BUILD");
     if (g_release && build && *build && g_rel == REL_SETUP) {
         snprintf(g_source, sizeof g_source, "%s", build);
@@ -2454,8 +3259,12 @@ void launcher_click(int mx, int my)
         g_sel = i;
         /* Back or forward on the arrows; anywhere else on the row steps
          * it forward, which is how a toggle is clicked. A text row only
-         * takes the selection, to be typed into. */
-        row_move(&rows[i], dir ? dir : 1);
+         * takes the selection, to be typed into; an action row does its
+         * action. */
+        if (rows[i].kind == ROW_ACTION)
+            rows[i].action();
+        else
+            row_move(&rows[i], dir ? dir : 1);
         if (g_tab == TAB_LINK)
             link_rows_changed();
     } else if (g_tab == TAB_LINK && g_link_mode == LINK_HOST &&
@@ -2519,6 +3328,8 @@ void launcher_tick(void)
         link_tab_tick();
     if (g_rel == REL_BUILDING)
         release_tick();
+    if (g_upd_building)
+        upd_tick();
     g_pad_seen = pad_poll(&dx, &dy, &a, &b, &t);
     if (g_capturing)
         capture_tick();             /* the press is the answer, not a move */

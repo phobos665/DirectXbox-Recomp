@@ -353,11 +353,27 @@ static void xbox_copy_ansi(char* dst, size_t dst_size, PXBOX_ANSI_STRING src)
     dst[n] = '\0';
 }
 
+/* The object manager ignores case, as the console's does: the 5960 online
+ * dashboard links "\??\b:" and opens "b:\media\...", and the lookup asks
+ * for "\??\B:". With an exact compare every lower-case link was recorded
+ * and never found. */
+static int symlink_name_eq(const char* a, const char* b)
+{
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'a' && x <= 'z') x = (char)(x - 'a' + 'A');
+        if (y >= 'a' && y <= 'z') y = (char)(y - 'a' + 'A');
+        if (x != y)
+            return 0;
+    }
+    return *a == *b;
+}
+
 static XBOX_SYMLINK* xbox_find_symlink(const char* name)
 {
     int i;
     for (i = 0; i < XBOX_MAX_SYMLINKS; i++) {
-        if (g_symlinks[i].used && strcmp(g_symlinks[i].link, name) == 0)
+        if (g_symlinks[i].used && symlink_name_eq(g_symlinks[i].link, name))
             return &g_symlinks[i];
     }
     return NULL;

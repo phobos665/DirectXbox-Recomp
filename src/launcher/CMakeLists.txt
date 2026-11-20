@@ -122,10 +122,19 @@ function(recomp_add_launcher TARGET GAME_EXE)
     # (host_main.h: where this executable is). xbox_net finds the
     # addresses the System Link tab tells a host to give out.
     target_link_libraries(${TARGET} PRIVATE xbox_config xbox_input xbox_net)
+    # The console identity is the game's own code, so Xbox Live registration
+    # finds the console the game will be (launcher.c, live_console).
+    target_sources(${TARGET} PRIVATE ${_dir}/../kernel/xbox_console_id.c)
+    target_include_directories(${TARGET} PRIVATE ${_dir}/../kernel ${_dir}/..)
+    # The player's own dashboard, copied off their xemu disk image
+    # (launcher.c, dash_choose).
+    target_sources(${TARGET} PRIVATE ${_dir}/../hdd/xbox_hdd.c)
+    target_include_directories(${TARGET} PRIVATE ${_dir}/../hdd)
     if(WIN32)
         # The rest is in every Windows.
-        # ole32 for the open dialog a self-building release asks with.
-        target_link_libraries(${TARGET} PRIVATE user32 gdi32 ole32)
+        # ole32 for the open dialog a self-building release asks with;
+        # bcrypt for a generated console's random bytes.
+        target_link_libraries(${TARGET} PRIVATE user32 gdi32 ole32 bcrypt)
     elseif(APPLE)
         target_link_libraries(${TARGET} PRIVATE SDL3::SDL3
             "-framework CoreText" "-framework CoreGraphics"
