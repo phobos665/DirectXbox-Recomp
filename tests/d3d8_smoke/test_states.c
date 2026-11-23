@@ -38,6 +38,29 @@ static D3D11_DEPTH_STENCIL_DESC apply(void)
     return desc;
 }
 
+static void check_depth_clip(void)
+{
+    /* Change only the guest clip mode. It must invalidate the cached
+     * rasterizer even when fill, winding and scissor stay the same. */
+    static const struct { DWORD control; BOOL clip; } cases[] = {
+        { 0, FALSE }, { 1, TRUE }, { 0x10, FALSE }, { 1, TRUE }, { 0, FALSE }
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ID3D11RasterizerState *state = NULL;
+        D3D11_RASTERIZER_DESC desc;
+        rs[D3DRS_DEPTHCLIPCONTROL] = cases[i].control;
+        d3d8_states_apply();
+        ID3D11DeviceContext_RSGetState(context, &state);
+        CHECK("rasterizer bound", state != NULL);
+        if (state) {
+            ID3D11RasterizerState_GetDesc(state, &desc);
+            CHECK("guest near/far clipping", desc.DepthClipEnable == cases[i].clip);
+            ID3D11RasterizerState_Release(state);
+        }
+    }
+}
+
 static void check_blend_factors(void)
 {
     static const struct { DWORD guest; D3D11_BLEND rgb, alpha; } cases[] = {
@@ -156,6 +179,7 @@ int main(void)
     d3d8_states_init();
     desc = apply();
     CHECK("cache recreates after shutdown", desc.StencilWriteMask == 0x5A);
+    check_depth_clip();
     check_blend_factors();
     d3d8_states_shutdown();
     ID3D11DeviceContext_ClearState(context);

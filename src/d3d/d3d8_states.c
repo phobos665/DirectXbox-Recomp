@@ -116,11 +116,11 @@ static DWORD hash_blend_states(const DWORD *rs)
            (rs[D3DRS_COLORWRITEENABLE] << 16);
 }
 
-static DWORD hash_raster_states(const DWORD *rs, BOOL scissor)
+static DWORD hash_raster_states(const DWORD *rs, BOOL scissor, BOOL clip_depth)
 {
     return rs[D3DRS_CULLMODE] ^
            (rs[D3DRS_FILLMODE] << 4) ^
-           (scissor ? 0x100u : 0u);
+           (scissor ? 0x100u : 0u) ^ (clip_depth ? 0x200u : 0u);
 }
 
 /* ================================================================
@@ -185,32 +185,25 @@ static void update_depth_stencil_state(const DWORD *rs)
         memcpy(&g_last_ds_desc, &dsd, sizeof(dsd));
 }
 
-/* Whether depth is clamped rather than clipped (RECOMP_D3D8_DEPTH_CLAMP,
- * on unless 0).
- *
- * An Xbox vertex program writes screen-space depth, in the depth buffer's
- * own units (0 to 0xFFFFFF for D24S8). The host divides by that scale and,
- * clipping, discards anything outside 0..1. Battlefield 2: Modern Combat's
- * multiplayer menus put every panel and every line of text at z = -0.1, a
- * tenth of a depth unit in front of the near plane. The console shows them,
- * so it does not discard depth that close to the range (the NV2A has a
- * z-clamp mode; which one the XDK sets is not checked here). The host
- * clipped every one and the menus were black. Clamping keeps them, at
- * depth 0. */
-static int depth_clamp(void)
+/* NV097_SET_ZMIN_MAX_CONTROL = 1 enables near/far culling with both
+ * Z-clamp and ignore-W off. TS2 uses it for laser strips that cross the
+ * eye. Depth clamping lets their near-plane fragments wash over the cabin.
+ * Keep the existing clamp for other modes and captures without this state. */
+static BOOL depth_clip(DWORD control)
 {
-    static int on = -1;
+    static int override = -2;
 
-    if (on < 0) {
+    if (override == -2) {
         const char *e = getenv("RECOMP_D3D8_DEPTH_CLAMP");
-        on = !(e && e[0] == '0');
+        override = e && *e ? e[0] == '0' : -1;
     }
-    return on;
+    return override >= 0 ? override : control == 1;
 }
 
 static void update_rasterizer_state(const DWORD *rs, BOOL scissor)
 {
-    DWORD hash = hash_raster_states(rs, scissor);
+    BOOL clip_depth = depth_clip(rs[D3DRS_DEPTHCLIPCONTROL]);
+    DWORD hash = hash_raster_states(rs, scissor, clip_depth);
     RhiRasterDesc rd;
 
     if (hash == g_last_raster_hash && g_raster_state) return;
@@ -239,7 +232,7 @@ static void update_rasterizer_state(const DWORD *rs, BOOL scissor)
     }
 
     rd.front_ccw = 0;
-    rd.depth_clip = depth_clamp() ? 0 : 1;
+    rd.depth_clip = clip_depth;
     rd.scissor = scissor ? 1 : 0;
     rd.multisample = 0;
     rd.antialiased_lines = 0;

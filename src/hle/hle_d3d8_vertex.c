@@ -544,6 +544,7 @@ static int pb_trace(void)
 #define PB_SIMPLE_FIRST     0x0300u
 #define PB_SIMPLE_END       0x038Cu
 #define PB_SWATH            0x09F8u
+#define PB_ZMIN_MAX_CONTROL 0x1D78u
 
 static int pb_inline_method(uint32_t method)
 {
@@ -1027,6 +1028,7 @@ void hle_d3d8_push_constants_sync(void)
                      (method >= PB_ELEM16 && method <= PB_INLINE_ARRAY) ||
                      (method + 4u * count > PB_SIMPLE_FIRST && method < PB_SIMPLE_END) ||
                      (method + 4u * count > PB_CLEAR_FIRST && method < PB_CLEAR_END) ||
+                     (method <= PB_ZMIN_MAX_CONTROL && method + 4u * count > PB_ZMIN_MAX_CONTROL) ||
                      method == PB_SWATH))) {
             int noninc = (w & 0x40000000u) != 0u;
 
@@ -1035,7 +1037,8 @@ void hle_d3d8_push_constants_sync(void)
             for (i = 0; i < count; i++) {
                 uint32_t m = noninc ? method : method + 4u * i;
                 uint32_t v = HLE_MEM32(va + 4u + 4u * i);
-                if (inl && ((m >= PB_SIMPLE_FIRST && m < PB_SIMPLE_END) || m == PB_SWATH)) {
+                if (inl && ((m >= PB_SIMPLE_FIRST && m < PB_SIMPLE_END) ||
+                            m == PB_SWATH || m == PB_ZMIN_MAX_CONTROL)) {
                     if (!g_w_nodraw && hle_d3d8_title_ltcg())
                         (void)hle_d3d8_state_store_simple(m, v);
                     else

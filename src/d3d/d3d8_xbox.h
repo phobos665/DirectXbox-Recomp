@@ -345,11 +345,13 @@ typedef enum D3DRENDERSTATETYPE {
     D3DRS_MULTISAMPLEMASK          = 162,
     D3DRS_COLORWRITEENABLE         = 168,
     D3DRS_BLENDOP                  = 171,
+    /* NV097_SET_ZMIN_MAX_CONTROL, raw guest value. */
+    D3DRS_DEPTHCLIPCONTROL         = 197,
     /* The final combiner's own two constants (NV2A SPECULAR_FOG_FACTOR 0/1),
      * Xbox D3DRS_PSFINALCOMBINERCONSTANT0/1. Not the last stage's C0/C1.
      * Just below the pixel-shader block, so one range (198-253) is every
      * state the combiners read; 254 is SHADOWFUNC and the device keeps 256
-     * states. Nothing else uses 172-199: the D3D8 states above end at 173. */
+     * states. The regular D3D8 states above end at 173. */
     D3DRS_PSFINALCOMBINERCONSTANT0 = 198,
     D3DRS_PSFINALCOMBINERCONSTANT1 = 199,
     /* Xbox-specific render states (200+) */

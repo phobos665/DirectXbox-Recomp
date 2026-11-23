@@ -66,6 +66,7 @@ HLE_IMPORT_VAR(D3D_g_DeferredTextureState);
 
 #define XRS_COUNT        167         /* X_D3DRS_DONOTCULLUNCOMPRESSED + 1 */
 #define XRS_REMOVED      154         /* X_D3DRS_MULTISAMPLETYPE */
+#define XRS_DEPTHCLIPCONTROL 82
 #define XRS_FOGENABLE    92
 #define XRS_COMPLEX      136
 #define STAGES           4
@@ -414,6 +415,7 @@ static const struct {
     {  72, D3DRS_STENCILMASK,      AS_IS },
     {  73, D3DRS_STENCILWRITEMASK, AS_IS },
     {  74, D3DRS_BLENDOP,          BLENDOP },
+    { XRS_DEPTHCLIPCONTROL, D3DRS_DEPTHCLIPCONTROL, AS_IS },
     {  92, D3DRS_FOGENABLE,        AS_IS },
     {  93, D3DRS_FOGTABLEMODE,     AS_IS },
     {  94, D3DRS_FOGSTART,         AS_IS },  /* float bits */
@@ -1093,6 +1095,7 @@ int hle_d3d8_state_store_simple(uint32_t method, uint32_t value)
         { 0x0330, 79 },  /* POINTOFFSETENABLE */
         { 0x0334, 80 },  /* WIREFRAMEOFFSETENABLE */
         { 0x0338, 81 },  /* SOLIDOFFSETENABLE */
+        { 0x1D78, XRS_DEPTHCLIPCONTROL }, /* NV097_SET_ZMIN_MAX_CONTROL */
     };
     size_t i;
     /* RECOMP_HLE_D3D8_RS_SIMPLE=0 leaves the array stale, as before this
@@ -1106,6 +1109,10 @@ int hle_d3d8_state_store_simple(uint32_t method, uint32_t value)
     method &= 0x1FFCu;
     for (i = 0; i < sizeof map / sizeof map[0]; i++) {
         if (map[i].method == method) {
+            /* Older XDKs start deferred states at 82 (FOGENABLE). */
+            if (map[i].state == XRS_DEPTHCLIPCONTROL &&
+                (!state_ready() || rs_slot(XRS_DEPTHCLIPCONTROL) < 0))
+                return 0;
             if (hle_var_D3D_g_RenderState && store)
                 HLE_MEM32(hle_var_D3D_g_RenderState + 4u * map[i].state) = value;
             return 1;
