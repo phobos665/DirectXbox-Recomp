@@ -1318,6 +1318,17 @@ static RhiView *empty_stage_view(void)
     return view;
 }
 
+static RhiView *bound_texture_view(IDirect3DBaseTexture8 *texture)
+{
+    if (texture && IDirect3DBaseTexture8_GetType(texture) == D3DRTYPE_TEXTURE) {
+        D3D8Texture *tex = (D3D8Texture *)texture;
+
+        if (tex->copy_srv)
+            return tex->copy_srv;
+    }
+    return d3d8_base_srv(texture);
+}
+
 static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDirect3DBaseTexture8 *pTexture)
 {
     (void)self;
@@ -1327,7 +1338,7 @@ static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDi
 
     /* Bind SRV to pixel shader */
     if (pTexture) {
-        RhiView *srv = d3d8_base_srv(pTexture);
+        RhiView *srv = bound_texture_view(pTexture);
         /* P8 textures bake a palette; record which stage palette they use
          * so SetPalette can re-bake them later. */
         if (d3d8_format_is_palettized(d3d8_base_format(pTexture)))
@@ -2092,7 +2103,7 @@ static void rebind_stage_srvs(RhiImage *target)
         if (!g_cur_textures[stage])
             srv = empty_stage_view();
         else if (d3d8_base_resource(g_cur_textures[stage]) != target)
-            srv = d3d8_base_srv(g_cur_textures[stage]);
+            srv = bound_texture_view(g_cur_textures[stage]);
         rhi_set_textures(stage, 1, &srv);
     }
 }

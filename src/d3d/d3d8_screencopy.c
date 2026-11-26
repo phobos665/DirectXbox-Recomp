@@ -238,7 +238,7 @@ static HRESULT copy_to_texture(IDirect3DTexture8 *dst, const RECT *src, const PO
     if (!create())
         return E_FAIL;
 
-    dst_image = tex->image;
+    dst_image = tex->copy_image ? tex->copy_image : tex->image;
     memset(&rtvd, 0, sizeof rtvd);
     rtvd.format = tex->host_format;
     rtvd.dim = RHI_VIEW_DIM_2D;
@@ -255,8 +255,8 @@ static HRESULT copy_to_texture(IDirect3DTexture8 *dst, const RECT *src, const PO
     probe_source(&saved, tex, back_w, back_h);
 
     /* A texture may hold more host pixels than the title's (a screen-sized
-     * render target is supersampled with the scene, d3d8_scene_target_size):
-     * tx, ty host pixels per title pixel. */
+     * render target is supersampled with the scene, or a screen-copy texture
+     * has a sidecar): tx, ty host pixels per title pixel. */
     {
         RhiImageDesc dd;
 

@@ -1069,11 +1069,32 @@ static ULONG __stdcall tex_AddRef(IDirect3DTexture8 *self)
     return (ULONG)InterlockedIncrement(&tex_from_iface(self)->ref_count);
 }
 
+static void tex_copy_release(D3D8Texture *tex)
+{
+    if (tex->copy_srv) {
+        RhiView *base = d3d8_base_srv((IDirect3DBaseTexture8 *)tex);
+        DWORD stage;
+
+        /* Unlock can invalidate a sidecar without another SetTexture. Put
+         * any stage that still holds it back on the guest texture's view
+         * before the sidecar is destroyed. */
+        for (stage = 0; stage < 4; stage++)
+            if (d3d8_GetStageTexture(stage) == (IDirect3DBaseTexture8 *)tex)
+                rhi_set_textures(stage, 1, &base);
+    }
+    rhi_view_destroy(tex->copy_srv);
+    rhi_image_destroy(tex->copy_image);
+    tex->copy_srv = NULL;
+    tex->copy_image = NULL;
+    tex->copy_scale = 0;
+}
+
 static ULONG __stdcall tex_Release(IDirect3DTexture8 *self)
 {
     D3D8Texture *tex = tex_from_iface(self);
     LONG ref = InterlockedDecrement(&tex->ref_count);
     if (ref <= 0) {
+        tex_copy_release(tex);
         rhi_view_destroy(tex->srv);
         rhi_image_destroy(tex->image);
         free(tex->sys_mem);
@@ -1508,6 +1529,7 @@ static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *self, UINT Level)
 
     tex->locked = FALSE;
     tex->dirty = FALSE;
+    tex_copy_release(tex);
 
     d3d8_upload_mip_level(tex->image, tex->d3d8_format,
                           tex_level_width(tex, Level),
@@ -1523,6 +1545,59 @@ static const IDirect3DTexture8Vtbl g_tex_vtbl = {
     tex_GetLevelCount,
     tex_GetLevelDesc, tex_GetSurfaceLevel, tex_LockRect, tex_UnlockRect,
 };
+
+/* Create or return the high-resolution sidecar that receives a screen copy.
+ * The guest texture itself stays at its original size, so render-target
+ * sizing, viewports, scissors and unrelated binds are unaffected. */
+RhiView *d3d8_texture_copy_view(IDirect3DBaseTexture8 *texture, unsigned factor)
+{
+    D3D8Texture *tex = (D3D8Texture *)texture;
+    RhiImageDesc id;
+    RhiViewDesc vd;
+
+    if (!tex || tex->iface.lpVtbl != &g_tex_vtbl || !tex->image ||
+        !(tex->usage & D3DUSAGE_RENDERTARGET))
+        return NULL;
+    if (!factor) {
+        UINT guest = d3d8_GetGuestWidth();
+        UINT host = d3d8_GetBackBufferWidth();
+
+        factor = guest && host >= guest && host % guest == 0 ? host / guest : 1;
+    }
+    if (factor < 2 || factor > 8)
+        return NULL;
+    if (tex->copy_srv && tex->copy_scale == factor)
+        return tex->copy_srv;
+    tex_copy_release(tex);
+
+    memset(&id, 0, sizeof id);
+    id.type = RHI_IMAGE_2D;
+    id.width = tex->width * factor;
+    id.height = tex->height * factor;
+    id.depth = 1;
+    id.mip_levels = 1;
+    id.format = tex->host_format;
+    id.samples = 1;
+    id.usage = RHI_USAGE_DEFAULT;
+    id.bind = RHI_BIND_RENDER_TARGET | RHI_BIND_SAMPLED;
+    tex->copy_image = rhi_image_create(&id, NULL);
+    if (!tex->copy_image)
+        return NULL;
+
+    memset(&vd, 0, sizeof vd);
+    vd.format = tex->host_format;
+    vd.dim = RHI_VIEW_DIM_2D;
+    vd.mip_count = vd.layer_count = 1;
+    tex->copy_srv = rhi_view_create(tex->copy_image, RHI_VIEW_SAMPLED, &vd);
+    if (!tex->copy_srv) {
+        tex_copy_release(tex);
+        return NULL;
+    }
+    tex->copy_scale = factor;
+    fprintf(stderr, "[COPY-SIDECAR] made %p: %ux%u guest -> %ux%u host (%ux)\n",
+            (void *)tex, tex->width, tex->height, id.width, id.height, factor);
+    return tex->copy_srv;
+}
 
 /* Read-only views of a 2D texture for frame capture (src/hle/hle_d3d8_record.c).
  * The vtable is the type test: cube and volume textures share this struct's

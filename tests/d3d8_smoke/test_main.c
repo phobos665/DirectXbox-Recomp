@@ -57,6 +57,9 @@ IDirect3DDevice8      *xbox_GetD3DDevice(void)  { return NULL; }
 /* d3d8_device.c: no render-target texture is supersampled here. */
 BOOL d3d8_scene_target_size(UINT w, UINT h, UINT *hw, UINT *hh)
 { (void)w; (void)h; (void)hw; (void)hh; return FALSE; }
+UINT d3d8_GetGuestWidth(void) { return 1; }
+UINT d3d8_GetBackBufferWidth(void) { return 1; }
+IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { (void)stage; return NULL; }
 
 static DWORD g_palette[256];
 const DWORD *d3d8_GetPalette(DWORD stage) { (void)stage; return g_palette; }

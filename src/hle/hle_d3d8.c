@@ -5273,6 +5273,7 @@ static void surface_measure(uint32_t va, UINT *w, UINT *h, uint32_t *fmt)
 }
 
 IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surface);
+RhiView *d3d8_texture_copy_view(IDirect3DBaseTexture8 *texture, unsigned factor);
 
 static int rt_surfaces_on(void)
 {
@@ -6214,6 +6215,7 @@ HLE_EXPORT(D3DDevice_CopyRects)
                     r.bottom = (LONG)HLE_MEM32(rects_va + i * 16 + 12);
                     p.x = points_va ? (LONG)HLE_MEM32(points_va + i * 8 + 0) : r.left;
                     p.y = points_va ? (LONG)HLE_MEM32(points_va + i * 8 + 4) : r.top;
+                    d3d8_texture_copy_view((IDirect3DBaseTexture8 *)tex, 0);
                     if (SUCCEEDED(host_CopyBackBufferRectToTexture(tex, &r, &p)))
                         from_screen++;
                     if (said_rect++ < 4)
@@ -6236,19 +6238,26 @@ HLE_EXPORT(D3DDevice_CopyRects)
                 r.right = (LONG)dw;
                 r.bottom = (LONG)dh;
                 p.x = p.y = 0;
+                d3d8_texture_copy_view((IDirect3DBaseTexture8 *)tex, 0);
                 if (SUCCEEDED(host_CopyBackBufferRectToTexture(tex, &r, &p)))
                     from_screen++;
                 if (said_rect++ < 4)
                     fprintf(stderr, "[HLE-D3D8] the title copies the top left %ux%u of its "
                             "screen into texture 0x%08X\n", dw, dh, dst_parent);
-            } else if (tex && SUCCEEDED(src != g_backbuffer_va && src_frame
-                                        ? host_CopyFrontToTexture(tex)
-                                        : host_CopyBackBufferToTexture(tex))) {
-                from_screen++;
-                if (from_screen == 1)
-                    fprintf(stderr, "[HLE-D3D8] the title reads its own screen back: "
-                            "copying the host frame into texture 0x%08X (%ux%u)\n",
-                            dst_parent, dw, dh);
+            } else if (tex) {
+                /* The full-frame copy feeds the next pass, so it needs the
+                 * same high-resolution sidecar as a rectangular copy. The
+                 * guest texture and every render-target size stay unchanged. */
+                d3d8_texture_copy_view((IDirect3DBaseTexture8 *)tex, 0);
+                if (SUCCEEDED(src != g_backbuffer_va && src_frame
+                                  ? host_CopyFrontToTexture(tex)
+                                  : host_CopyBackBufferToTexture(tex))) {
+                    from_screen++;
+                    if (from_screen == 1)
+                        fprintf(stderr, "[HLE-D3D8] the title reads its own screen back: "
+                                "copying the host frame into texture 0x%08X (%ux%u)\n",
+                                dst_parent, dw, dh);
+                }
             }
         } else {
             elsewhere++;

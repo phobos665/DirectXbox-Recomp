@@ -188,6 +188,9 @@ typedef struct D3D8Texture {
     BOOL                    dirty;
     UINT                    palette;    /* Palette index (texture stage) this P8 texture bakes */
     BOOL                    screen_copy; /* the frame was copied into it (d3d8_screencopy.c) */
+    RhiImage               *copy_image; /* optional high-resolution CopyRects sidecar */
+    RhiView                *copy_srv;   /* sampled view of copy_image */
+    UINT                    copy_scale; /* 0 until made, then the render-scale factor */
 } D3D8Texture;
 
 typedef struct D3D8Surface {
@@ -337,6 +340,7 @@ HRESULT d3d8_CreateImageSurfaceImpl(UINT Width, UINT Height, D3DFORMAT Format,
  * volume). All three implementations keep it at the same offset as
  * D3D8Texture, and the image likewise. */
 RhiView  *d3d8_base_srv(IDirect3DBaseTexture8 *texture);
+RhiView  *d3d8_texture_copy_view(IDirect3DBaseTexture8 *texture, unsigned factor);
 RhiImage *d3d8_base_resource(IDirect3DBaseTexture8 *texture);
 
 /* Read the D3DFORMAT of any base texture. */
